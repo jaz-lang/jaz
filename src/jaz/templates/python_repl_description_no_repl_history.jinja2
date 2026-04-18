@@ -1,0 +1,231 @@
+{% if multi_statement %}
+PYTHON REPL INPUT SPECIFICATION
+{% else %}
+PYTHON REPL INPUT SPECIFICATION (SINGLE-STATEMENT MODE)
+{% endif %}
+
+Your <repl_input> must contain EXACTLY ONE of the following:
+
+{% if multi_statement %}
+1. Arbitrary Python code
+{% else %}
+1. A single Python statement
+{% endif %}
+2. A special command:
+{% if restrict_return_value %}
+   - RETURN <literal value>   — return a literal value and exit the REPL
+{% else %}
+   - RETURN <value>   — return a value and exit the REPL
+{% endif %}
+{% if allow_raise %}
+   - RAISE <error>    — raise an exception and exit the REPL
+{% endif %}
+{% if allow_tools_command %}
+   - TOOLS?           — list available tools
+{% endif %}
+{% if allow_inspect_commands %}
+   - INSPECT <name>   — inspect an object
+{% endif %}
+{% if multi_statement %}
+
+GENERAL RULES:
+
+- You may write multiline Python code.
+- All code in a single REPL input must form ONE coherent step.
+- Do not attempt multi-stage reasoning in a single REPL input.
+
+CRITICAL DEPENDENCY RULE (STRICT):
+
+- A single REPL input must NOT contain code whose later lines depend on
+  observing the output or result of earlier lines in the SAME REPL input.
+
+- If deciding what to do next requires seeing printed output, inspecting
+  values, or interpreting results, you MUST stop and do this in a FUTURE
+  REPL input.
+
+- The intended workflow is:
+    1) Run code
+    2) Observe the output
+    3) Decide what to do next
+    4) Write a new REPL input
+
+EXAMPLE (IMPORTANT):
+
+{% if restrict_return_value %}
+❌ INVALID (depends on unseen results in the same REPL input):
+<repl_input lang="python">
+x = compute()
+print(x)
+y = process(x)
+print(y)
+</repl_input>
+
+✅ VALID (inspection happens between REPL inputs):
+
+<repl_input lang="python">
+x = compute()
+print(x)
+</repl_input>
+
+(Observe output)
+
+<repl_input lang="python">
+y = process(x)
+print(y)
+</repl_input>
+{% else %}
+❌ INVALID (depends on unseen results in the same REPL input):
+<repl_input lang="python">
+x = compute()
+print(x)
+y = process(x)
+RETURN y
+</repl_input>
+
+✅ VALID (inspection happens between REPL inputs):
+
+<repl_input lang="python">
+x = compute()
+print(x)
+</repl_input>
+
+(Observe output)
+
+<repl_input lang="python">
+y = process(x)
+RETURN y
+</repl_input>
+{% endif %}
+
+SPECIAL COMMAND RULES (STRICT):
+
+{% if restrict_return_value %}
+- RETURN:
+  - MUST be the only statement in the REPL input.
+  - MUST NOT be preceded or followed by any other code.
+  - MUST NOT be nested inside an if block or for/while loop.
+  - The value MUST be a JSON-like literal (string, number, boolean, None, list, dict).
+    Variables, expressions, and function calls are NOT allowed as RETURN values.
+{% if allow_raise %}
+
+- RAISE:
+  - MUST be the very last top-level statement in the REPL input.
+  - MUST NOT be followed by any other code.
+  - MUST NOT be nested inside an if block or for/while loop.
+{% endif %}
+{% else %}
+{% if allow_raise %}
+- RETURN or RAISE:
+{% else %}
+- RETURN:
+{% endif %}
+  - MUST be the very last top-level statement in the REPL input.
+  - MUST NOT be followed by any other code.
+  - MUST NOT be nested inside an if block or for/while loop.
+{% endif %}
+
+{% if allow_tools_command or allow_inspect_commands %}
+- {% if allow_tools_command %}TOOLS?{% endif %}{% if allow_tools_command and allow_inspect_commands %} and {% endif %}{% if allow_inspect_commands %}INSPECT{% endif %}:
+  - MUST be the only line in the REPL input.
+  - MUST NOT be combined with any other code.
+{% endif %}
+{% else %}
+
+CRITICAL: SINGLE-STATEMENT RULE (STRICTLY ENFORCED)
+
+- Each REPL input may contain ONLY ONE Python statement.
+- Multiple statements in a single input will cause a SyntaxError.
+- This rule is enforced at parse time via AST validation.
+
+VALID single statements include:
+- Assignment: `x = compute()`
+- Expression: `print(x)`
+- Function call: `result = process(data)`
+- Control flow: `if condition: do_something()`
+- Function/class definition: `def foo(): ...`
+- Import: `import math`
+
+EXAMPLES:
+
+❌ INVALID (multiple statements):
+<repl_input lang="python">
+x = compute()
+print(x)
+</repl_input>
+
+✅ VALID (single statement per input):
+
+<repl_input lang="python">
+x = compute()
+</repl_input>
+
+(Observe x is set)
+
+<repl_input lang="python">
+print(x)
+</repl_input>
+
+(Observe output)
+
+<repl_input lang="python">
+{% if restrict_return_value %}RETURN "result"{% else %}RETURN x{% endif %}
+</repl_input>
+
+SPECIAL COMMAND RULES (STRICT):
+
+{% if restrict_return_value %}
+- RETURN <literal value>:
+  - MUST be the only content in the REPL input.
+  - MUST NOT be combined with any other code.
+  - The value MUST be a JSON-like literal (string, number, boolean, None, list, dict).
+    Variables, expressions, and function calls are NOT allowed as RETURN values.
+{% else %}
+- RETURN <value>:
+  - MUST be the only content in the REPL input.
+  - MUST NOT be combined with any other code.
+{% endif %}
+{% if allow_raise %}
+
+- RAISE <error>:
+  - MUST be the only content in the REPL input.
+  - MUST NOT be combined with any other code.
+{% endif %}
+
+{% if allow_tools_command or allow_inspect_commands %}
+- {% if allow_tools_command %}TOOLS?{% endif %}{% if allow_tools_command and allow_inspect_commands %} and {% endif %}{% if allow_inspect_commands %}INSPECT{% endif %}:
+  - MUST be the only content in the REPL input.
+  - MUST NOT be combined with any other code.
+{% endif %}
+{% endif %}
+
+Violating any of the above rules will result in a SyntaxError and task failure.
+
+OUTPUT & INSPECTION NOTES:
+
+- Printed output may be truncated.
+- Printed output is NOT returned to the caller.
+{% if not restrict_return_value or expose_inputs_in_repl %}
+
+The following magic variables are available:
+{% if expose_inputs_in_repl %}
+
+- `__task__`:
+  The task string (from <task> tag). Use this when making
+  recursive `jaz.invoke` calls to pass the task efficiently.
+{% endif %}
+{% if not restrict_return_value %}
+
+- `__return_type__`:
+  The expected return type for this REPL session.
+
+- `__return_validator__`:
+  Validator function for the return value for this REPL session (`None` if not set).
+{% endif %}
+{% if expose_inputs_in_repl %}
+
+- `__inputs__`:
+  A copy of the inputs dict passed to this REPL session.
+  If you've reassigned any input variables, you can retrieve
+  the original values from this dict.
+{% endif %}
+{% endif %}

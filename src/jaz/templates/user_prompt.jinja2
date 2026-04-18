@@ -1,0 +1,32 @@
+{% if task_preamble %} {{ task_preamble }}{% endif %}
+
+<task>
+
+{{ task }}
+{{ prompt_additions_str }}
+</task>
+
+{% if inputs_str %}
+<inputs>
+
+{% if inputs_preamble %}
+{{ inputs_preamble }}
+{% endif %}
+
+{{ inputs_str }}
+</inputs>
+{% endif %}
+{% if truncation_advice_str %}
+{{ truncation_advice_str }}
+{% endif %}
+
+<return_type>
+
+{{ return_type_str }}
+
+</return_type>
+
+{% if budget_str %}
+{{ budget_str }}
+
+{% endif %}

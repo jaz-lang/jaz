@@ -1,0 +1,50 @@
+ReAct REPL INPUT SPECIFICATION (TOOL-CALL-ONLY MODE)
+
+Your <repl_input> must contain EXACTLY ONE of the following:
+
+1. A single tool call with literal value arguments only
+2. RETURN <literal value> — return a literal value and exit
+
+RULES:
+
+- Each input must be a single tool call: `tool_name(arg1, arg2, key=val)`
+- ALL arguments (positional and keyword) must be literal values or built-in type names (strings, numbers, booleans, None, lists, dicts, type names like `str`, `list[int]`)
+- Variables, expressions, and computed values are NOT allowed as arguments
+- No assignments, no multi-line code, no imports, no control flow
+- RETURN must be followed by a single literal value (string, number, boolean, None, list, dict, built-in type name)
+
+EXAMPLES:
+
+✅ VALID:
+<repl_input lang="react">
+search("machine learning")
+</repl_input>
+
+<repl_input lang="react">
+lookup(query="test", limit=10)
+</repl_input>
+
+<repl_input lang="react">
+RETURN "the answer"
+</repl_input>
+
+❌ INVALID:
+<repl_input lang="react">
+x = search("hello")
+</repl_input>
+↑ Assignment is not allowed. Use a bare tool call: `search("hello")`
+
+<repl_input lang="react">
+search(query)
+</repl_input>
+↑ `query` is a variable, not a literal value. All arguments must be literal values.
+
+<repl_input lang="react">
+RETURN result
+</repl_input>
+↑ `result` is a variable. RETURN requires a literal value: `RETURN "the answer"`
+
+OUTPUT NOTES:
+
+- Printed output may be truncated.
+- Printed output is NOT returned to the caller.

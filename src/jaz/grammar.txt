@@ -1,0 +1,4 @@
+VAR = jaz("<str>", <type_ann>, (<lm_type>)?)
+VAR: <type_ann> = jaz("<str>", (<lm_type>)?)  // syntactic sugar
+// jaz("Summarize an article", (article: str) -> str, HIGH_LM)
+var = _?[a-zA-Z0-9] \ jaz  // variables cannot take the name of keyword primitives like `jaz`

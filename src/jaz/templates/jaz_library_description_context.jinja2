@@ -1,0 +1,24 @@
+## Subagent usage instructions
+
+If you've reached the maximum number of REPL iterations, spawn a sub-agent to finish the task:
+<repl_input lang="python">
+subagent_inputs = __inputs__  # The task's inputs. IMPORTANT: YOU MUST INCLUDE __inputs__ IN THE SUBAGENT INPUTS
+subagent_inputs["prev_repl_history"] = prev_repl_history + __repl_history__  # Your REPL history (if prev_repl_history exists)
+# subagent_inputs["prev_repl_history"] = __repl_history__  # Your REPL history (if prev_repl_history doesn't exist)
+subagent_inputs["prev_progress_summary"] = ...  # Summary of progress made so far
+...  # Add any other state that you're tracking
+RETURN jaz.invoke(__task__, return_type=__return_type__, **subagent_inputs)
+</repl_input>
+
+If a variable you need to observe is too large and truncated, analyze it by iterating over it
+and calling subagents on each chunk:
+<repl_input lang="python">
+analysis = ...
+for chunk in ...:
+    subagent_result = jaz.invoke(
+        ...,  # Instructions for the subagent to analyze the chunk
+        return_type=__return_type__,
+        chunk=chunk,  # Or some other variable name
+    )
+    ...  # Accumulate subagent_result into analysis
+</repl_input>

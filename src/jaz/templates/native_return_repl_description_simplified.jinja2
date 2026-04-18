@@ -1,0 +1,77 @@
+PYTHON REPL INPUT SPECIFICATION
+
+Your <repl_input> must contain Python code.
+
+RETURN STATEMENT SEMANTICS:
+
+A return statement exits the REPL session immediately.
+Do NOT issue a return statement if you would like to continue with more REPL iterations.
+If you have completed your task and wish to end the REPL session, use a return statement to return your final result.
+{% if restrict_return_value %}
+The returned value must be a JSON-like literal (string, number, boolean, None, list, dict).
+{% endif %}
+
+{% if allow_raise %}
+RAISE STATEMENT SEMANTICS:
+
+A raise statement exits the REPL session immediately.
+Do NOT issue a raise statement if you would like to continue with more REPL iterations.
+If you deem your task impossible and wish to end the REPL session, use a raise statement to raise an exception.
+{% endif %}
+
+GENERAL RULES:
+
+- You may write multiline Python code.
+- All code in a single REPL input must form ONE coherent step.
+- Multi-step plans should be carried out across multiple REPL iterations,
+  not crammed into a single REPL input.
+
+OUTPUT & INSPECTION NOTES:
+
+- Printed output may be truncated.
+- Printed output is NOT returned to the caller.
+{% if not restrict_return_value or expose_inputs_in_repl or repl_history %}
+
+The following magic variables are available:
+{% if expose_inputs_in_repl %}
+
+- `__task__`:
+  The task string (from <task> tag). Use this when making
+  recursive `jaz.invoke` calls to pass the task efficiently.
+{% endif %}
+{% if not restrict_return_value %}
+
+- `__return_type__`:
+  The expected return type for this REPL session.
+
+- `__return_validator__`:
+  Validator function for the return value for this REPL session (`None` if not set).
+{% endif %}
+{% if expose_inputs_in_repl %}
+
+- `__inputs__`:
+  A copy of the inputs dict passed to this REPL session.
+  If you've reassigned any input variables, you can retrieve
+  the original values from this dict.
+{% endif %}
+{% if repl_history %}
+
+- `__repl_history__`:
+  A list containing the REPL session history, indexed by iteration number.
+{% if expose_inputs_in_repl %}
+  - `__repl_history__[0]` contains initialization info:
+    - `.task`: Same as `__task__`
+    - `.inputs`: Same as `__inputs__`
+{% endif %}
+  - `__repl_history__[N]` (for N >= 1) contains iteration N's results:
+    - `.repl_input`: The source code executed in iteration N
+    - `.repl_output`: The printed output from iteration N
+    - `.error`: The error summary (str) if iteration N failed, else None
+
+- `_`:
+  The result of the most recent evaluated expression.
+
+- `_N`:
+  The result of the N-th REPL input, if it evaluated an expression.
+{% endif %}
+{% endif %}

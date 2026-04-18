@@ -1,0 +1,129 @@
+{% if multi_statement %}
+BASH REPL INPUT SPECIFICATION
+{% else %}
+BASH REPL INPUT SPECIFICATION (SINGLE-STATEMENT MODE)
+{% endif %}
+
+Your <repl_input> must contain EXACTLY ONE of the following:
+
+{% if multi_statement %}
+1. Arbitrary bash code
+{% else %}
+1. A single bash statement
+{% endif %}
+2. A special command:
+   - RETURN <value>   — return a value and exit the REPL
+   - RAISE <error>    — raise an exception and exit the REPL
+{% if multi_statement %}
+
+GENERAL RULES:
+
+- You may write multiline bash code.
+- All code in a single REPL input must form ONE coherent step.
+- Do not attempt multi-stage reasoning in a single REPL input.
+
+CRITICAL DEPENDENCY RULE (STRICT):
+
+- A single REPL input must NOT contain code whose later lines depend on
+  observing the output or result of earlier lines in the SAME REPL input.
+
+- If deciding what to do next requires seeing printed output, inspecting
+  values, or interpreting results, you MUST stop and do this in a FUTURE
+  REPL input.
+
+- The intended workflow is:
+    1) Run code
+    2) Observe the output
+    3) Decide what to do next
+    4) Write a new REPL input
+
+EXAMPLE (IMPORTANT):
+
+❌ INVALID (depends on unseen results in the same REPL input):
+<repl_input lang="bash">
+ls -l          # Find file to check
+head file.txt  # Check file, but you haven't even seen the output of `ls -l` yet!
+</repl_input>
+
+✅ VALID (inspection happens between REPL inputs):
+
+<repl_input lang="bash">
+ls -l
+</repl_input>
+
+(Observe output)
+
+<repl_input lang="bash">
+head file.txt
+</repl_input>
+
+SPECIAL COMMAND RULES (STRICT):
+
+RETURN or RAISE:
+- MUST appear on the final line.
+- MUST NOT be followed by any other code.
+{% else %}
+
+CRITICAL: SINGLE-STATEMENT RULE (STRICTLY ENFORCED)
+
+- Each REPL input may contain ONLY ONE bash statement.
+- Multiple statements will cause a SyntaxError.
+- This rule is enforced at parse time using tree-sitter.
+
+WHAT IS ALLOWED (single statement):
+- Simple commands: `ls -l`
+- Pipelines: `ls | grep foo | wc -l`
+- AND/OR lists: `mkdir dir && cd dir`
+- Conditional execution: `test -f file || echo missing`
+- Redirections: `cat file.txt > output.txt`
+- Command substitution: `echo $(date)`
+- Line continuations: `echo hello \`
+                      `world`
+- Here-documents (count as single statement)
+
+WHAT IS NOT ALLOWED (multiple statements):
+- Semicolon-separated commands: `ls; pwd`
+- Multiple lines: `ls`
+                  `pwd`
+
+EXAMPLES:
+
+❌ INVALID (multiple lines = multiple statements):
+<repl_input lang="bash">
+ls -l
+head file.txt
+</repl_input>
+
+❌ INVALID (semicolon = multiple statements):
+<repl_input lang="bash">
+ls -l; head file.txt
+</repl_input>
+
+✅ VALID (AND/OR list is single statement):
+<repl_input lang="bash">
+mkdir dir && cd dir && ls
+</repl_input>
+
+✅ VALID (pipeline):
+<repl_input lang="bash">
+cat file.txt | grep pattern | sort | uniq
+</repl_input>
+
+✅ VALID (line continuation):
+<repl_input lang="bash">
+echo "hello" \
+     "world"
+</repl_input>
+
+SPECIAL COMMAND RULES (STRICT):
+
+- RETURN <value>:
+  - MUST be the only content in the REPL input.
+  - MUST NOT be combined with any other code.
+
+- RAISE <error>:
+  - MUST be the only content in the REPL input.
+  - MUST NOT be combined with any other code.
+{% endif %}
+
+Violating any of the above rules will result in a SyntaxError and task failure.

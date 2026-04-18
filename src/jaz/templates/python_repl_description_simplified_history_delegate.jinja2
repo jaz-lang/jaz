@@ -1,0 +1,135 @@
+PYTHON REPL INPUT SPECIFICATION
+
+Your <repl_input> must contain EXACTLY ONE of the following:
+
+1. Arbitrary Python code
+2. A special command:
+{% if restrict_return_value %}
+   - RETURN <literal value>   — return a literal value and exit the REPL
+{% else %}
+   - RETURN <value>   — return a value and exit the REPL
+{% endif %}
+{% if allow_raise %}
+   - RAISE <error>    — raise an exception and exit the REPL
+{% endif %}
+{% if allow_tools_command %}
+   - TOOLS?           — list available tools
+{% endif %}
+{% if allow_inspect_commands %}
+   - INSPECT <name>   — inspect an object
+{% endif %}
+
+GENERAL RULES:
+
+- You may write multiline Python code.
+- All code in a single REPL input must form ONE coherent step.
+- Multi-step plans should be carried out across multiple REPL iterations,
+  not crammed into a single REPL input.
+
+SPECIAL COMMAND RULES (STRICT):
+
+{% if restrict_return_value %}
+- RETURN:
+  - MUST be the only statement in the REPL input.
+  - MUST NOT be preceded or followed by any other code.
+  - MUST NOT be nested inside an if block or for/while loop.
+  - The value MUST be a JSON-like literal (string, number, boolean, None, list, dict).
+    Variables, expressions, and function calls are NOT allowed as RETURN values.
+{% if allow_raise %}
+
+- RAISE:
+  - MUST be the very last top-level statement in the REPL input.
+  - MUST NOT be followed by any other code.
+  - MUST NOT be nested inside an if block or for/while loop.
+{% endif %}
+{% else %}
+{% if allow_raise %}
+- RETURN or RAISE:
+{% else %}
+- RETURN:
+{% endif %}
+  - MUST be the very last top-level statement in the REPL input.
+  - MUST NOT be followed by any other code.
+  - MUST NOT be nested inside an if block or for/while loop.
+{% endif %}
+
+{% if allow_tools_command or allow_inspect_commands %}
+- {% if allow_tools_command %}TOOLS?{% endif %}{% if allow_tools_command and allow_inspect_commands %} and {% endif %}{% if allow_inspect_commands %}INSPECT{% endif %}:
+  - MUST be the only line in the REPL input.
+  - MUST NOT be combined with any other code.
+{% endif %}
+
+Violating any of the above rules will result in a SyntaxError and task failure.
+
+OUTPUT & INSPECTION NOTES:
+
+- Printed output may be truncated.
+- Printed output is NOT returned to the caller.
+{% if not restrict_return_value or expose_inputs_in_repl or repl_history %}
+
+The following magic variables are available:
+{% if expose_inputs_in_repl %}
+
+- `__task__`:
+  The task string (from <task> tag). Use this when making
+  recursive `jaz.invoke` calls to pass the task efficiently.
+{% endif %}
+{% if not restrict_return_value %}
+
+- `__return_type__`:
+  The expected return type for this REPL session.
+
+- `__return_validator__`:
+  Validator function for the return value for this REPL session (`None` if not set).
+{% endif %}
+{% if expose_inputs_in_repl %}
+
+- `__inputs__`:
+  A copy of the inputs dict passed to this REPL session.
+  If you've reassigned any input variables, you can retrieve
+  the original values from this dict.
+{% endif %}
+{% if repl_history %}
+
+- `history` (optional):
+  An input variable containing your REPL history. It is a list of dicts,
+  where each entry corresponds to one prior REPL input and has the following keys:
+    - `"code"`: The source code executed in that prior iteration
+    - `"output"`: The printed output from that prior iteration
+    - `"plan"` (optional): The plan associated with that iteration, if any
+
+  Note: If `history` does not exist, then that means your REPL history is empty.
+  If `history` does exist, then that means your REPL history is non-empty.
+
+  SEARCHING HISTORY EFFECTIVELY:
+
+  1. Use TARGETED search terms: exact date/time, exact names, or distinctive
+     keywords unique to the topic. Avoid overly broad terms.
+
+  2. When you find a match, ALWAYS display a context window around the hit —
+     never truncate to just a prefix.
+
+     Example:
+     ```
+     for i, entry in enumerate(history):
+         text = entry.get("output", "")
+         pos = text.find("search term here")
+         if pos >= 0:
+             start = max(0, pos - 1000)
+             end = min(len(text), pos + 2000)
+             print(f"--- history[{i}] (pos {pos}) ---")
+             print(text[start:end])
+             print()
+     ```
+
+  3. If you decide to search history, you must ONLY search in the current REPL iteration
+     and NOT do anything else. Print the snippets found and stop. Wait for the
+     next iteration to conduct analysis and follow-up work.
+
+- `_`:
+  The result of the most recent evaluated expression.
+
+- `_N`:
+  The result of the N-th REPL input, if it evaluated an expression.
+{% endif %}
+{% endif %}

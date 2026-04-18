@@ -1,0 +1,27 @@
+Rewrite the most recent <repl_input lang="python">...</repl_input> from your response above so that it ends with a tail-call recursive delegation to a subagent via `RETURN jaz.invoke(...)`.
+
+Transform as follows:
+- Convert all print statements into variable assignments.
+- Build a `subagent_inputs` dictionary starting from `__inputs__`.
+- Add the variables from converting your print statements to `subagent_inputs`.
+- Add a progress summary and any tracked state to `subagent_inputs`.
+- End with `RETURN jaz.invoke(__task__, return_type=__return_type__, **subagent_inputs)`.
+
+Follow this format:
+<repl_input lang="python">
+...  # Your multiturn REPL input, but with print statements replaced with variable assignments.
+
+subagent_inputs = __inputs__  # The magic variable `__inputs__` is a dictionary with the inputs to the task. IMPORTANT: `subagent_inputs` MUST be initialized to `__inputs__`!
+
+history = ...  # Complete comprehensive interaction history of your REPL session (no truncation/abbreviation allowed)
+subagent_inputs["prev_history"] = prev_repl_history + history  # (if prev_history exists)
+# subagent_inputs["prev_history"] = history  # (if prev_history doesn't exist)
+
+subagent_inputs["prev_progress_summary"] = ...  # Summary of progress made so far
+
+...  # Assigned variables are added to subagent_inputs (from converting your print statements to variable assignments)
+
+...  # Add any other state that you're tracking to subagent_inputs
+
+RETURN jaz.invoke(__task__, return_type=__return_type__, **subagent_inputs)  # (MANDATORY: delegate to subagent to finish the rest of the task)
+</repl_input>
