@@ -12,6 +12,17 @@ from .agent import Agent
 from .config import Config, get_config
 from .library import Library, get_jaz_library
 
+# Common misspellings or misuses of invoke() kwargs.
+# Keys are invalid kwarg names that users may pass; values are suggestions.
+_INVOKE_KWARG_TYPOS: dict[str, str] = {
+    "max_repl_iterations": (
+        "max_iterations (or use jaz.config_override(max_repl_iterations=...))"
+    ),
+    "model": "jaz.configure(model_config={'model': ...})",
+    "temperature": "jaz.config_override(model_config={'temperature': ...})",
+    "max_tokens": "jaz.config_override(model_config={'max_tokens': ...})",
+}
+
 
 @dataclass(kw_only=True, frozen=True)
 class PrehookOutput:
@@ -384,6 +395,14 @@ def invoke[ReturnT](
         Hooks are managed via context managers, not parameters. Use the `with` statement
         to add hooks before calling invoke. See jaz.hooks for details.
     """
+
+    # Catch common kwarg misspellings before they silently become input variables
+    for key in inputs:
+        if key in _INVOKE_KWARG_TYPOS:
+            raise TypeError(
+                f"invoke() got unexpected keyword argument '{key}'. "
+                f"Did you mean: {_INVOKE_KWARG_TYPOS[key]}"
+            )
 
     # Resolve config once at the public entry point
     config = get_config()

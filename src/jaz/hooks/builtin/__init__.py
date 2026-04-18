@@ -10,15 +10,16 @@ from .workflow_replay import WorkflowReplayHook
 
 # Conditionally import tracing hooks if opentelemetry is installed
 try:
-    from .jaeger_tracing import JaegerTracingHook
-    from .langfuse_tracing import LangfuseTracingHook
+    from .jaeger_tracing import JaegerTracingHook  # noqa: F401
+    from .langfuse_tracing import LangfuseTracingHook  # noqa: F401
 
     _TRACING_AVAILABLE = True
 except ImportError:
-    # OpenTelemetry not installed, tracing hooks unavailable
+    # OpenTelemetry not installed, tracing hooks unavailable.
+    # Do NOT assign None — let the ImportError propagate so that
+    # downstream re-exports (jaz.hooks.__init__) detect the absence
+    # and users get a clear ImportError instead of a silent None.
     _TRACING_AVAILABLE = False
-    JaegerTracingHook = None  # type: ignore
-    LangfuseTracingHook = None  # type: ignore
 
 __all__ = [
     "ConversationHistoryHook",

@@ -1,6 +1,6 @@
 from . import repl  # noqa: F401  # register REPLs
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 from .agent import Agent
 from .config import config_override, configure, get_config
 from .invoke import invoke
