@@ -1,32 +1,6 @@
-{% if task_preamble %} {{ task_preamble }}{% endif %}
-
-<task>
-
-{{ task }}
-{{ prompt_additions_str }}
-</task>
-
-{% if inputs_str %}
-<inputs>
-
-{% if inputs_preamble %}
-{{ inputs_preamble }}
-{% endif %}
-
-{{ inputs_str }}
-</inputs>
-{% endif %}
-{% if truncation_advice_str %}
+{{ inputs_str }}{% if input_names %}{% set plural = input_names | length > 1 %}
+The input variable{{ "s" if plural else "" }} `{{ input_names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
+{% if recursion_available %}{{ "They are" if plural else "It is" }} not automatically available to `jaz.invoke()` calls you make, so making {{ "them" if plural else "it" }} available to sub-invokes requires passing {{ "them" if plural else "it" }} explicitly.
+{% endif %}{% endif %}{% if truncation_advice_str %}
 {{ truncation_advice_str }}
-{% endif %}
-
-<return_type>
-
-{{ return_type_str }}
-
-</return_type>
-
-{% if budget_str %}
-{{ budget_str }}
-
 {% endif %}

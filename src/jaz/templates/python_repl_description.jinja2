@@ -1,257 +1,68 @@
-{% if multi_statement %}
-PYTHON REPL INPUT SPECIFICATION
-{% else %}
-PYTHON REPL INPUT SPECIFICATION (SINGLE-STATEMENT MODE)
-{% endif %}
+## Python REPL specification
 
-Your <repl_input> must contain EXACTLY ONE of the following:
-
-{% if multi_statement %}
-1. Arbitrary Python code
-{% else %}
-1. A single Python statement
+{# Deduped against system_prompt.jinja2, which owns the output-format rules (code only, executed
+   verbatim, no fences, prose in comments) and renders directly above this section. #}
+- Your response should contain Python code.
+- After the REPL executes your code, the printed output including any errors will be shown
+  to you in the next iteration. It is NOT shown to the caller.
+- Printed output will be truncated if it is too large.
+- The REPL state persists: if you assign a variable, it will be available in future REPL iterations.
+{# `exec_timeout` and `allow_timeout_pragma` are injected at render time (like `allow_raise`),
+   never baked: the REPL enforces both, so a stale value would promise the agent time it does not
+   get — or an override the REPL ignores. With the pragma off and no bound there is nothing to
+   say, so the bullet disappears entirely rather than rendering an empty statement. The bound is
+   spelled out in each branch instead of factored out because a mid-line `{% endif %}` at a line
+   END would eat the newline after it (trim_blocks) and run this bullet into the next one. #}
+{% if allow_timeout_pragma %}
+- Your code is executed {% if exec_timeout is not none %}under a timeout of {{ exec_timeout }} seconds. If your code is expected to take longer, change{% else %}without a timeout. If your code risks running forever, set{% endif %} the timeout
+  by writing a pragma comment `# timeout: T` on its own line at the top before your code, where `T` is a positive number
+  (e.g. `5.0`, `60`, `300`) indicating the number of seconds.
+{% elif exec_timeout is not none %}
+- Your code is executed under a timeout of {{ exec_timeout }} seconds.
 {% endif %}
-2. A special command:
-{% if restrict_return_value %}
-   - RETURN <literal value>   — return a literal value and exit the REPL
-{% else %}
-   - RETURN <value>   — return a value and exit the REPL
-{% endif %}
+{# Frame `return` around what it delivers, not around when it is forbidden: the prohibition-only
+   phrasing cost ~2 turns/run (gpt-5-mini, 12 trials/arm, one-turn task — 5/12 runs took >1 turn at
+   avg 2.83, vs 0/12 at avg 1.00). Matrix: tests/test_return_instruction_integration.py. #}
+- To indicate task completion, use a `return` statement with the final result.
+  Do NOT print and return in the same REPL iteration - printing is for observing intermediate output
+  to decide your next step, whereas returning is for indicating task completion and ending the REPL session.
 {% if allow_raise %}
-   - RAISE <error>    — raise an exception and exit the REPL
+- If the task is impossible, use a `raise` statement to raise an exception explaining why:
+  `raise Exception("<reason why the task is impossible>")`.
+  Executing `raise` immediately ends the REPL session.
 {% endif %}
-{% if allow_tools_command %}
-   - TOOLS?           — list available tools
-{% endif %}
-{% if allow_inspect_commands %}
-   - INSPECT <name>   — inspect an object
-{% endif %}
-{% if multi_statement %}
+{# `__inputs__` is deliberately undocumented: it is slated for removal, and dropping it from the
+   prompt is the first step. Do not restore it here. #}
+- The magic variable `__repl_history__` is available by name in the REPL.
+  It is a list with one entry per REPL iteration, in order (`__repl_history__[0]` is your first
+  iteration and `__repl_history__[-1]` the most recent). Each entry has:
+  - `.llm_response (str)`: Your full response for that iteration containing your code
+  - `.repl_output (str)`: The printed output from that iteration, including any error traceback
+  - `.repl_exception (BaseException | None)`: The exception object raised if that iteration hit
+    a recoverable error, else None
 
-GENERAL RULES:
+## Determine the workflow type
 
-- You may write multiline Python code.
-- All code in a single REPL input must form ONE coherent step.
-- Do not attempt multi-stage reasoning in a single REPL input.
+- If the task is a question that can be answered directly, hard-code your response:
 
-CRITICAL DEPENDENCY RULE (STRICT):
+    return <hard-coded response>
 
-- A single REPL input must NOT contain code whose later lines depend on
-  observing the output or result of earlier lines in the SAME REPL input.
+- If the task involves computing a result programmatically, write a program:
 
-- If deciding what to do next requires seeing printed output, inspecting
-  values, or interpreting results, you MUST stop and do this in a FUTURE
-  REPL input.
+    <program computing the result>
+    return <computed result>
 
-- The intended workflow is:
-    1) Run code
-    2) Observe the output
-    3) Decide what to do next
-    4) Write a new REPL input
+- If the task is neither a directly-answerable question nor a programming problem, then you must use
+  a *multi-step agentic workflow*. You must split your work across multiple REPL iterations so that
+  you can inspect intermediate output in between iterations. Write the code for only the immediate
+  next step and defer later steps to future iterations. Do NOT return if multiple steps remain - instead
+  print intermediate output to inform future steps. Return iff the immediate next step is the last step
+  and completes the entire task.
 
-EXAMPLE (IMPORTANT):
+    <code for the *immediate next step* (non-final)>
+    print(<intermediate output>)  # do NOT return
 
-{% if restrict_return_value %}
-❌ INVALID (depends on unseen results in the same REPL input):
-<repl_input lang="python">
-x = compute()
-print(x)
-y = process(x)
-print(y)
-</repl_input>
+*OR*
 
-✅ VALID (inspection happens between REPL inputs):
-
-<repl_input lang="python">
-x = compute()
-print(x)
-</repl_input>
-
-(Observe output)
-
-<repl_input lang="python">
-y = process(x)
-print(y)
-</repl_input>
-{% else %}
-❌ INVALID (depends on unseen results in the same REPL input):
-<repl_input lang="python">
-x = compute()
-print(x)
-y = process(x)
-RETURN y
-</repl_input>
-
-✅ VALID (inspection happens between REPL inputs):
-
-<repl_input lang="python">
-x = compute()
-print(x)
-</repl_input>
-
-(Observe output)
-
-<repl_input lang="python">
-y = process(x)
-RETURN y
-</repl_input>
-{% endif %}
-
-SPECIAL COMMAND RULES (STRICT):
-
-{% if restrict_return_value %}
-- RETURN:
-  - MUST be the only statement in the REPL input.
-  - MUST NOT be preceded or followed by any other code.
-  - MUST NOT be nested inside an if block or for/while loop.
-  - The value MUST be a JSON-like literal (string, number, boolean, None, list, dict).
-    Variables, expressions, and function calls are NOT allowed as RETURN values.
-{% if allow_raise %}
-
-- RAISE:
-  - MUST be the very last top-level statement in the REPL input.
-  - MUST NOT be followed by any other code.
-  - MUST NOT be nested inside an if block or for/while loop.
-{% endif %}
-{% else %}
-{% if allow_raise %}
-- RETURN or RAISE:
-{% else %}
-- RETURN:
-{% endif %}
-  - MUST be the very last top-level statement in the REPL input.
-  - MUST NOT be followed by any other code.
-  - MUST NOT be nested inside an if block or for/while loop.
-{% endif %}
-
-{% if allow_tools_command or allow_inspect_commands %}
-- {% if allow_tools_command %}TOOLS?{% endif %}{% if allow_tools_command and allow_inspect_commands %} and {% endif %}{% if allow_inspect_commands %}INSPECT{% endif %}:
-  - MUST be the only line in the REPL input.
-  - MUST NOT be combined with any other code.
-{% endif %}
-{% else %}
-
-CRITICAL: SINGLE-STATEMENT RULE (STRICTLY ENFORCED)
-
-- Each REPL input may contain ONLY ONE Python statement.
-- Multiple statements in a single input will cause a SyntaxError.
-- This rule is enforced at parse time via AST validation.
-
-VALID single statements include:
-- Assignment: `x = compute()`
-- Expression: `print(x)`
-- Function call: `result = process(data)`
-- Control flow: `if condition: do_something()`
-- Function/class definition: `def foo(): ...`
-- Import: `import math`
-
-EXAMPLES:
-
-❌ INVALID (multiple statements):
-<repl_input lang="python">
-x = compute()
-print(x)
-</repl_input>
-
-✅ VALID (single statement per input):
-
-<repl_input lang="python">
-x = compute()
-</repl_input>
-
-(Observe x is set)
-
-<repl_input lang="python">
-print(x)
-</repl_input>
-
-(Observe output)
-
-<repl_input lang="python">
-{% if restrict_return_value %}RETURN "result"{% else %}RETURN x{% endif %}
-</repl_input>
-
-SPECIAL COMMAND RULES (STRICT):
-
-{% if restrict_return_value %}
-- RETURN <literal value>:
-  - MUST be the only content in the REPL input.
-  - MUST NOT be combined with any other code.
-  - The value MUST be a JSON-like literal (string, number, boolean, None, list, dict).
-    Variables, expressions, and function calls are NOT allowed as RETURN values.
-{% else %}
-- RETURN <value>:
-  - MUST be the only content in the REPL input.
-  - MUST NOT be combined with any other code.
-{% endif %}
-{% if allow_raise %}
-
-- RAISE <error>:
-  - MUST be the only content in the REPL input.
-  - MUST NOT be combined with any other code.
-{% endif %}
-
-{% if allow_tools_command or allow_inspect_commands %}
-- {% if allow_tools_command %}TOOLS?{% endif %}{% if allow_tools_command and allow_inspect_commands %} and {% endif %}{% if allow_inspect_commands %}INSPECT{% endif %}:
-  - MUST be the only content in the REPL input.
-  - MUST NOT be combined with any other code.
-{% endif %}
-{% endif %}
-
-Violating any of the above rules will result in a SyntaxError and task failure.
-
-OUTPUT & INSPECTION NOTES:
-
-- Printed output may be truncated.
-- Printed output is NOT returned to the caller.
-{% if not restrict_return_value or expose_inputs_in_repl or repl_history %}
-
-The following magic variables are available:
-{% if expose_inputs_in_repl %}
-
-- `__task__`:
-  The task string (from <task> tag). Use this when making
-  recursive `jaz.invoke` calls to pass the task efficiently.
-{% endif %}
-{% if not restrict_return_value %}
-
-- `__return_type__`:
-  The expected return type for this REPL session.
-
-- `__return_validator__`:
-  Validator function for the return value for this REPL session (`None` if not set).
-{% endif %}
-{% if expose_inputs_in_repl %}
-
-- `__inputs__`:
-  A copy of the inputs dict passed to this REPL session.
-  If you've reassigned any input variables, you can retrieve
-  the original values from this dict.
-{% endif %}
-{% if repl_history %}
-
-- `__repl_history__`:
-  A list containing the REPL session history, indexed by iteration number.
-{% if expose_inputs_in_repl %}
-  - `__repl_history__[0]` contains initialization info:
-    - `.task`: Same as `__task__`
-    - `.inputs`: Same as `__inputs__`
-{% endif %}
-  - `__repl_history__[N]` (for N >= 1) contains iteration N's results:
-    - `.repl_input`: The source code executed in iteration N
-    - `.repl_output`: The printed output from iteration N
-    - `.error`: The error summary (str) if iteration N failed, else None
-
-- `_`:
-  The result of the most recent evaluated expression.
-
-- `_N`:
-  The result of the N-th REPL input, if it evaluated an expression.
-{% if multi_statement %}
-
-Use these variables ONLY to reference results from PREVIOUS REPL inputs.
-Do NOT use them to access or rely on results produced earlier
-within the SAME REPL input.
-{% endif %}
-{% endif %}
-{% endif %}
+    <code for the *last step* of the workflow>
+    return <final result>

@@ -43,44 +43,131 @@ The trade-offs were worth it for the cleaner API and better composability.
 Discrete points in the agent's execution lifecycle where hooks can observe and influence behavior.
 
 Examples:
-- `ReplIterationEnter` - Before executing REPL code
-- `LLMQueryEnter` - Before making an LLM API call
+- `LLMQueryEnter` - Before making an LLM API call (the always-present per-turn boundary)
+- `REPLExecEnter` - Before executing parsed REPL code (conditional — only on runnable code)
 - `InvokeEnter` - When `jaz.invoke()` is called
-- `Message` - When a message is processed
-- `BudgetUpdate` - When cost budget status changes
+
+**Events are immutable — treat them as completely read-only.** An `Event` is a frozen dataclass (rebinding a field raises `FrozenInstanceError`), `inputs`/`scope` are read-only mappings, and `hooks` is an immutable tuple. The **only** way a hook influences execution — or communicates with another hook — is by **returning effects**. The same event object is dispatched to every hook, so mutating it would let an earlier-ordered hook silently change what a later-ordered hook sees at the same event; effects avoid this because the dispatcher applies them only *after* the whole hook loop, so one hook's output is invisible to the others at the same event. (Some referenced objects — `config`, the live `hooks` — are deliberately live so you can *read* real runtime state; reading is fine, mutating through them is unsupported.)
 
 ### Effects
 Typed outputs from hooks that express how they want to influence execution. Effects are order-independent and composed by the dispatcher.
 
 Examples:
-- `HaltExecution` - Stop execution immediately
-- `AddInstructionPrompt` - Add instruction text to the agent's prompt
-- `ModifyIterationLimit` - Change max REPL iterations
-- `OverrideLLMClient` - Override the LLM model for a query
+- `Abort` - Terminate the invoke with a `Raise` (loop/budget hard-stops). Valid at **every live event**.
+- `OverrideResult` - Supply an `ExecResult` at `REPLExecEnter`, skipping execution.
+- `ModifyResult` - Transform the `ExecResult` at `REPLExecExit` (e.g. budget-forcing a refusal).
+- `AddMessages` - Add message(s) (e.g. instruction text) to the query at `LLMQueryEnter`
+- `OverrideResponse` - Supply a pre-computed LLM response, skipping the API call
+
+The two exec-result effects each carry a full `ExecResult`: `OverrideResult` *supplies* one at
+`REPLExecEnter` (execution is skipped; multiple must **agree**), `ModifyResult` *transforms* the
+result at `REPLExecExit` (multiple **fold** — carried `Continue`s concat output + group
+exceptions). `Abort` is *termination* — un-bundled from these (#481) — and is valid at **every
+live event**, so loop/budget control has an always-present home. Emitting an exec-result effect
+at any other event is ignored with a warning.
+
+**Conditional vs unconditional events (a contract every enforcement hook must
+know):** within a span, enter/exit pairing is guaranteed **with one carve-out — an
+`Abort` at `LLMQueryEnter` skips the paired `LLMQueryExit`** (the query never happens; the
+loop short-circuits to termination). So an observer hook that opens a resource at
+`LLMQueryEnter` and closes it at `LLMQueryExit` (e.g. a tracing span) leaks on every
+hard-stopped turn unless it *also* cleans up at `InvokeExit` — which is where the invoke
+ends and every still-open per-turn resource for that `invoke_id` should be released. The
+in-repo `OTelTracing` does exactly this (ends any orphaned `llm_query` child span at
+`InvokeExit`). Consumers that merely *read* `LLMQueryExit` (budget/cost, history, loggers)
+need no carve-out: an aborted turn ran no query, so there is correctly nothing to record.
+Child spans are also **not** guaranteed to open at all — REPL *execution* events only fire
+when the LLM response parses to runnable code; a turn whose response fails to parse never
+opens an execution span. So never use
+execution events as a proxy for "once per turn" — a hard stop hung there silently never
+fires for perpetually-unparseable output. Rule of thumb: **liveness / per-turn
+enforcement → `Abort` at `LLMQueryEnter`** (the always-present per-turn boundary — it fires
+unconditionally once per turn, before the query); **result-composed nudges → execution
+exit** (they intentionally compose with what the code actually did). This is how
+`IterationLimit` and `BudgetPool` place their hard stops vs soft force-finish nudges.
 
 ### Contexts
 Typed contracts between the dispatcher and agent containing composed effects. Each event type has a specific context type.
 
 Examples:
-- `ReplIterationContext` - Can halt, modify prompts, adjust iterations
-- `LLMQueryContext` - Can halt, override model parameters
-- `MessageContext` - Read-only, can only record metrics
-- `InvokeContext` - Can halt, add prompts, add libraries
+- `REPLExecContext` - REPL execution *enter*: can supply a result (OverrideResult) or terminate (Abort)
+- `REPLExecExitContext` - REPL execution *exit*: can transform the result (ModifyResult) or terminate (Abort)
+- `LLMQueryContext` - LLM query *enter*: can edit the prompt (AddMessages/DropMessages), override the response (OverrideResponse), or terminate (Abort)
+- `InvokeContext` - Can add REPL inputs, or terminate (Abort)
 
 ### Hooks
 Extension points that process events and return effects. Hooks inherit from the `Hook` base class and support the context manager protocol.
 
 ```python
-from jaz.dispatcher import Hook, Event, Effect
+from jaz.hooks import Hook, Effect, AddMessages
+from jaz.hooks.events import LLMQueryEnter
 
 class MyHook(Hook):
-    def on_event(self, event: Event) -> list[Effect]:
-        """Process event and return effects."""
-        # Hooks see all events - filter to what you care about
-        if isinstance(event, ReplIterationEnter):
-            return [AddInstructionPrompt("Be concise.")]
-        return []
+    # Override a typed per-event handler for just the events you care about — typed
+    # attribute access, no isinstance/match, and unimplemented events default to no-op.
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        # Prompt text is added as an AddMessages at LLMQueryEnter (the context
+        # where message edits compose).
+        return [
+            AddMessages(
+                messages=[{"role": "user", "content": "Be concise."}],
+                index=len(event.messages),
+            )
+        ]
 ```
+
+A cross-cutting observer that treats **every** event uniformly (logging, tracing) overrides
+`on_any(event)` instead — the dispatcher calls it *in addition to* the matched typed handler,
+so it composes with (never replaces) the per-event dispatch, and one hook may use both.
+Don't override `_dispatch_event`: it's the framework's private internal event router
+(#597, renamed from `on_event` in #740 so the router no longer looks like an `on_<event>`
+override point). Override the typed `on_<event>` handlers or `on_any` instead.
+
+### Hook serialization (`to_dict` / `from_dict`)
+
+`Hook.to_dict()` serializes a hook to a JSON-safe `{"class", "qualified_name", "params"}` dict,
+and `Hook.from_dict(d)` reconstructs it. Two uses: recording *what governance applied* in an
+observability trace (the loggers/tracers serialize each active hook at `InvokeEnter`), and
+round-tripping `Config.baseline_hooks` through `Config.to_dict()` → reconstruct.
+
+**Make a hook a dataclass and serialization is free** — no boilerplate:
+
+```python
+from dataclasses import dataclass
+from jaz.hooks import Hook
+
+@dataclass(eq=False)          # eq=False: hooks are identity objects (deduped by `is`, not value)
+class MyHook(Hook):
+    threshold: float = 0.5
+
+MyHook(threshold=0.9).to_dict()   # {"class": "MyHook", "qualified_name": ..., "params": {"threshold": 0.9}}
+Hook.from_dict(d)                 # -> MyHook(threshold=0.9)
+```
+
+Rules for the dataclass path:
+- Each `init` field becomes a param; `field(init=False)` runtime state (counters, per-invoke
+  dicts, open handles) is **excluded**.
+- A field whose value isn't JSON-safe and has no encoder is **omitted** — it round-trips to its
+  constructor default rather than crashing serialization.
+- For a non-JSON-safe value you *do* want preserved, declare a per-field
+  `field(metadata={"to_dict": encode, "from_dict": decode})` pair (an encoder returning `None`
+  omits the key). This is how `IterationLimit.must_exit_warning` (a callable/str/None)
+  round-trips.
+- Put validation in `__post_init__` (e.g. a range check), and heavy `__init__` work / derived
+  state there too.
+
+**Reconstruction never imports by name.** `from_dict` matches `class`/`qualified_name` against a
+registry auto-populated when each `Hook` subclass is defined (`__init_subclass__`), so any
+*imported* subclass **resolves** — built-ins are covered because importing `jaz.hooks` imports
+them all; a custom hook is resolvable once its module is imported. An unknown/unimported class
+raises `ValueError`. A short-name collision requires a matching `qualified_name` to disambiguate.
+A full *round-trip* additionally needs the params, so it holds for any imported **dataclass** hook
+(or one overriding `_to_dict_params`) — a plain-class hook with required constructor args
+serializes to empty params and fails to reconstruct.
+
+A hook that can't reasonably be a dataclass (live objects, `**kwargs`, credentials) stays a plain
+class and overrides `_to_dict_params()` (the explicit escape hatch), or simply doesn't serialize
+its params.
 
 ### HookDispatcher
 Stateless singleton that orchestrates hooks by:
@@ -96,35 +183,20 @@ Stateless singleton that orchestrates hooks by:
 Hooks are activated using Python's `with` statement:
 
 ```python
-from jaz import invoke
-from jaz.hooks import PrintLogger, BudgetControlHook
-from jaz.dispatcher import disable_hook, isolated_hooks
+from jaz import ReturnType, invoke
+from jaz.hooks import PrintLogger, BudgetPool
 import logging
 
 # Simple hook activation
 with PrintLogger(level=logging.INFO):
-    result = invoke("Calculate 2+2", return_type=int)
+    result = invoke(ReturnType(int), task="Calculate 2+2")
     # PrintLogger is active during this invoke
 
 # Nested hooks - both active
 with PrintLogger(level=logging.INFO):
-    with BudgetControlHook(cost_tracker):
-        result = invoke("Complex task", return_type=str)
-        # Both PrintLogger and BudgetControlHook are active
-
-# Disable specific hooks
-with PrintLogger(level=logging.INFO):
-    invoke("task 1", return_type=str)  # PrintLogger active
-
-    with disable_hook(PrintLogger):
-        invoke("task 2", return_type=str)  # PrintLogger disabled
-
-    invoke("task 3", return_type=str)  # PrintLogger active again
-
-# Isolated context (no parent hooks)
-with PrintLogger():
-    with isolated_hooks():
-        invoke("clean slate", return_type=str)  # No hooks at all
+    with BudgetPool(cost_budget=1.0, calls_budget=50):
+        result = invoke(ReturnType(str), task="Complex task")
+        # Both PrintLogger and BudgetPool are active
 ```
 
 ### Automatic Propagation
@@ -132,16 +204,16 @@ with PrintLogger():
 Hooks automatically propagate to nested `invoke()` calls via `contextvars`:
 
 ```python
-from jaz import invoke
+from jaz import ReturnType, invoke
 from jaz.hooks import PrintLogger
 
 with PrintLogger(level=logging.INFO):
     # This invoke has PrintLogger
     result = invoke(
-        """
+        ReturnType(int),
+        task="""
         Call invoke again with prompt: 'What is 5 * 5?'
         """,
-        return_type=int
     )
     # The nested invoke() call also has PrintLogger automatically!
 ```
@@ -150,36 +222,68 @@ This works across any level of nesting - hooks propagate through:
 - Nested `invoke()` calls
 - Function calls within the hook context
 - Async functions (contextvars are async-safe)
-- Threads (each thread gets its own context copy)
+- Threads started *inside* the hook context (each inherits a copy)
+
+> **Thread pool caveat**: `ThreadPoolExecutor` workers do **not** inherit the
+> calling thread's hooks — Python's `contextvars` only propagates to threads
+> that are *started* inside the active context, not to pre-existing pool
+> workers.
+>
+> Inside a **`jaz.invoke` sub-invoke** run in such a worker this is largely
+> mitigated (#727): the ancestor hook chain is closure-threaded on the prehook and
+> **re-based** onto the worker — composed *under* any hooks the worker activates
+> locally (`ancestor + local`, so both fire), rather than the old either/or that
+> dropped the ancestor whenever the worker had its own hook. What is **not**
+> recovered automatically is a hook the agent activated **mid-REPL** and then a raw
+> pool worker: `prehook.parent_hooks` was snapshotted before the REPL ran, and
+> contextvars can't cross the pool boundary. To carry the full live context
+> (including mid-REPL `with Hook()` activations) into a worker, wrap the call in
+> `contextvars.copy_context()`:
+>
+> ```python
+> import contextvars
+> from concurrent.futures import ThreadPoolExecutor
+>
+> ctx = contextvars.copy_context()  # snapshots the live hook + config context
+> with ThreadPoolExecutor() as ex:
+>     ex.submit(ctx.run, lambda: jaz.invoke(jaz.ReturnType(str), task="subtask")).result()
+> ```
+>
+> `copy_context()` carries the *established* context across, so the worker sees the
+> full parent state and no re-base is needed. Outside a sub-invoke (a bare hook, no
+> `jaz.invoke`), the caveat is unchanged — activate the hook *inside* the worker or
+> use `copy_context()`.
 
 ### Default Global Context
 
-By default, all invokes have `PrintLogger(level=logging.INFO)` active. To start with a clean slate:
+The default hook context is **empty**. Hooks are opt-in: nothing runs until
+you activate a hook via `with HookClass():`.
 
-```python
-from jaz.dispatcher import isolated_hooks
+Future essential built-in behaviors (budget enforcement, permissions, etc.)
+will be auto-installed by `jaz.invoke()`. Each such built-in will ship with
+its own dedicated, behavior-specific opt-out (e.g., a hypothetical
+`bypass_budget()`) — **not** a generic disable/clear mechanism.
 
-with isolated_hooks():
-    # No default PrintLogger - completely clean context
-    invoke("silent task", return_type=str)
-```
+There is deliberately **no** generic way to disable or clear hooks — neither a
+class-keyed `disable_hook(SomeClass)` nor a blanket `clear_all_hooks()` (#466
+removed both). Hook lifecycle is managed purely by lexical `with` scoping:
+
+1. Multiple instances of the same `Hook` class can be active simultaneously
+   (e.g., two `PrintLogger`s at different levels). A class-keyed disable
+   conflates class with instance identity and silently kills all of them.
+2. A blanket clear is a footgun: it silently strips governance / safety
+   baseline hooks (e.g. the loop's only termination guarantee), and its effect
+   can't even be honored in raw worker threads (they restore the ancestor
+   context) — a false sense of a clean slate.
+3. Named, behavior-specific opt-outs document intent at the call site and are
+   far easier to audit than a generic kill switch.
 
 ### Helper Functions
 
 ```python
-from jaz.dispatcher import disable_hook, isolated_hooks
-
-# Disable specific hook types
-with disable_hook(PrintLogger, MetricsHook):
-    invoke(...)  # These hook types are disabled
-
 # Activate multiple hooks with native Python syntax
 with Hook1(), Hook2(), Hook3():
     invoke(...)  # All three hooks active
-
-# Isolated context
-with isolated_hooks():
-    invoke(...)  # No parent hooks, clean slate
 ```
 
 ## Architecture
@@ -189,13 +293,13 @@ with isolated_hooks():
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Global Default Context                                   │
-│ hooks: (PrintLogger(INFO),)                             │
+│ hooks: ()  # empty — hooks are opt-in                    │
 └─────────────────────────────────────────────────────────┘
                          │
                          ▼
            ┌─────────────────────────────┐
            │ with MyHook():              │
-           │ hooks: (PrintLogger, MyHook)│
+           │ hooks: (MyHook,)            │
            └─────────────────────────────┘
                          │
                          ▼
@@ -234,7 +338,8 @@ with isolated_hooks():
               └────────────────────┘
                     │
                     │ Composition Rules:
-                    │ • ANY halt → halt (all errors collected)
+                    │ • Abort → Raise (supersedes ModifyResult)
+                    │ • ModifyResult → transforms the ExecResult
                     │ • ALL prompts → concatenate
                     │ • MIN iteration limit
                     │ • ALL metrics → record
@@ -244,8 +349,8 @@ with isolated_hooks():
           │ ExecutionContext     │
           │ (Typed)              │
           │                      │
-          │ • halt_errors: list  │
-          │ • should_halt: bool  │
+          │ • error_effects: list│
+          │ • raise_effects: list│
           │ • instruction_prompt │
           │ • max_iterations...  │
           └──────────────────────┘
@@ -263,55 +368,80 @@ with isolated_hooks():
 ### 1. Create a Hook
 
 ```python
-from jaz.dispatcher import Hook, Event, Effect, ReplIterationEnter, HaltExecution, AddInstructionPrompt
-from jaz.budget import CostTracker
+from jaz.hooks import (
+    Hook, Event, Effect, LLMQueryEnter, Abort, AddMessages,
+)
 
-class BudgetControlHook(Hook):
-    """Hook that enforces budget limits."""
+class WrapUpHook(Hook):
+    """Example custom hook: nudge the agent to finish after `soft` REPL
+    iterations, then hard-stop after `hard`.
 
-    def __init__(self, cost_tracker: CostTracker):
-        self.cost_tracker = cost_tracker
+    Illustrates the two effect kinds you'll reach for most — a soft nudge via
+    AddMessages (prompt modification, emitted at LLMQueryEnter) and a terminal abort
+    via Abort — plus the fact that a hook may hold its own state across events.
 
-    def on_event(self, event: Event) -> list[Effect]:
-        effects = []
+    Both live on ``LLMQueryEnter``, the always-present per-turn boundary: the nudge
+    because that's the only context where message edits compose, and the hard stop because
+    ``Abort`` there fires once per turn *before* the query (so it never wastes a call and
+    never silently skips a parse-failure turn the way a conditional execution event would).
 
-        # Only act on REPL iteration events
-        if isinstance(event, ReplIterationEnter):
-            if self.cost_tracker.is_budget_exhausted():
-                effects.append(AddInstructionPrompt(
-                    text="Budget exhausted! Exit immediately.",
-                ))
+    Note ``_iterations`` here is **tree-wide**: one hook instance propagates to
+    nested ``invoke()`` calls via contextvars, so the count spans the whole
+    invoke tree rather than each invoke separately. For per-invoke state, key your
+    tracking by ``event.invoke_id`` — which is exactly why the built-in
+    BudgetPool keys its trackers by invoke_id. For real LLM cost /
+    call-count budgets, use that built-in rather than rolling your own.
+    """
 
-                if self.cost_tracker.is_buffer_exhausted():
-                    effects.append(HaltExecution(
-                        error=BudgetExhaustedError(),
-                    ))
+    def __init__(self, soft: int = 5, hard: int = 8):
+        self.soft = soft
+        self.hard = hard
+        self._iterations = 0
 
-        return effects
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        # LLMQueryEnter fires once per turn, before the query — count here.
+        self._iterations += 1
+
+        # Once past `hard`, terminate the invoke: Abort resolves to a Raise that
+        # propagates out of invoke().
+        if self._iterations > self.hard:
+            return [Abort(error=RuntimeError("Iteration limit exceeded"))]
+
+        # Once past `soft`, nudge the agent to finish. The nudge is an AddMessages
+        # appended to the end of this query.
+        if self._iterations > self.soft:
+            return [
+                AddMessages(
+                    messages=[{"role": "user", "content": "Wrap up and RETURN soon."}],
+                    index=len(event.messages),
+                )
+            ]
+
+        return []
 ```
 
 ### 2. Use Hook as Context Manager
 
 ```python
-from jaz import invoke
+from jaz import ReturnType, invoke
 
 # Activate hook for specific scope
-with BudgetControlHook(cost_tracker):
-    result = invoke("Expensive task", return_type=str)
-    # BudgetControlHook is active during this invoke
+with WrapUpHook():
+    result = invoke(ReturnType(str), task="Expensive task")
+    # WrapUpHook is active during this invoke
 ```
 
 ### 3. Combine Multiple Hooks
 
 ```python
-from jaz.hooks import PrintLogger, SafetyFilterHook
+from jaz.hooks import PrintLogger, BudgetPool
 import logging
 
-# Both hooks active
+# All three hooks active; they compose and propagate together
 with PrintLogger(level=logging.INFO):
-    with BudgetControlHook(cost_tracker):
-        with SafetyFilterHook():
-            result = invoke("Task with all protections", return_type=str)
+    with BudgetPool(cost_budget=1.0, calls_budget=50):
+        with WrapUpHook():
+            result = invoke(ReturnType(str), task="Task with all protections")
 ```
 
 ### 4. Conditional Hook Activation
@@ -320,107 +450,91 @@ with PrintLogger(level=logging.INFO):
 def my_function(enable_logging: bool = True):
     if enable_logging:
         with PrintLogger(level=logging.INFO):
-            return invoke("task", return_type=str)
+            return invoke(ReturnType(str), task="task")
     else:
-        with isolated_hooks():  # No default PrintLogger
-            return invoke("silent task", return_type=str)
+        return invoke(ReturnType(str), task="silent task")  # No logging hook
 ```
 
-### 5. Hook Disabling Pattern
+### 5. Use in Agent (Internal)
 
 ```python
-# Override PrintLogger level temporarily
-with PrintLogger(level=logging.INFO):
-    invoke("normal logging", return_type=str)
-
-    # Temporarily use DEBUG level
-    with disable_hook(PrintLogger):
-        with PrintLogger(level=logging.DEBUG):
-            invoke("verbose logging", return_type=str)
-
-    # Back to INFO level
-    invoke("normal logging again", return_type=str)
-```
-
-### 6. Use in Agent (Internal)
-
-```python
-from jaz.dispatcher import get_dispatcher
+from jaz.hooks import get_dispatcher
 
 # In Agent.do_one_repl_iteration()
 dispatcher = get_dispatcher()
 
-with dispatcher.span_repl_iteration(
-    iteration=i,
-    max_iterations=max_iterations,
-    code=code,
-    cur_recursion_depth=cur_recursion_depth
-) as span:
-    # Check if hooks want to halt
-    if span.ctx.should_halt:
-        _raise_halt_errors(span.ctx.halt_errors)  # ExceptionGroup if multiple
-
-    # Apply prompt modifications from hooks
-    if span.ctx.instruction_prompt_additions:
-        prompt += "\n" + "\n".join(span.ctx.instruction_prompt_additions)
-
-    # Use iteration limit override if provided
-    max_iters = span.ctx.max_iterations_override or max_iterations
-
-    # Execute REPL code
-    exec_result = repl.exec(code, ...)
+with dispatcher.span_repl_exec(enter_event) as span:
+    if span.enter_override is not None:
+        # An enter-time OverrideResult (supply) / Abort short-circuits execution.
+        exec_result = span.enter_override
+    else:
+        # Execute REPL code (REPL inputs are injected once at InvokeEnter, not here —
+        # AddInput is InvokeEnter-only, #481)
+        exec_result = repl.exec(code, ...)
 
     # Complete the span
     span.complete(exec_result=exec_result)
+
+# Apply any exit-time ModifyResult transform / Abort.
+exec_result = span.get_final_exec_result()
 ```
 
 ## Composition Rules
 
 The dispatcher applies explicit composition rules when combining effects from multiple hooks:
 
-### Halting
-- **Rule**: If ANY hook returns `HaltExecution`, execution halts
-- **Multiple halts**: All errors are collected. A single error is raised directly; multiple errors are raised as an `ExceptionGroup`
+### Exec-result / terminate effects (`OverrideResult` / `ModifyResult` / `Abort`)
+`OverrideResult` is valid only at `REPLExecEnter` (supply), `ModifyResult` only at `REPLExecExit`
+(transform); `Abort` is valid at every live event. Where they co-occur (the REPL execution
+boundaries) they compose into the REPL result types (`Continue` / `Return` / `Raise`):
+
+- **Enter (`OverrideResult`)**: execution is skipped and the supplied result is used. Multiple
+  `OverrideResult`s **fold** among themselves (no `exec_result` to fold onto yet) by the same
+  precedence as the exit boundary — carried `Continue`s concatenate their `output` and group their
+  exceptions, so two hooks vetoing the same input (e.g. a `ValidateREPLInput` and the evals
+  `RestrictReturnValue`) compose into one recoverable rejection; distinct carried `Return` *values*
+  still raise `ReturnValueConflictError`. `Abort` supersedes them.
+- **Exit (`ModifyResult`)**: the composed result supersedes the actual `exec_result`; multiple
+  **fold** by carried-result kind precedence `Raise` > `Return` > `Continue`. Carried `Continue`s
+  concatenate their `output` onto the original's and group their exceptions into an
+  `ExceptionGroup`; carried `Return`s cannot merge (two distinct values raise
+  `ReturnValueConflictError`, identical ones coalesce); carried `Raise`s group their exceptions. The original's
+  exception is folded in only when the outcome is of the same final type; the original `output` is
+  preserved.
+
+Both boundaries share one fold (`_fold_carried_results`); enter passes `original=None`, exit passes
+the executed result.
+- **`Abort` supersedes** the exec-result effects at either boundary (termination trumps
+  supply/transform) → `Raise`. Multiple `Abort`s group their exceptions into an `ExceptionGroup`.
 
 ### Prompt Modifications
-- **Rule**: ALL `AddInstructionPrompt` effects are concatenated
-- **Order**: Concatenated in hook registration order
-- **Example**: Budget warning + safety note both appear in prompt
-
-### Iteration Limits
-- **Rule**: MINIMUM of all `ModifyIterationLimit` effects
-- **Rationale**: Most restrictive limit wins (safety-first)
-- **Example**: Hook A says max=10, Hook B says max=5 → use 5
-
-### Model Overrides
-- **Rule**: LAST `OverrideLLMClient` effect wins
-- **Order**: Determined by hook registration order
-- **Note**: Last hook registered has final say
+- **Rule**: prompt text is added via `AddMessages` at `LLMQueryEnter`; all adds compose into the query through the message-edit fold (`apply_message_edits`)
+- **Order**: deterministic and hook-order-independent — same-slot adds are ordered by `(sort_key, canonical content)`
+- **Example**: Budget warning + safety note both appear in the query
 
 ## Type Safety
 
 The dispatcher uses typed contexts to prevent invalid operations:
 
 ```python
-# Type checker knows ctx is ReplIterationContext!
-with dispatcher.span_repl_iteration(...) as span:
-    span.ctx.instruction_prompt_additions  # ✓ Exists
-    span.ctx.llm_client_override  # ✗ Type error - doesn't exist on ReplIterationContext
+# Type checker knows ctx is REPLExecContext!
+with dispatcher.span_repl_exec(...) as span:
+    span.ctx.override_effects  # ✓ Exists
+    span.ctx.message_edits  # ✗ Type error - doesn't exist on REPLExecContext
 
 # Type checker knows ctx is LLMQueryContext!
 with dispatcher.span_llm_query(...) as span:
-    span.ctx.llm_client_override  # ✓ Exists
-    span.ctx.model_config_overrides  # ✓ Exists
-    span.ctx.instruction_prompt_additions  # ✗ Type error - doesn't exist on LLMQueryContext
+    span.ctx.message_edits  # ✓ Exists
+    span.ctx.override_response  # ✓ Exists
+    span.ctx.override_effects  # ✗ Type error - doesn't exist on LLMQueryContext
 ```
 
 Read-only contexts prevent invalid operations:
 
 ```python
-# MessageContext is read-only - can't halt during message processing
-ctx = dispatcher.process_message(message)
-ctx.should_halt  # AttributeError — ExecutionContext has no halt fields
-# Hooks that return HaltExecution for Message events get logged as warnings
+# An OverrideResult / ModifyResult emitted at an event that can't compose it
+# (e.g. LLMQueryEnter) is logged as a warning and ignored — but Abort is
+# valid there and terminates the invoke.
 ```
 
 ## Hook Coordination
@@ -429,33 +543,36 @@ For complex scenarios where hooks need to coordinate, create a "meta-hook" that 
 
 ```python
 class AdaptiveBudgetHook(Hook):
-    """Single hook that coordinates budget + iteration adjustment."""
+    """Single hook that coordinates a budget warning + abort decision."""
 
-    def __init__(self, cost_tracker: CostTracker):
+    def __init__(self, cost_tracker: CostTracker, budget: float):
+        # CostTracker is a budget-less accounting node now; the meta-hook holds its
+        # own budget (mirrors how BudgetTrackingHook owns the one pool budget).
         self.cost_tracker = cost_tracker
+        self.budget = budget
 
-    def on_event(self, event: Event) -> list[Effect]:
-        effects = []
+    def _utilization(self) -> float:
+        return self.cost_tracker.total_llm_cost / self.budget
 
-        if isinstance(event, ReplIterationEnter):
-            utilization = (
-                self.cost_tracker.total_llm_cost /
-                self.cost_tracker.llm_cost_budget
-            )
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        # Both decisions live on LLMQueryEnter (once per turn, before the query).
+        # Check the hard stop first so an exhausted budget terminates rather than
+        # merely warning.
+        if self._utilization() >= 1.0:
+            # Abort is valid at every live event and resolves to a terminal Raise.
+            return [Abort(error=BudgetExhaustedError())]
 
-            # Coordinated decision
-            if utilization > 0.8:
-                # Reduce iterations
-                effects.append(ModifyIterationLimit(
-                    new_max=max(3, event.max_iterations // 2),
-                    reason="budget_conservation"
-                ))
-                # AND add explanation to prompt
-                effects.append(AddInstructionPrompt(
-                    text=f"Budget at {utilization:.1%}, reducing iterations",
-                ))
+        # Otherwise, warn the agent to wrap up (prompt modification, composed at the query).
+        if self._utilization() > 0.8:
+            return [AddMessages(
+                messages=[{
+                    "role": "user",
+                    "content": f"Budget at {self._utilization():.1%}; finish and RETURN soon.",
+                }],
+                index=len(event.messages),
+            )]
 
-        return effects
+        return []
 ```
 
 This is cleaner than having two separate hooks that might conflict.
@@ -471,21 +588,24 @@ class AdaptiveLogger(Hook):
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
 
-    def on_event(self, event: Event) -> list[Effect]:
-        if self.verbose:
-            # Log everything
-            return [AddInstructionPrompt(f"Event: {type(event).__name__}")]
-        elif isinstance(event, (ReplIterationEnter, LLMQueryEnter)):
-            # Only log important events
-            return [AddInstructionPrompt(f"Event: {type(event).__name__}")]
+    def on_any(self, event: Event) -> list[Effect]:
+        # Prompt additions only compose at LLMQueryEnter; add more detail when verbose.
+        if isinstance(event, LLMQueryEnter):
+            note = "verbose context note" if self.verbose else "brief context note"
+            return [
+                AddMessages(
+                    messages=[{"role": "user", "content": note}],
+                    index=len(event.messages),
+                )
+            ]
         return []
 
 # Use different verbosity in different scopes
 with AdaptiveLogger(verbose=False):
-    invoke("production task", return_type=str)
+    invoke(ReturnType(str), task="production task")
 
 with AdaptiveLogger(verbose=True):
-    invoke("debug task", return_type=str)
+    invoke(ReturnType(str), task="debug task")
 ```
 
 ### Conditional Hook Wrapper
@@ -504,19 +624,18 @@ def maybe_hook(hook: Hook, enabled: bool):
 
 # Use it
 with maybe_hook(PrintLogger(level=logging.DEBUG), enable_debug):
-    invoke("task", return_type=str)
+    invoke(ReturnType(str), task="task")
 ```
 
 ### Hook Stack Inspection
 
 ```python
-from jaz.dispatcher import get_current_hooks
+from jaz.hooks.context import get_current_hooks
 
 def print_active_hooks():
     """Debug utility to see what hooks are active."""
     hook_ctx = get_current_hooks()
-    print(f"Active hooks: {[type(h).__name__ for h in hook_ctx.get_active_hooks()]}")
-    print(f"Disabled types: {hook_ctx.disabled_types}")
+    print(f"Active hooks: {[type(h).__name__ for h in hook_ctx.hooks]}")
 ```
 
 ## Testing Hooks
@@ -524,22 +643,31 @@ def print_active_hooks():
 The context-based design makes hooks easy to test in isolation:
 
 ```python
-from jaz.dispatcher import get_dispatcher, isolated_hooks
+from jaz.hooks import get_dispatcher
 
 def test_my_hook():
     """Test hook in isolation."""
-    # Use isolated_hooks to avoid default PrintLogger
-    with isolated_hooks():
-        with MyHook():
-            dispatcher = get_dispatcher()
+    # The default context is empty, so MyHook is the only active hook.
+    with MyHook():
+        dispatcher = get_dispatcher()
 
-            # Emit test event
-            event = ReplIterationEnter(1, 10, "test", 0)
-            effects = dispatcher.emit(event)
+        # Emit test event. Every Event carries the invoke's effective `config`
+        # (the dispatcher resolves baseline_hooks from it — see #463); in a test,
+        # `get_config()` is the convenient default.
+        event = LLMQueryEnter(
+            config=get_config(),
+            invoke_id="test",
+            messages=[],
+            model="test-model",
+            iteration=1,
+            depth=0,
+            can_recurse=True,
+        )
+        effects = dispatcher.emit(event)
 
-            # Assert expected effects
-            assert len(effects) == 1
-            assert isinstance(effects[0], AddInstructionPrompt)
+        # Assert expected effects (a prompt addition is an AddMessages at LLMQueryEnter).
+        assert len(effects) == 1
+        assert isinstance(effects[0], AddMessages)
 ```
 
 ## Extension Points
@@ -552,14 +680,15 @@ To add new capabilities to the hook system:
 # events/my_event.py
 @dataclass
 class MyCustomEvent(Event):
-    """My custom event."""
+    """My custom event. Inherits the required `config` field from Event (#463)."""
     data: str
     timestamp: float
 
-# dispatcher.py - add span method
+# dispatcher.py - add span method. The Agent passes the invoke's effective config
+# into the enter event (self.config); the dispatcher copies it onto the exit event.
 @contextmanager
-def span_my_custom(self, data: str):
-    enter_event = MyCustomEvent(data=data, timestamp=time.time())
+def span_my_custom(self, config: "Config", data: str):
+    enter_event = MyCustomEvent(config=config, data=data, timestamp=time.time())
     effects = self.emit(enter_event)
     ctx = self._compose_my_custom(effects)
     span = Span(ctx=ctx)
@@ -597,7 +726,7 @@ Just implement the `Hook` base class:
 
 ```python
 class MyCustomHook(Hook):
-    def on_event(self, event: Event) -> list[Effect]:
+    def on_any(self, event: Event) -> list[Effect]:
         if isinstance(event, MyCustomEvent):
             return [MyCustomEffect(action="process", data={})]
         return []
@@ -610,7 +739,7 @@ If you have code using the old dispatcher API:
 ```python
 # OLD WAY (deprecated)
 dispatcher = HookDispatcher()
-dispatcher.add_hook(ReplIterationEnter, MyHook())
+dispatcher.add_hook(LLMQueryEnter, MyHook())
 agent = Agent(repls=["python"], dispatcher=dispatcher)
 result = agent.invoke(...)
 
@@ -637,10 +766,10 @@ A: Use nested `with` statements to change the active hooks:
 
 ```python
 with Hook1():
-    invoke("task 1", return_type=str)  # Has Hook1
+    invoke(ReturnType(str), task="task 1")  # Has Hook1
 
 with Hook2():
-    invoke("task 2", return_type=str)  # Has Hook2
+    invoke(ReturnType(str), task="task 2")  # Has Hook2
 ```
 
 **Q: Are hooks thread-safe?**
@@ -653,11 +782,11 @@ A: Yes! `contextvars` are async-safe, so hooks work correctly across `await` bou
 
 **Q: How do I see what hooks are currently active?**
 
-A: Use `get_current_hooks()` from `jaz.dispatcher`:
+A: Use `get_current_hooks()` from `jaz.hooks.context`:
 
 ```python
-from jaz.dispatcher import get_current_hooks
+from jaz.hooks.context import get_current_hooks
 
 hook_ctx = get_current_hooks()
-print([type(h).__name__ for h in hook_ctx.get_active_hooks()])
+print([type(h).__name__ for h in hook_ctx.hooks])
 ```

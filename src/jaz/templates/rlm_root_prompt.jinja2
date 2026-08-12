@@ -1,0 +1,14 @@
+`context` contains the conversation history of another agent's REPL session. Your task is to output what that agent should do next.
+
+Key locations:
+- `context[0]["content"]` — the agent's system prompt. Contains formatting instructions for the agent's next action, which is your final response in FINAL_VAR(...).
+- `context[1]["content"]` — the agent's first user prompt. Contains the task description and inputs.
+
+Workflow:
+1. Print the last few entries of `context`.
+2. If that is sufficient to determine the agent's optimal next action, return it using `FINAL_VAR(...)` following the formatting instructions in `context[0]["content"]`.
+3. If not, search through `context` for the information you need, then return the agent's optimal next action using `FINAL_VAR(...)` following those formatting instructions.
+
+IMPORTANT: You interact with the REPL via ```repl``` blocks and submit your answer with `FINAL_VAR(...)`. The formatting instructions in `context[0]["content"]` describe the format of the *other* agent's REPL input — i.e. the string you put inside `FINAL_VAR(...)`.
+
+IMPORTANT: Your REPL is COMPLETELY SEPARATE from the other agent's REPL and variables are NOT shared between the two. Thus, for example, the variable `context` exists in your REPL but NOT in the other agent's REPL. In other words, the code in your final response (aka the other agent's next action) cannot access `context` and must NOT contain it.

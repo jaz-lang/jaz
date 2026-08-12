@@ -1,9 +1,9 @@
 """Jaeger tracing hook that exports spans via OpenTelemetry OTLP HTTP."""
 
-from jaz.hooks.builtin.otel_tracing import OTelTracingHook
+from jaz.hooks.builtin.otel_tracing import OTelTracing
 
 
-class JaegerTracingHook(OTelTracingHook):
+class JaegerTracing(OTelTracing):
     """Hook preset for exporting Jaz traces to Jaeger.
 
     Args:
@@ -25,3 +25,10 @@ class JaegerTracingHook(OTelTracingHook):
             service_name=service_name,
             max_attribute_length=max_attribute_length,
         )
+
+
+#: Deprecated alias for the pre-rename spelling — see the rationale block in
+#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
+#: site so the deep-path import keeps working and so the alias map stays checkable
+#: (``test_every_renamed_hook_has_an_alias``).
+JaegerTracingHook = JaegerTracing

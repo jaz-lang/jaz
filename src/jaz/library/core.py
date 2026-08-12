@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Iterable, MutableMapping
 from types import ModuleType
 from typing import Self
 
-# TODO: Have this be configurable
-_MAX_PROMPT_OBJECT_ENTRIES = 100
+from .._catalog import render_catalog
 
 
 def _parse_dotted_path(dotted_path: str) -> list[str]:
@@ -24,11 +22,32 @@ def _unparse_dotted_path(dotted_path_parts: list[str]) -> str:
 
 
 class Library:
-    """
-    A library is a collection of tools that can be called by the language model
-    in a REPL session. Tools are functions or other Python objects that have
-    __name__ and __doc__ attributes. A library structured as a hierarchical namespace,
-    similar to Python packages and modules.
+    """A convenience builder for a nested, dotted tool namespace.
+
+    A library is a collection of tools (functions or other objects with ``__name__``
+    / ``__doc__``) assembled into a hierarchical namespace, like a Python package.
+    Its construction ergonomics — dotted-path :meth:`add`, the
+    :meth:`register` decorator, nested submodules with docstrings — are the reason
+    it still exists; ``SimpleNamespace`` covers the flat case, ``Library`` is nicer
+    for nested namespaces built at runtime (tools that close over per-episode state).
+
+    Role in the framework (see ``design/design_features/library_as_input.md``):
+    a ``Library`` is now an **ordinary input**, not a privileged kwarg. There is no
+    ``libraries=`` on ``jaz.invoke`` — you pass a library as a normal keyword
+    argument and it binds into the REPL under that name. Two protocol methods make
+    this work:
+
+    - :meth:`__jaz_get__` returns the library's single root module, so the agent
+      interacts with the module of tools rather than this bookkeeping object (payload
+      substitution — the same ``__jaz_get__`` protocol that ``jaz.Display`` uses).
+    - :meth:`__jaz_description__` renders the tool catalog rooted at the *bound name*
+      (the kwarg), so ``jaz.invoke(tools=lib)`` documents ``tools.foo(...)`` regardless
+      of the root module's internal name.
+
+    Constraint: a ``Library`` used as an input must have **exactly one root module**
+    (every real library does); see :meth:`_single_root_module`. The privileged
+    multi-name binding (``add_self_to_program_state``) survives only to bind the
+    framework's own JAZ library and to support eval harnesses with their own REPLs.
 
     Methods:
     - add(tool_path: str, tool: object): Add a tool to the library at the
@@ -143,96 +162,82 @@ class Library:
         for module_name, module in self._root_modules.items():
             program_state[module_name] = module
 
-    @staticmethod
-    def _summarize_doc(obj: object, *, full: bool = False) -> str | None:
-        doc = inspect.getdoc(obj)
-        if not doc:
-            return None
-        doc = doc.strip()
-        return doc if full else doc.splitlines()[0]
+    def _single_root_module(self) -> ModuleType:
+        """Return the library's one root module, enforcing the single-root invariant.
 
-    @staticmethod
-    def _format_signature(obj: object) -> str:
-        if not callable(obj):
-            return ""
-        try:
-            return str(inspect.signature(obj))
-        except (TypeError, ValueError):
-            return "()"
-
-    @classmethod
-    def _format_object_entry(
-        cls, dotted_path: str, obj: object, *, full_docstrings: bool = False
-    ) -> str:
-        if isinstance(obj, ModuleType):
-            doc_summary = (
-                cls._summarize_doc(obj, full=full_docstrings)
-                or "(no description available)"
+        A ``Library`` used as a normal ``jaz.invoke`` input binds under exactly one
+        kwarg name, so it must expose exactly one root module (the design constrains
+        ``Library`` to a single root — see ``library_as_input.md``). The invariant is
+        checked lazily here rather than at construction so the builder API (empty
+        libraries, incremental ``create_module``) keeps working; it only has to hold
+        at the point the library is consumed as an input.
+        """
+        if len(self._root_modules) != 1:
+            raise ValueError(
+                f"Library {self._name!r} must have exactly one root module to be used "
+                f"as an input (has {len(self._root_modules)}: "
+                f"{sorted(self._root_modules)}). A Library binds under a single kwarg "
+                "name; nest additional namespaces as sub-modules of the one root."
             )
-            return f"- `{dotted_path}` [module]: {doc_summary}"
+        (module,) = self._root_modules.values()
+        return module
 
-        if callable(obj):
-            signature = cls._format_signature(obj)
-            doc_summary = (
-                cls._summarize_doc(obj, full=full_docstrings)
-                or "(no description available)"
+    def __jaz_get__(self) -> ModuleType:
+        """Return the root module to bind into the REPL under this input's kwarg name.
+
+        Payload substitution (the ``__jaz_get__`` protocol): the
+        ``Library`` is bookkeeping; the agent interacts with the module of tools. So
+        ``jaz.invoke(env=lib)`` binds the root module as ``env``, not the ``Library``.
+        """
+        return self._single_root_module()
+
+    def __jaz_description__(self, bound_name: str | None) -> str:
+        """Render this library's tool catalog rooted at ``bound_name``.
+
+        This is the generalized form of the old ``<tool_libraries>`` rendering: the
+        catalog renders against the *bound name* (the kwarg the agent sees), so
+        ``jaz.invoke(tools=lib)`` produces ``tools.bash(...)`` regardless of the root
+        module's internal name.
+
+        The body is delegated to :meth:`default_description` so a ``jaz.describe``
+        override can *compose* with the default catalog rather than replace it
+        wholesale: ``jaz.get_description`` routes back through this method
+        (which the override has replaced), so the default has to be reachable by a
+        path that does not — that path is ``default_description``.
+        """
+        return self.default_description(bound_name)
+
+    def default_description(self, bound_name: str | None = None) -> str:
+        """Render the default tool catalog for this library, rooted at ``bound_name``.
+
+        Factored out of :meth:`__jaz_description__` so a caller that overrides this
+        library's description via ``jaz.describe`` can still reach the default
+        rendering and append to it, e.g.::
+
+            jaz.describe(
+                lib, lambda l, name: f"Custom note.\\n\\n{l.default_description(name)}"
             )
-            return f"- `{dotted_path}{signature}`: {doc_summary}"
 
-        type_name = type(obj).__name__
-        return f"- `{dotted_path}` [{type_name}]"
+        Going through ``jaz.get_description`` instead would recurse — it resolves
+        ``__jaz_description__``, which the override has replaced.
+        """
+        root = self._single_root_module()
+        return render_catalog(root, bound_name)
 
-    @classmethod
-    def _render_module_entries(
-        cls,
-        module: ModuleType,
-        dotted_path: str,
-        *,
-        seen_modules: set[int],
-        remaining_entries: list[int],
-        full_docstrings: bool = False,
-    ) -> list[str]:
-        if remaining_entries[0] <= 0:
-            return []
+    def render_prompt_description(self, *, full_docstrings: bool = True) -> str:
+        """Render the full library card (name + description + tool catalog).
 
-        module_id = id(module)
-        if module_id in seen_modules:
-            return [f"- `{dotted_path}` [module]: (already documented above)"]
+        Used for the dedicated ``<jaz_library>`` system-prompt block (the always-present
+        JAZ library). The per-object catalog walk is shared with the general
+        ``jaz.Catalog`` render mode via :func:`jaz._catalog.render_catalog`, so the two
+        cannot drift. Each root module is rendered rooted at its own name (real
+        libraries have exactly one root; see ``_single_root_module``).
 
-        seen_modules.add(module_id)
-        entries = [
-            cls._format_object_entry(
-                dotted_path, module, full_docstrings=full_docstrings
-            )
-        ]
-        remaining_entries[0] -= 1
+        ``full_docstrings`` defaults to ``True`` — render comprehensively; pass
+        ``False`` to opt into compact (first-line-only) rendering when size matters.
+        See :func:`jaz._catalog.render_catalog` for the rationale.
+        """
 
-        for name, value in sorted(vars(module).items()):
-            if remaining_entries[0] <= 0:
-                break
-            if name.startswith("_"):
-                continue
-            child_path = f"{dotted_path}.{name}"
-            if isinstance(value, ModuleType):
-                entries.extend(
-                    cls._render_module_entries(
-                        value,
-                        child_path,
-                        seen_modules=seen_modules,
-                        remaining_entries=remaining_entries,
-                        full_docstrings=full_docstrings,
-                    )
-                )
-            else:
-                entries.append(
-                    cls._format_object_entry(
-                        child_path, value, full_docstrings=full_docstrings
-                    )
-                )
-                remaining_entries[0] -= 1
-        return entries
-
-    def render_prompt_description(self, *, full_docstrings: bool = False) -> str:
         def backtickify(text: str) -> str:
             return f"`{text}`"
 
@@ -242,26 +247,18 @@ class Library:
             f"**Top-level module(s):** {', '.join(map(backtickify, self._root_modules.keys()))}",
         ]
 
-        exported_entries: list[str] = []
-        seen_modules: set[int] = set()
-        remaining_entries = [_MAX_PROMPT_OBJECT_ENTRIES]
-        for module_name, module in sorted(self._root_modules.items()):
-            exported_entries.extend(
-                self._render_module_entries(
-                    module,
-                    module_name,
-                    seen_modules=seen_modules,
-                    remaining_entries=remaining_entries,
-                    full_docstrings=full_docstrings,
-                )
-            )
-
-        if exported_entries:
-            if remaining_entries[0] <= 0:
-                exported_entries.append(
-                    f"- ... truncated after {_MAX_PROMPT_OBJECT_ENTRIES} objects"
-                )
-            sections.append("**Available objects:**\n" + "\n".join(exported_entries))
+        # Each root is rendered independently, so the per-catalog entry cap
+        # (_MAX_PROMPT_OBJECT_ENTRIES) now applies per root rather than once across
+        # all roots — a multi-root library could emit up to N*cap entries and N
+        # truncation markers. Harmless because the _single_root_module invariant
+        # means real libraries have exactly one root.
+        catalogs = [
+            render_catalog(module, module_name, full_docstrings=full_docstrings)
+            for module_name, module in sorted(self._root_modules.items())
+        ]
+        catalog_text = "\n".join(c for c in catalogs if c)
+        if catalog_text:
+            sections.append("**Available objects:**\n" + catalog_text)
 
         return "\n\n".join(sections) + "\n"
 

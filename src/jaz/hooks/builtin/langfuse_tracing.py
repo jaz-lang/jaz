@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import os
 
-from jaz.hooks.builtin.otel_tracing import OTelTracingHook
+from jaz.hooks.builtin.otel_tracing import OTelTracing
 
 
 def _normalize_langfuse_base_url(base_url: str) -> str:
@@ -17,7 +17,7 @@ def _build_langfuse_headers(public_key: str, secret_key: str) -> dict[str, str]:
     return {"Authorization": f"Basic {token}"}
 
 
-class LangfuseTracingHook(OTelTracingHook):
+class LangfuseTracing(OTelTracing):
     """Hook preset for exporting Jaz traces to Langfuse Cloud.
 
     By default, credentials are read from environment:
@@ -55,7 +55,7 @@ class LangfuseTracingHook(OTelTracingHook):
 
         if not resolved_public or not resolved_secret:
             raise ValueError(
-                "LangfuseTracingHook requires credentials. Provide public_key/secret_key "
+                "LangfuseTracing requires credentials. Provide public_key/secret_key "
                 "or set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY."
             )
 
@@ -69,3 +69,10 @@ class LangfuseTracingHook(OTelTracingHook):
             headers=headers,
             max_attribute_length=max_attribute_length,
         )
+
+
+#: Deprecated alias for the pre-rename spelling — see the rationale block in
+#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
+#: site so the deep-path import keeps working and so the alias map stays checkable
+#: (``test_every_renamed_hook_has_an_alias``).
+LangfuseTracingHook = LangfuseTracing

@@ -14,7 +14,9 @@ if TYPE_CHECKING:
 # Global mapping from language names to REPL classes
 REPL_LANGUAGE_MAP: dict[str, type["REPL"]] = {}
 
-# Character class for valid REPL language names, shared with REPL_INPUT_REGEX in agent.py
+# Character class for valid REPL language names. No longer shared with the protocol layer: the
+# The response is raw code with no wrapper tag or ``lang=`` attribute, so the protocol has no language
+# to validate and this pattern is used only for registry-name checking.
 REPL_LANG_NAME_PAT = r"[a-zA-Z0-9_]+"
 REPL_LANGUAGE_NAME_RE = re.compile(rf"^{REPL_LANG_NAME_PAT}$")
 
@@ -32,23 +34,47 @@ def register_repl(language: str):
     Returns:
         Decorator function that registers the REPL class
 
-    Example:
-        from jaz.repl import REPL, register_repl
+    A registered REPL must follow two contracts, neither of which this decorator can check
+    (it verifies only that the class subclasses ``REPL``):
+
+    * ``__init__`` takes **configuration only** and must leave the instance inert — no
+      namespace, no session, nothing per-run. Its declared parameters are the REPL's config
+      surface, discovered by signature the same way a backend's are.
+    * ``initialize`` takes **invoke-time arguments only** and returns a **new** instance,
+      leaving the receiver a reusable template. Binding onto ``self`` and returning it makes
+      the object single-use; one configured REPL is expected to serve many invokes, each with
+      its own state.
+
+    Examples:
+        from jaz.repl.base import REPL
+        from jaz.repl.registry import register_repl
 
         @register_repl("javascript")
         class JavaScriptREPL(REPL):
-            @classmethod
-            def initialize(cls, inputs, libraries, allowed_imports, ...):
-                # Implementation
-                ...
+            def __init__(self, exec_timeout=30.0):
+                self.exec_timeout = exec_timeout  # configuration only
+
+            def initialize(self, inputs, jaz_library, ...):
+                new = copy.copy(self)             # never bind onto `self`
+                new.namespace = dict(inputs)      # per-invoke state on the copy
+                return new
 
             def exec(self, src, input_id, ...):
                 # Implementation
                 ...
 
         # Now "javascript" is available in REPL_LANGUAGE_MAP
-        # and can be used with Agent(repls=["python", "javascript"])
+        # and can be selected via jaz.configure(repl="javascript")
     """
+    # The `initialize` contract changed: it used to be documented as single-use ("construct a
+    # fresh REPL per invoke, as `Agent` does"), so an implementation written against that text
+    # binds onto `self` and returns it. That keeps working while every caller builds a REPL per
+    # invoke, and starts bleeding state between invokes the moment one is held and reused —
+    # silently, as wrong output rather than an error. There is no dispatch seam around
+    # `initialize` to enforce it from, so it is stated here, where an implementer looks, and on
+    # the `REPL` ABC. TODO(#1057) tracks detecting it; TODO(#1058) tracks removing the need for
+    # it by making `REPL` stateless with an explicit `REPLState`, which is the intended end
+    # state — there is then no `self` to bind to and the contract cannot be violated.
 
     if not REPL_LANGUAGE_NAME_RE.match(language):
         raise ValueError(

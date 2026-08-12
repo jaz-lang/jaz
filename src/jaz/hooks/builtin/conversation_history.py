@@ -7,7 +7,7 @@ The output JSON structure organizes by REPL iterations:
 {
     "invoke_id": "...",
     "task_name": "...",
-    "prompt": "...",
+    "inputs": {...},
     "repl_iterations": [
         {
             "iteration": 1,
@@ -22,31 +22,37 @@ The output JSON structure organizes by REPL iterations:
 """
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from jaz.hooks.base import Event
 from jaz.hooks.dispatcher import Hook
+from jaz.hooks.effects import Effect
 from jaz.hooks.events import (
     InvokeEnter,
     InvokeExit,
     LLMQueryEnter,
     LLMQueryExit,
-    ReplIterationEnter,
-    ReplIterationExit,
 )
-from jaz.repl.types import ErrorResult, ExecResult, RaiseResult, ReturnResult
+from jaz.provenance import PROVENANCE_KEY, provenance_of
+from jaz.repl.types import Continue, ExecResult, Raise, Return
 
 
 @dataclass
-class ReplIteration:
+class REPLIteration:
     """Represents a single REPL iteration within an invoke."""
 
     iteration: int
     messages: list[dict[str, Any]] = field(default_factory=list)
     llm_response: dict[str, Any] | None = None
     children: list["InvokeNode"] = field(default_factory=list)
+    # Provenance of message edits (drops/adds) composed for this iteration's query — the
+    # only record of what was *removed*, since a dropped message leaves the buffer and so
+    # can't be recovered from the surviving messages' per-message provenance. None unless a
+    # hook emitted DropMessages / AddMessages this iteration.
+    edits: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert iteration to a JSON-serializable dictionary."""
@@ -54,6 +60,7 @@ class ReplIteration:
             "iteration": self.iteration,
             "messages": self.messages,
             "llm_response": self.llm_response,
+            "edits": self.edits,
             "children": [child.to_dict() for child in self.children],
         }
 
@@ -66,22 +73,31 @@ class InvokeNode:
     parent_invoke_id: str | None
     parent_repl_iteration: int | None
     task_name: str
-    prompt: str
-    return_type: str | None
+    # Explicit `**inputs` kwargs and resolved ambient `jaz.scope` — distinct provenance channels
+    # (#727), serialized as separate ``inputs`` / ``scope`` keys.
     inputs: dict[str, Any]
-    recursion_depth: int
+    scope: dict[str, Any]
+    depth: int
+
+    # Serialized ``to_dict()`` dicts of the hooks active for this invoke (baseline ‖ propagating ‖
+    # local), captured at receipt from the live ``event.hooks`` (#727).
+    # Defaulted so pre-existing node constructions need not supply it.
+    hooks: tuple[dict, ...] = field(default_factory=tuple)
 
     # Accumulated during execution - organized by REPL iteration
-    repl_iterations: dict[int, ReplIteration] = field(default_factory=dict)
+    repl_iterations: dict[int, REPLIteration] = field(default_factory=dict)
     current_iteration: int | None = None
     result: ExecResult | None = None
-    # Track message count to only store new messages per iteration
-    last_message_count: int = 0
+    # Snapshot of the message buffer at the previous iteration's query, so each iteration
+    # records only what changed. A count would assume the buffer only ever grows; a
+    # persistent message edit (compaction) can shrink/insert/reorder it, so we diff against
+    # the actual snapshot by common prefix + suffix instead (see on_llm_query_enter).
+    last_messages: list[dict[str, Any]] = field(default_factory=list)
 
-    def get_or_create_iteration(self, iteration: int) -> ReplIteration:
-        """Get or create a ReplIteration for the given iteration number."""
+    def get_or_create_iteration(self, iteration: int) -> REPLIteration:
+        """Get or create a REPLIteration for the given iteration number."""
         if iteration not in self.repl_iterations:
-            self.repl_iterations[iteration] = ReplIteration(iteration=iteration)
+            self.repl_iterations[iteration] = REPLIteration(iteration=iteration)
         return self.repl_iterations[iteration]
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,10 +109,10 @@ class InvokeNode:
         return {
             "invoke_id": self.invoke_id,
             "task_name": self.task_name,
-            "prompt": self.prompt,
-            "return_type": self.return_type,
             "inputs": _serialize_inputs(self.inputs),
-            "recursion_depth": self.recursion_depth,
+            "scope": _serialize_inputs(self.scope),
+            "hooks": list(self.hooks),
+            "depth": self.depth,
             "repl_iterations": [it.to_dict() for it in sorted_iterations],
             "result": _serialize_result(self.result),
         }
@@ -124,7 +140,7 @@ def _serialize_result(result: ExecResult | None) -> dict[str, Any] | None:
     result_dict: dict[str, Any] = {"type": type(result).__name__}
 
     # Add result-specific fields
-    if isinstance(result, ReturnResult):
+    if isinstance(result, Return):
         value = result.return_value
         if value is not None:
             try:
@@ -133,7 +149,7 @@ def _serialize_result(result: ExecResult | None) -> dict[str, Any] | None:
             except (TypeError, ValueError):
                 result_dict["value"] = repr(value)
 
-    if isinstance(result, ErrorResult | RaiseResult):
+    if isinstance(result, Continue | Raise):
         if result.exception is not None:
             result_dict["exception"] = str(result.exception)
             result_dict["exception_type"] = type(result.exception).__name__
@@ -145,6 +161,9 @@ def _serialize_message(message: dict[str, Any]) -> dict[str, Any]:
     """Serialize a message to JSON-compatible format."""
     result = {}
     for key, value in message.items():
+        if key == PROVENANCE_KEY:
+            # Emitted as a clean "provenance" sub-object below, not as the raw magic key.
+            continue
         if key == "content":
             # Handle content which can be string or list of content parts
             if isinstance(value, str):
@@ -166,20 +185,26 @@ def _serialize_message(message: dict[str, Any]) -> dict[str, Any]:
                 result[key] = value
             except (TypeError, ValueError):
                 result[key] = repr(value)
+    prov = provenance_of(message)
+    if prov is not None:
+        result["provenance"] = prov.to_dict()
     return result
 
 
-class ConversationHistoryHook(Hook):
-    """Hook that captures and stores the entire conversation history as JSON.
+class ConversationHistory(Hook):
+    """Capture the entire conversation history as JSON.
 
-    This hook tracks all LLM interactions across all invoke calls (including
-    nested invokes), preserving the natural tree structure of the execution.
+    Records every LLM interaction in the hook's scope, preserving the tree structure of the
+    execution. Under ``with ConversationHistory(...):`` that includes invokes nested inside;
+    passed positionally to one ``jaz.invoke``, only that invoke's own interactions are
+    recorded and its sub-invokes are absent from the output.
 
-    Usage:
-        with ConversationHistoryHook(output_path="./conversation.json"):
-            result = invoke("Do something", return_type=str)
+    A pure observer: it emits no effects, so it never influences the run.
 
-        # Creates: ./conversation.json with full conversation tree
+    Examples:
+        with ConversationHistory(output_path="./conversation.json"):
+            result = invoke(ReturnType(str), task="Do something")
+        # Creates ./conversation.json with the full conversation tree.
 
     Args:
         output_path: Path to write the JSON output. If not provided,
@@ -187,6 +212,19 @@ class ConversationHistoryHook(Hook):
             accessed via the `root_nodes` attribute after execution.
         indent: JSON indentation level (default: 2). Set to None for compact output.
     """
+
+    # Handles ``InvokeEnter``/``InvokeExit`` (tree structure) and ``LLMQueryEnter``/
+    # ``LLMQueryExit`` (the messages and responses). Out of the docstring: which events a hook
+    # subscribes to is not something a caller of the hook acts on — "emits no effects" is.
+
+    # TODO: eventually remove this hook in favor of ``ATIFTrace``, which emits the same
+    # information in the standardized ATIF v1.7 format. Migrate existing consumers off the
+    # ``ConversationHistory`` JSON first.
+
+    # Captures the per-invoke ``task_name`` label off the blackboard (set by a
+    # ``MetaData`` hook) into each InvokeNode; declaring it lets that seed validate.
+    # Absent → ``"main"``.
+    blackboard_consumes = {"task_name": "Human label recorded on each invoke node."}
 
     def __init__(
         self,
@@ -209,120 +247,162 @@ class ConversationHistoryHook(Hook):
         # Track root-level invokes (those without parents)
         self.root_nodes: list[InvokeNode] = []
 
-    def on_event(self, event: Event) -> list:
-        """Process events and build conversation tree.
+    # This hook is a passive observer: every handler builds the conversation tree
+    # and returns an empty effect list.
 
-        Args:
-            event: The hook event
+    def on_invoke_enter(self, event: InvokeEnter) -> list[Effect]:
+        # Create node for this invoke
+        node = InvokeNode(
+            invoke_id=event.invoke_id,
+            parent_invoke_id=event.parent_invoke_id,
+            parent_repl_iteration=event.parent_repl_iteration,
+            # Per-invoke label carried on the blackboard (seeded by a MetaData hook),
+            # not a core event field. Absent → "main".
+            task_name=str(event.blackboard.get("task_name", "main")),
+            # Explicit kwargs and resolved scope kept separate (#727) — see the node fields above.
+            # Defensive copies (like ATIFTrace) so the node's long-lived snapshot never aliases
+            # the event's dicts. This is a SHALLOW snapshot: it pins the key set / top-level bindings
+            # at receipt, but nested MUTABLE values are shared with the live namespace, and
+            # `_serialize_inputs` keeps JSON-safe values by reference and runs lazily (at to_dict),
+            # so a value the agent mutates during execution is reflected in the serialized node.
+            # Pinning nested values would need eager deep serialization here — costly and can fail on
+            # non-copyable inputs — so it is a documented limitation (#831), not a bug.
+            inputs=dict(event.inputs),
+            scope=dict(event.scope),
+            # Serialize the live active-hook set to dicts here, at receipt, so the recorded node
+            # pins the governance active AT InvokeEnter and stays JSON-safe (#727).
+            hooks=tuple(h.to_dict() for h in event.hooks),
+            depth=event.depth,
+        )
 
-        Returns:
-            Empty list (this is a passive observer hook)
-        """
-        match event:
-            case InvokeEnter(
-                invoke_id=invoke_id,
-                parent_invoke_id=parent_invoke_id,
-                parent_repl_iteration=parent_repl_iteration,
-                prompt=prompt,
-                task_name=task_name,
-                return_type=return_type,
-                inputs=inputs,
-                cur_recursion_depth=depth,
-            ):
-                # Get return type as string
-                return_type_str = None
-                if return_type is not None:
-                    return_type_str = getattr(return_type, "__name__", None) or str(
-                        return_type
-                    )
+        # Store in lookup dict
+        self.nodes[event.invoke_id] = node
 
-                # Create node for this invoke
-                node = InvokeNode(
-                    invoke_id=invoke_id,
-                    parent_invoke_id=parent_invoke_id,
-                    parent_repl_iteration=parent_repl_iteration,
-                    task_name=task_name,
-                    prompt=prompt,
-                    return_type=return_type_str,
-                    inputs=inputs,
-                    recursion_depth=depth,
+        # Link to parent's specific iteration or add as root
+        if event.parent_invoke_id and event.parent_invoke_id in self.nodes:
+            parent_node = self.nodes[event.parent_invoke_id]
+            if event.parent_repl_iteration is not None:
+                # Add to the specific iteration that spawned this invoke
+                iteration = parent_node.get_or_create_iteration(
+                    event.parent_repl_iteration
                 )
+                iteration.children.append(node)
+            else:
+                # Fallback: add to current iteration if known
+                if parent_node.current_iteration is not None:
+                    iteration = parent_node.get_or_create_iteration(
+                        parent_node.current_iteration
+                    )
+                    iteration.children.append(node)
+        else:
+            self.root_nodes.append(node)
+        return []
 
-                # Store in lookup dict
-                self.nodes[invoke_id] = node
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        # LLMQueryEnter is the always-present per-turn boundary (it replaced the removed
+        # REPLIterationEnter as the per-turn anchor — #481): mark which iteration this turn
+        # belongs to and ensure its record exists, before recording the turn's messages
+        # below. event.iteration is None only on the non-loop query() path — skip there.
+        node = self.nodes.get(event.invoke_id)
+        if node and event.iteration is not None:
+            node.current_iteration = event.iteration
+            node.get_or_create_iteration(event.iteration)
 
-                # Link to parent's specific iteration or add as root
-                if parent_invoke_id and parent_invoke_id in self.nodes:
-                    parent_node = self.nodes[parent_invoke_id]
-                    if parent_repl_iteration is not None:
-                        # Add to the specific iteration that spawned this invoke
-                        iteration = parent_node.get_or_create_iteration(
-                            parent_repl_iteration
-                        )
-                        iteration.children.append(node)
-                    else:
-                        # Fallback: add to current iteration if known
-                        if parent_node.current_iteration is not None:
-                            iteration = parent_node.get_or_create_iteration(
-                                parent_node.current_iteration
-                            )
-                            iteration.children.append(node)
-                else:
-                    self.root_nodes.append(node)
-
-            case ReplIterationEnter(invoke_id=invoke_id, iteration=iteration):
-                # Track current iteration for this invoke
-                node = self.nodes.get(invoke_id)
-                if node:
-                    node.current_iteration = iteration
-                    # Ensure the iteration exists
-                    node.get_or_create_iteration(iteration)
-
-            case ReplIterationExit(invoke_id=invoke_id, iteration=iteration):
-                # Iteration complete - current_iteration stays set for child tracking
-                pass
-
-            case LLMQueryEnter(invoke_id=invoke_id, messages=messages):
-                # Store only new messages for this iteration (not accumulated from previous)
-                node = self.nodes.get(invoke_id)
-                if node and node.current_iteration is not None:
-                    # Only serialize messages added since last iteration
-                    new_messages = messages[node.last_message_count :]
-                    serialized_messages = [
-                        _serialize_message(dict(msg)) for msg in new_messages
-                    ]
-                    iteration = node.get_or_create_iteration(node.current_iteration)
-                    iteration.messages = serialized_messages
-                    # Update the count for next iteration
-                    node.last_message_count = len(messages)
-
-            case LLMQueryExit(
-                invoke_id=invoke_id,
-                response_content=response_content,
-                model=model,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cost=cost,
+        # Record only what changed this iteration, not the accumulated buffer. Diff
+        # against the previous query's snapshot by longest common prefix + suffix and log
+        # the changed *middle*: in the common append-only case that is exactly the new
+        # tail; when a persistent edit (compaction) rewrites the middle it is just the
+        # inserted/replaced messages — never the whole buffer. (A bare message count would
+        # assume the buffer only grows; the prefix/suffix comparison survives a
+        # shrink/insert/reorder. Non-contiguous edits log a slightly wider span — still
+        # bounded by the buffer, never larger.)
+        #
+        # The match is by *value* (dict equality), not identity, so two value-equal
+        # messages (e.g. duplicate short acknowledgements, or a compaction that re-inserts
+        # a byte-identical message) can make the prefix/suffix scan attribute the boundary
+        # to the wrong side. Never loses data — worst case is the same "slightly wider
+        # span" over-logging above — but it's a second reason, beyond reordering, that this
+        # is a stopgap rather than the fix: #599's message-identity primitive is. Per-message
+        # provenance (#605) narrows but does not close this gap once it lands: its stamped
+        # `iteration` field rides inside the same dict, so two same-content messages from
+        # *different* iterations stop comparing equal — but duplicates stamped within the
+        # same iteration are still indistinguishable by value.
+        if node and node.current_iteration is not None:
+            cur = [dict(m) for m in event.messages]
+            prev = node.last_messages
+            p = 0
+            while p < len(prev) and p < len(cur) and prev[p] == cur[p]:
+                p += 1
+            s = 0
+            while (
+                s < len(prev) - p and s < len(cur) - p and prev[-1 - s] == cur[-1 - s]
             ):
-                # Store the LLM response in the current iteration
-                node = self.nodes.get(invoke_id)
-                if node and node.current_iteration is not None:
-                    response_data = {
-                        "model": model,
-                        "content": response_content,
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "cost": cost,
+                s += 1
+            changed = cur[p : len(cur) - s]
+            iteration = node.get_or_create_iteration(node.current_iteration)
+            iteration.messages = [_serialize_message(m) for m in changed]
+            node.last_messages = cur
+        return []
+
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+        # Store the LLM response in the current iteration
+        node = self.nodes.get(event.invoke_id)
+        if node and node.current_iteration is not None:
+            response_data: dict[str, Any] = {
+                "model": event.model,
+                "content": event.response.content,
+                "prompt_tokens": event.response.prompt_tokens,
+                "completion_tokens": event.response.completion_tokens,
+                "cost": event.response.cost,
+            }
+            # ATIF v1.7 MetricsSchema usage fields (added when present)
+            if event.response.cached_tokens is not None:
+                response_data["cached_tokens"] = event.response.cached_tokens
+            if event.response.extra:
+                response_data["extra"] = dict(event.response.extra)
+            iteration = node.get_or_create_iteration(node.current_iteration)
+            iteration.llm_response = response_data
+
+            # Record what this query's composed edits removed/inserted. Drop indices point
+            # into the enter snapshot, which on_llm_query_enter stored as last_messages this
+            # same iteration, so resolve them there to log the actual dropped messages +
+            # reasons. Persistent adds are stamped ADDED only *after* this exit fires, so
+            # their serialized form here simply carries no provenance sub-object — the
+            # reason/persistent fields below are the record.
+            edits = event.message_edits
+            if edits is not None and (edits.all_drops or edits.all_adds):
+                snapshot = node.last_messages
+                dropped = [
+                    {
+                        "index": i,
+                        "persistent": i in edits.persistent_drops,
+                        "message": _serialize_message(snapshot[i]),
                     }
-                    iteration = node.get_or_create_iteration(node.current_iteration)
-                    iteration.llm_response = response_data
+                    for i in sorted(edits.all_drops)
+                    if 0 <= i < len(snapshot)
+                ]
+                added = [
+                    {
+                        "index": add.index,
+                        "persistent": add.persistent,
+                        "messages": [_serialize_message(m) for m in add.messages],
+                    }
+                    for add in edits.all_adds
+                ]
+                iteration.edits = {"dropped": dropped, "added": added}
+        # Per-turn flush to disk for crash recovery. LLMQueryExit is the always-present
+        # per-turn exit (it replaced the removed REPLIterationExit as the flush point —
+        # #481); it fires once per turn after the response is recorded above.
+        self._write_output()
+        return []
 
-            case InvokeExit(invoke_id=invoke_id, result=result):
-                # Store the result
-                node = self.nodes.get(invoke_id)
-                if node:
-                    node.result = result
-
+    def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:
+        # Store the result
+        node = self.nodes.get(event.invoke_id)
+        if node:
+            node.result = event.result
+        # Flush to disk after invoke completes
+        self._write_output()
         return []
 
     def get_conversation_tree(self) -> list[dict[str, Any]]:
@@ -342,23 +422,39 @@ class ConversationHistoryHook(Hook):
         return json.dumps(self.get_conversation_tree(), indent=self.indent)
 
     def _write_output(self) -> None:
-        """Write the conversation history to the output file."""
+        """Write the conversation history to the output file.
+
+        Uses write-to-temp-then-rename for atomic writes, so a crash
+        mid-write won't leave a truncated/unparsable JSON file. The temp file is
+        created via ``tempfile.mkstemp`` (unique even across concurrent threads
+        and processes), so two writers targeting the same output_path can't
+        clobber each other's temp file mid-rename; the final rename is atomic so
+        a reader always sees either the old file or a complete new one.
+        """
         if self.output_path:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            self.output_path.write_text(self.get_json())
+            fd, tmp_name = tempfile.mkstemp(
+                dir=self.output_path.parent,
+                prefix=self.output_path.name + ".",
+                suffix=".tmp",
+            )
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(self.get_json())
+                tmp.rename(self.output_path)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Exit context and write output file."""
-        # Write output file if configured
+    def teardown(self, exc: BaseException | None = None) -> None:
+        """Write the output file on exit.
+
+        Note: We intentionally do NOT clear state here so that the conversation
+        tree can be accessed after exiting the context manager (as documented).
+        Users who want to reuse the hook should call reset() explicitly.
+        """
         self._write_output()
-
-        # Note: We intentionally do NOT clear state here so that the conversation
-        # tree can be accessed after exiting the context manager (as documented).
-        # Users who want to reuse the hook should call reset() explicitly.
-
-        # Call parent to reset hook context (only if __enter__ was called)
-        if hasattr(self, "_token"):
-            return super().__exit__(exc_type, exc_value, traceback)
 
     def reset(self) -> None:
         """Clear the conversation history state.
@@ -367,3 +463,10 @@ class ConversationHistoryHook(Hook):
         """
         self.nodes.clear()
         self.root_nodes.clear()
+
+
+#: Deprecated alias for the pre-rename spelling — see the rationale block in
+#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
+#: site so the deep-path import keeps working and so the alias map stays checkable
+#: (``test_every_renamed_hook_has_an_alias``).
+ConversationHistoryHook = ConversationHistory

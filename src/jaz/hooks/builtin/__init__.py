@@ -1,17 +1,24 @@
 """Built-in hook implementations."""
 
-from .conversation_history import ConversationHistoryHook
-from .identify_workflow import IdentifyWorkflowHook, WorkflowStrategyHook
+from ._must_exit import TemplatedMustExitWarning
+from .budget_forcing import BudgetForcing
+from .budget_pool import BudgetPool
+from .compaction import Compaction
+from .context_window import ContextWindow
+from .conversation_history import ConversationHistory
+from .iteration_limit import IterationLimit
 from .loggers import FileLogger, PrintLogger
-from .memory_store import MemoryStoreHook
-from .multiple_choice_hook import MultipleChoiceHook
-from .parent_updates import ParentUpdatesHook
-from .workflow_replay import WorkflowReplayHook
+from .metadata import MetaData
+from .recursion_limit import RecursionLimit
+from .repl_input_hooks import ValidateREPLInput
+from .replay import Replay
+from .return_hooks import ReturnType, ValidateReturn
+from .workflow_replay import WorkflowReplay
 
 # Conditionally import tracing hooks if opentelemetry is installed
 try:
-    from .jaeger_tracing import JaegerTracingHook  # noqa: F401
-    from .langfuse_tracing import LangfuseTracingHook  # noqa: F401
+    from .jaeger_tracing import JaegerTracing  # noqa: F401
+    from .langfuse_tracing import LangfuseTracing  # noqa: F401
 
     _TRACING_AVAILABLE = True
 except ImportError:
@@ -22,18 +29,42 @@ except ImportError:
     _TRACING_AVAILABLE = False
 
 __all__ = [
-    "ConversationHistoryHook",
-    "MemoryStoreHook",
+    "BudgetForcing",
+    "BudgetPool",
+    "Compaction",
+    "ConversationHistory",
+    "ContextWindow",
+    "IterationLimit",
+    "RecursionLimit",
+    "TemplatedMustExitWarning",
+    "MetaData",
     "PrintLogger",
     "FileLogger",
-    "WorkflowReplayHook",
-    "MultipleChoiceHook",
-    "IdentifyWorkflowHook",
-    "WorkflowStrategyHook",
-    "ParentUpdatesHook",
+    "WorkflowReplay",
+    "Replay",
+    "ReturnType",
+    "ValidateReturn",
+    "ValidateREPLInput",
 ]
 
 # Only export tracing hooks if available
 if _TRACING_AVAILABLE:
-    __all__.append("JaegerTracingHook")
-    __all__.append("LangfuseTracingHook")
+    __all__.append("JaegerTracing")
+    __all__.append("LangfuseTracing")
+
+
+# Deprecated aliases for the pre-rename spellings — see the rationale block in
+# ``jaz/hooks/__init__.py``. Repeated here because ``jaz.hooks.builtin`` has its own
+# ``__all__``: the old names were importable from *this* namespace too, so aliasing only
+# the parent would still break `from jaz.hooks.builtin import ReplayHook`.
+BudgetForcingHook = BudgetForcing
+CompactionHook = Compaction
+ContextWindowHook = ContextWindow
+ConversationHistoryHook = ConversationHistory
+IterationLimitHook = IterationLimit
+ReplayHook = Replay
+WorkflowReplayHook = WorkflowReplay
+
+if _TRACING_AVAILABLE:
+    JaegerTracingHook = JaegerTracing
+    LangfuseTracingHook = LangfuseTracing

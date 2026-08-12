@@ -18,10 +18,14 @@ from opentelemetry.trace import Span, Status, StatusCode, set_span_in_context
 
 from jaz.hooks.base import Event
 from jaz.hooks.dispatcher import Hook
+from jaz.string_utils import summarize_exception
 
 
-class OTelTracingHook(Hook):
-    """Hook that exports Jaz hook spans via OTLP HTTP.
+class OTelTracing(Hook):
+    """Export the run as OpenTelemetry spans over OTLP HTTP.
+
+    Under ``with`` the trace covers invokes nested inside. Passed positionally, only that
+    invoke is traced and its sub-invokes contribute no spans to this trace.
 
     Args:
         endpoint: OTLP HTTP traces endpoint (e.g., ``.../v1/traces``)
@@ -30,6 +34,11 @@ class OTelTracingHook(Hook):
         max_attribute_length: Maximum length for string attributes. If None,
             strings are not truncated.
     """
+
+    # Reads the per-invoke ``task_name`` off the blackboard (set by a ``MetaData``
+    # hook) to name the root trace; declaring it lets that seed validate. Absent →
+    # ``"main"``.
+    blackboard_consumes = {"task_name": "Human label used as the root trace name."}
 
     def __init__(
         self,
@@ -100,14 +109,14 @@ class OTelTracingHook(Hook):
         if include_trace_fields:
             span.set_attribute("langfuse.trace.output", text)
 
-    def on_event(self, event: Event) -> list:
+    def on_any(self, event: Event) -> list:
         from jaz.hooks.events import (
             InvokeEnter,
             InvokeExit,
             LLMQueryEnter,
             LLMQueryExit,
-            ReplExecutionEnter,
-            ReplExecutionExit,
+            REPLExecEnter,
+            REPLExecExit,
         )
 
         spans = self._get_active_spans()
@@ -117,26 +126,32 @@ class OTelTracingHook(Hook):
             case InvokeEnter(
                 invoke_id=invoke_id,
                 parent_invoke_id=parent_invoke_id,
-                prompt=prompt,
-                task_name=task_name,
-                return_type=return_type,
                 inputs=inputs,
-                max_iterations=max_iterations,
-                cur_recursion_depth=cur_depth,
-                max_recursion_depth=max_depth,
+                depth=cur_depth,
             ):
+                # Per-invoke label carried on the blackboard (seeded by a MetaData
+                # hook), not a core event field. Absent → "main".
+                task_name = str(event.blackboard.get("task_name", "main"))
                 attributes: dict[str, Any] = {
                     "jaz.span_type": "invoke",
                     "jaz.invoke_id": invoke_id,
-                    "jaz.prompt": self._truncate(
-                        prompt if isinstance(prompt, str) else str(prompt)
-                    ),
-                    "jaz.return_type": str(return_type) if return_type else "None",
-                    "jaz.max_iterations": max_iterations,
-                    "jaz.cur_recursion_depth": cur_depth,
-                    "jaz.max_recursion_depth": max_depth,
-                    "jaz.inputs": str(inputs),
+                    # The former `jaz.prompt` attribute is gone (#538): `task` is now an
+                    # ordinary input, so the prompt lives in `jaz.inputs` below rather than
+                    # in a separate distinguished field.
+                    "jaz.depth": cur_depth,
+                    # Explicit `**inputs` kwargs and resolved ambient `jaz.scope` are logged as
+                    # SEPARATE attributes (#727): they are distinct provenance channels. `jaz.scope`
+                    # is omitted entirely when no scope is active (the common case) to avoid noise.
+                    "jaz.inputs": str(dict(inputs)),
+                    # The governance active for this invoke: each active hook serialized via
+                    # to_dict() at this edge (`event.hooks` carries the LIVE set, #727), incl. this
+                    # tracer. Emitted UNCONDITIONALLY (unlike `jaz.scope` above, omitted-when-empty):
+                    # the active-hook set is the governance record — always worth pinning on the
+                    # span, and never empty for an event this tracer observes (the tracer is in it).
+                    "jaz.hooks": str([h.to_dict() for h in event.hooks]),
                 }
+                if event.scope:
+                    attributes["jaz.scope"] = str(dict(event.scope))
                 parent_span = spans.get(parent_invoke_id) if parent_invoke_id else None
                 is_root_invoke = parent_span is None
                 span = self.tracer.start_span(
@@ -144,8 +159,10 @@ class OTelTracingHook(Hook):
                     attributes=attributes,
                     context=(set_span_in_context(parent_span) if parent_span else None),
                 )
+                # The span's input is the invoke's inputs (#538): there is no separate
+                # prompt string anymore — the task rides in `inputs` like any other input.
                 self._set_input_attributes(
-                    span, prompt, include_trace_fields=is_root_invoke
+                    span, dict(inputs), include_trace_fields=is_root_invoke
                 )
                 if is_root_invoke:
                     span.set_attribute("langfuse.trace.name", task_name)
@@ -156,59 +173,91 @@ class OTelTracingHook(Hook):
                 span = spans.pop(invoke_id, None)
                 if span:
                     from jaz.repl.types import (
-                        ErrorResult,
-                        ExecuteResult,
-                        RaiseResult,
-                        ReturnResult,
+                        Raise,
+                        Return,
                     )
 
                     is_root_invoke = invoke_roots.pop(invoke_id, False)
 
-                    if isinstance(result, RaiseResult):
-                        span.set_attribute("jaz.result_type", "RAISE")
-                        span.set_attribute(
-                            "jaz.error", self._truncate(str(result.output))
-                        )
-                        self._set_output_attributes(
-                            span, result.output, include_trace_fields=is_root_invoke
-                        )
-                        span.set_status(Status(StatusCode.ERROR))
-                    elif isinstance(result, ErrorResult):
-                        span.set_attribute("jaz.result_type", "ERROR")
-                        self._set_output_attributes(
-                            span, result.output, include_trace_fields=is_root_invoke
-                        )
-                        span.set_status(Status(StatusCode.OK))
-                    elif isinstance(result, ReturnResult):
-                        span.set_attribute("jaz.result_type", "RETURN")
-                        self._set_output_attributes(
-                            span,
-                            result.return_value,
-                            include_trace_fields=is_root_invoke,
-                        )
-                        span.set_status(Status(StatusCode.OK))
-                    elif isinstance(result, ExecuteResult):
-                        span.set_attribute("jaz.result_type", "EXECUTE")
-                        self._set_output_attributes(
-                            span, result.output, include_trace_fields=is_root_invoke
-                        )
-                        span.set_status(Status(StatusCode.OK))
+                    match result:
+                        case Raise():
+                            span.set_attribute("jaz.result_type", "RAISE")
+                            # A ``Raise`` carries no output (#903); its exception is the payload.
+                            # ``jaz.exception`` is left as the *single* carrier rather than also
+                            # feeding the output attributes: before #903 the two were
+                            # complementary (``jaz.output`` held the invoke's captured stdout),
+                            # but with no output field the output attributes could only repeat
+                            # the error verbatim. A failed invoke reads as ERROR status plus
+                            # ``jaz.exception``; an empty Langfuse output column is the accurate
+                            # rendering of "this invoke produced no result".
+                            span.set_attribute(
+                                "jaz.exception",
+                                self._truncate(summarize_exception(result.exception)),
+                            )
+                            span.set_status(Status(StatusCode.ERROR))
+                        case Return(return_value=return_value):
+                            span.set_attribute("jaz.result_type", "RETURN")
+                            # Same `jaz.*` payload naming as the repl_iteration RETURN arm, so
+                            # the two span levels are queryable the same way: the returned value
+                            # under ``jaz.return_value``, plus the generic output slot below.
+                            span.set_attribute(
+                                "jaz.return_value", self._truncate(str(return_value))
+                            )
+                            self._set_output_attributes(
+                                span,
+                                return_value,
+                                include_trace_fields=is_root_invoke,
+                            )
+                            span.set_status(Status(StatusCode.OK))
+                        case _:
+                            # An invoke only ever exits on a *terminal* result, so there is no
+                            # Continue arm here (unlike the repl_iteration span, where Continue
+                            # is the common case). The loop completes the invoke span solely
+                            # from its ``case Return() | Raise()`` arm — a Continue appends an
+                            # observation and iterates — and the enter-time abort path is
+                            # asserted to be a Raise in ``Agent.invoke``. The ATIF trace hook
+                            # encodes the same invariant by matching only Return/Raise.
+                            #
+                            # Raised rather than `assert`-ed so `python -O` cannot silently turn
+                            # a leaked non-terminal result into an untraced invoke.
+                            raise AssertionError(
+                                "InvokeExit carried a non-terminal result: "
+                                f"{type(result).__name__}"
+                            )
+
+                    # Abort carve-out (#481): a loop/budget hard-stop fires ``LLMQueryEnter``
+                    # but — by design — no ``LLMQueryExit`` (the query never happened), so the
+                    # aborted turn's per-turn child span is never closed on its own. End any
+                    # orphaned children of this invoke here, *before* the invoke span, so they
+                    # close in-order with a bounded duration instead of leaking (out of order,
+                    # inflated) to ``teardown()``. A normal turn already popped its child at
+                    # ``LLMQueryExit`` / ``REPLExecExit``, so this is a no-op there. This is the
+                    # observer-side handling of the enter/exit pairing carve-out documented in
+                    # hooks/README.md — an observer that pairs a resource on ``LLMQuery`` must
+                    # clean up at ``InvokeExit`` because an abort skips the exit.
+                    for child_key in (
+                        (invoke_id, "llm_query"),
+                        (invoke_id, "repl_iteration"),
+                    ):
+                        child = spans.pop(child_key, None)
+                        if child is not None:
+                            child.set_attribute("jaz.aborted", True)
+                            child.set_status(Status(StatusCode.ERROR))
+                            child.end()
                     span.end()
 
-            case ReplExecutionEnter(
+            case REPLExecEnter(
                 invoke_id=invoke_id,
                 iteration=iteration,
-                max_iterations=max_iterations,
                 code=code,
-                cur_recursion_depth=depth,
+                depth=depth,
             ):
                 attributes = {
                     "jaz.span_type": "repl_iteration",
                     "jaz.invoke_id": invoke_id,
                     "jaz.iteration": iteration,
-                    "jaz.max_iterations": max_iterations,
                     "jaz.code": self._truncate(code),
-                    "jaz.cur_recursion_depth": depth,
+                    "jaz.depth": depth,
                 }
                 parent_span = spans.get(invoke_id)
                 span = self.tracer.start_span(
@@ -219,63 +268,94 @@ class OTelTracingHook(Hook):
                 self._set_input_attributes(span, code, include_trace_fields=False)
                 spans[(invoke_id, "repl_iteration")] = span
 
-            case ReplExecutionExit(invoke_id=invoke_id, exec_result=result):
+            case REPLExecExit(invoke_id=invoke_id, exec_result=result):
                 span = spans.pop((invoke_id, "repl_iteration"), None)
                 if span:
                     from jaz.repl.types import (
-                        ErrorResult,
-                        ExecuteResult,
-                        RaiseResult,
-                        ReturnResult,
+                        Continue,
+                        Raise,
+                        Return,
                     )
 
                     match result:
-                        case RaiseResult(output=output, exception=exception):
+                        case Raise(exception=exception):
                             span.set_attribute("jaz.exec_result_type", "RAISE")
-                            output_text = str(output).strip()
-                            output_value = (
-                                output_text if output_text else f"RAISE: {exception!r}"
-                            )
+                            # Mirrors the invoke-level RAISE arm exactly: a ``Raise`` carries no
+                            # output (#903), so the exception goes to ``jaz.exception`` and the
+                            # output attributes stay unset. Stuffing ``RAISE: <exception>`` into
+                            # ``jaz.output`` would file an error under a name that means
+                            # "what this turn produced", which is what it no longer is.
                             span.set_attribute(
-                                "jaz.output", self._truncate(output_value)
-                            )
-                            self._set_output_attributes(
-                                span, output_value, include_trace_fields=False
+                                "jaz.exception",
+                                self._truncate(summarize_exception(exception)),
                             )
                             span.set_status(Status(StatusCode.ERROR))
-                        case ErrorResult(output=output, error_summary=error_summary):
-                            span.set_attribute("jaz.exec_result_type", "ERROR")
-                            output_text = str(output).strip()
-                            output_value = (
-                                output_text
-                                if output_text
-                                else f"ERROR: {error_summary}"
-                            )
-                            span.set_attribute(
-                                "jaz.output", self._truncate(output_value)
-                            )
-                            self._set_output_attributes(
-                                span, output_value, include_trace_fields=False
-                            )
-                        case ReturnResult(output=output):
+                        case Return(return_value=return_value):
                             span.set_attribute("jaz.exec_result_type", "RETURN")
-                            output_text = str(output).strip()
-                            output_value = output_text if output_text else "RETURN"
+                            # No output on a ``Return`` (#903) — the return value *is* the
+                            # payload, so record it under its own name rather than under
+                            # ``jaz.output``: a return value is not the turn's printed output,
+                            # and after #903 the two can no longer coincide. This leaves each
+                            # `jaz.*` payload attribute meaning exactly one thing —
+                            # ``jaz.exception`` on RAISE, ``jaz.return_value`` on RETURN,
+                            # ``jaz.output`` only on EXECUTE/ERROR, where it really is stdout.
+                            # A constant "RETURN" label here would drop the finishing turn's
+                            # only real content from the trace.
                             span.set_attribute(
-                                "jaz.output", self._truncate(output_value)
+                                "jaz.return_value", self._truncate(str(return_value))
                             )
+                            # The generic OTel/Langfuse output slot still takes the return
+                            # value: for a successful finish that *is* the observation's
+                            # output, and the invoke-level RETURN arm fills it the same way.
                             self._set_output_attributes(
-                                span, output_value, include_trace_fields=False
+                                span, return_value, include_trace_fields=False
                             )
-                        case ExecuteResult(output=output):
-                            span.set_attribute("jaz.exec_result_type", "EXECUTE")
-                            output_text = str(output).strip()
-                            output_value = (
-                                output_text if output_text else "[no repl output]"
-                            )
+                        case Continue(output=output, exception=exception):
+                            # One arm for both continue outcomes (#566 C): a clean
+                            # success and a recoverable error differ only in the label
+                            # and whether ``jaz.exception`` is set.
+                            is_error = exception is not None
                             span.set_attribute(
-                                "jaz.output", self._truncate(output_value)
+                                "jaz.exec_result_type",
+                                "ERROR" if is_error else "EXECUTE",
                             )
+                            output_text = str(output).strip()
+                            # Each `jaz.*` payload attribute names exactly one thing, and neither
+                            # stands in for the other: ``jaz.output`` is this turn's actual stdout,
+                            # ``jaz.exception`` the recoverable exception — the same name and
+                            # rendering the RAISE arms use, so "the exception for this turn" is one
+                            # query regardless of whether it was recoverable. An ERROR turn that
+                            # printed nothing therefore leaves ``jaz.output`` unset rather than
+                            # filing the exception text under it (which is what the old
+                            # ``ERROR: <exc>`` fallback did, and is the same duplication that was
+                            # removed from the invoke-level RAISE arm).
+                            #
+                            # Note the overlap this does NOT try to remove: a *parse-failure*
+                            # Continue deliberately carries the rendered error as its ``output``
+                            # (see ``_parse_error_result``), so both attributes legitimately hold
+                            # that text — ``output`` is what the agent saw, ``exception`` is the
+                            # structured metadata beside it.
+                            if output_text:
+                                span.set_attribute(
+                                    "jaz.output", self._truncate(output_text)
+                                )
+                            if exception is not None:
+                                span.set_attribute(
+                                    "jaz.exception",
+                                    self._truncate(summarize_exception(exception)),
+                                )
+                            # The generic OTel/Langfuse output slot keeps a human-readable
+                            # fallback: unlike the `jaz.*` attributes it is the viewer's single
+                            # "what happened this turn" column, where a placeholder reads better
+                            # than an empty cell.
+                            if output_text:
+                                output_value = output_text
+                            elif exception is not None:
+                                output_value = (
+                                    f"ERROR: {summarize_exception(exception)}"
+                                )
+                            else:
+                                output_value = "[no repl output]"
                             self._set_output_attributes(
                                 span, output_value, include_trace_fields=False
                             )
@@ -286,7 +366,7 @@ class OTelTracingHook(Hook):
                 messages=messages,
                 model=model,
                 iteration=iteration,
-                cur_recursion_depth=depth,
+                depth=depth,
             ):
                 attributes: dict[str, Any] = {
                     "jaz.span_type": "llm_query",
@@ -296,6 +376,9 @@ class OTelTracingHook(Hook):
                     "langfuse.observation.type": "generation",
                     "langfuse.generation.model": model,
                 }
+                # Best-effort positional tail labels: length-guarded and role-checked, so
+                # a buffer that a persistent message edit shrank/reordered can only change
+                # *which* message is labelled (trace metadata), never crash this hook.
                 if messages:
                     if len(messages) >= 2 and messages[-2]["role"] == "user":
                         attributes["jaz.last_last_message"] = self._truncate(
@@ -303,10 +386,8 @@ class OTelTracingHook(Hook):
                         )
                     last_message = self._truncate(self._format_message(messages[-1]))
                     attributes["jaz.last_message"] = last_message
-                if iteration is not None:
-                    attributes["jaz.iteration"] = iteration
-                if depth is not None:
-                    attributes["jaz.cur_recursion_depth"] = depth
+                attributes["jaz.iteration"] = iteration
+                attributes["jaz.depth"] = depth
 
                 parent_span = spans.get((invoke_id, "repl_iteration")) or spans.get(
                     invoke_id
@@ -324,32 +405,32 @@ class OTelTracingHook(Hook):
                     )
                 spans[(invoke_id, "llm_query")] = span
 
-            case LLMQueryExit(
-                invoke_id=invoke_id,
-                response_content=resp,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cost=cost,
-            ):
+            case LLMQueryExit(invoke_id=invoke_id, response=response):
+                content = response.content
                 span = spans.pop((invoke_id, "llm_query"), None)
                 if span:
-                    if resp:
-                        span.set_attribute("jaz.response", self._truncate(str(resp)))
+                    if content:
+                        span.set_attribute("jaz.response", self._truncate(str(content)))
                         self._set_output_attributes(
-                            span, resp, include_trace_fields=False
+                            span, content, include_trace_fields=False
                         )
-                    if prompt_tokens is not None:
-                        span.set_attribute("jaz.prompt_tokens", prompt_tokens)
-                    if completion_tokens is not None:
-                        span.set_attribute("jaz.completion_tokens", completion_tokens)
-                    if cost is not None:
-                        span.set_attribute("jaz.cost_usd", cost)
+                    if response.prompt_tokens is not None:
+                        span.set_attribute("jaz.prompt_tokens", response.prompt_tokens)
+                    if response.completion_tokens is not None:
+                        span.set_attribute(
+                            "jaz.completion_tokens", response.completion_tokens
+                        )
+                    if response.cost is not None:
+                        span.set_attribute("jaz.cost_usd", response.cost)
                     span.set_status(Status(StatusCode.OK))
                     span.end()
 
         return []
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def teardown(self, exc: BaseException | None = None) -> None:
+        # End any spans still open, mark them errored if the scope raised, then
+        # force-flush the exporter so batched spans are actually sent.
+        exc_type = type(exc) if exc is not None else None
         spans = self._get_active_spans()
         invoke_roots = self._get_invoke_roots()
         for span_key in list(spans.keys()):
@@ -357,11 +438,11 @@ class OTelTracingHook(Hook):
             if exc_type is not None:
                 span.set_status(Status(StatusCode.ERROR))
                 span.set_attribute("error.type", exc_type.__name__)
-                span.set_attribute("error.message", str(exc_value))
+                span.set_attribute("error.message", str(exc))
                 if isinstance(span_key, str):
                     self._set_output_attributes(
                         span,
-                        f"{exc_type.__name__}: {exc_value}",
+                        f"{exc_type.__name__}: {exc}",
                         include_trace_fields=invoke_roots.get(span_key, False),
                     )
             span.end()
@@ -369,4 +450,11 @@ class OTelTracingHook(Hook):
                 invoke_roots.pop(span_key, None)
 
         self.provider.force_flush()
-        return super().__exit__(exc_type, exc_value, traceback)
+
+
+#: Deprecated alias for the pre-rename spelling — see the rationale block in
+#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
+#: site so the deep-path import keeps working and so the alias map stays checkable
+#: (``test_every_renamed_hook_has_an_alias``). This hook is absent from every ``__all__``,
+#: so that deep-path import is the only way it was ever reachable.
+OTelTracingHook = OTelTracing

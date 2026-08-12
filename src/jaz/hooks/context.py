@@ -17,36 +17,40 @@ This provides several key benefits:
 Basic Usage
 -----------
     from jaz import invoke
-    from jaz.hooks import PrintLogger, disable_hook, isolated_hooks
+    from jaz.hooks import PrintLogger
     import logging
 
     # Activate a hook
     with PrintLogger(level=logging.INFO):
-        result = invoke("task", return_type=str)
-
-    # Disable a hook type
-    with disable_hook(PrintLogger):
-        result = invoke("quiet task", return_type=str)
-
-    # Isolated context (no parent hooks)
-    with isolated_hooks():
-        result = invoke("clean slate", return_type=str)
+        result = invoke(ReturnType(str), task="task")
 
 Architecture
 ------------
-The context system maintains an immutable HookContext that contains:
-- hooks: tuple of currently active Hook instances (in registration order)
-- disabled_types: set of hook types that are temporarily disabled
+The context system maintains an immutable HookContext containing the tuple of
+currently active Hook instances (in registration order). Each time a hook is
+entered/exited, a new HookContext is created and set in the context variable.
+This immutability ensures thread safety and makes context propagation predictable.
 
-Each time a hook is entered/exited, a new HookContext is created and set in the
-context variable. This immutability ensures thread safety and makes context
-propagation predictable.
+Design: built-in defaults and no generic disable
+-------------------------------------------------
+The default global hook context is **empty**. Future essential behaviors
+(budget enforcement, permissions, etc.) will be auto-installed by `invoke()`
+as regular `Hook` instances. Each such built-in ships with its own dedicated,
+behavior-specific opt-out (e.g., a hypothetical `bypass_budget()`).
 
-Default Global Context
-----------------------
-By default, the global context includes PrintLogger(level=logging.INFO).
-This means all invoke() calls have basic logging unless explicitly disabled
-with isolated_hooks().
+There is deliberately **no** generic disable/clear mechanism — neither a
+class-keyed `disable_hook(SomeClass)` nor a blanket `clear_all_hooks()` (#466
+removed both). Hook lifecycle is managed purely by lexical `with` scoping:
+
+1. Multiple instances of the same `Hook` class can be active simultaneously
+   (e.g., two `PrintLogger`s at different log levels). A class-keyed disable
+   silently kills all of them, conflating class with instance identity.
+2. A blanket clear is a footgun: it silently strips governance / safety
+   baseline hooks (e.g. the loop's only termination guarantee), and its effect
+   can't even be honored in raw worker threads (they restore the ancestor
+   context) — so it gives a false sense of a clean slate.
+3. Named, behavior-specific opt-outs document intent at the call site and are
+   far easier to audit than a generic kill switch.
 
 See Also
 --------
@@ -55,7 +59,7 @@ See Also
 - get_dispatcher(): Get the singleton dispatcher that reads from context
 """
 
-from contextlib import contextmanager
+from collections.abc import Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -77,58 +81,60 @@ class HookContext:
     """
 
     hooks: tuple["Hook", ...] = field(default_factory=tuple)
-    disabled_types: frozenset[type] = field(default_factory=frozenset)
-    is_implicit_default: bool = False
+    # Ids of hook instances active via `local_hooks` in this invoke or any enclosing
+    # one. Carried on the contextvar purely for *collision detection*, NOT dispatch:
+    # local hooks must not propagate to nested invokes (being local is the whole
+    # point), so they stay off `hooks`. But a local hook's lifecycle IS live for its
+    # invoke's entire dynamic extent (setup at entry, teardown at exit — see
+    # invoke._activate_local_hooks), which includes every nested invoke. Recording the
+    # id here lets `Hook.__enter__` / `_activate_local_hooks` see a still-live local and
+    # refuse to re-activate it (via `with` or a nested `local_hooks`), which would run
+    # setup()/teardown() twice. This makes the "one instance, one live scope" invariant
+    # (#533 / #540) total rather than only covering `with`-activated hooks.
+    local_active: frozenset[int] = frozenset()
+    # True once a real invoke has established this context as the ancestor for a subtree
+    # (#727, mirroring ConfigStack.established). A `with` activation only ``with_hook``s,
+    # which carries the flag through but never sets it true — so ``not established`` is the
+    # reliable "fresh worker thread, contextvar didn't propagate" signal the worker re-base in
+    # library/jaz.py keys on, even after the worker runs its own `with Hook()`. This replaces
+    # the old "is the contextvar unset (None)?" signal, which a worker's own `with` corrupted
+    # (it set the var, so the sub-invoke skipped restoring the ancestor → ancestor DROPPED).
+    # Excluded from equality: it's re-establishment bookkeeping, not part of the value.
+    established: bool = field(default=False, compare=False)
 
     def with_hook(self, hook: "Hook") -> "HookContext":
-        """Return new context with hook added at the end."""
+        """Return new context with hook added at the end (carrying local_active/established)."""
         return HookContext(
             hooks=self.hooks + (hook,),
-            disabled_types=self.disabled_types,
-            is_implicit_default=False,
+            local_active=self.local_active,
+            established=self.established,
         )
 
-    def with_disabled(self, hook_type: type) -> "HookContext":
-        """Return new context with hook type disabled."""
+    def with_local_active(self, ids: Iterable[int]) -> "HookContext":
+        """Return new context recording these local-hook instance ids as live."""
         return HookContext(
             hooks=self.hooks,
-            disabled_types=self.disabled_types | {hook_type},
-            is_implicit_default=False,
+            local_active=self.local_active | frozenset(ids),
+            established=self.established,
         )
 
-    def get_active_hooks(self) -> list["Hook"]:
-        """Get all hooks that aren't disabled, in registration order."""
-        return [h for h in self.hooks if type(h) not in self.disabled_types]
+    def with_established(self) -> "HookContext":
+        """Return this context marked established (the ancestor for a subtree). See
+        ``established`` and ``invoke._established_hook_context``."""
+        return HookContext(
+            hooks=self.hooks, local_active=self.local_active, established=True
+        )
 
 
 def get_current_hooks() -> HookContext:
     """Get current hook context.
 
-    Returns the default global context if none has been set.
-    The default context includes PrintLogger(level=logging.INFO).
+    Returns an empty context if none has been set.
     """
     try:
         return _hook_context.get()
     except LookupError:
-        # Return default global context
-        return _get_default_context()
-
-
-def _get_default_context() -> HookContext:
-    """Get the default global hook context.
-
-    This is lazily initialized to include PrintLogger(level=logging.INFO).
-    The is_implicit_default flag indicates this is the default context,
-    which will be replaced by an empty context when the first user hook is added.
-    """
-    # Import here to avoid circular dependency
-    import logging
-
-    from .builtin.print_logger import PrintLogger
-
-    return HookContext(
-        hooks=(PrintLogger(level=logging.INFO),), is_implicit_default=True
-    )
+        return HookContext()
 
 
 def _set_hook_context(ctx: HookContext) -> Token[HookContext]:
@@ -145,52 +151,3 @@ def _reset_hook_context(token: Token[HookContext]) -> None:
     Internal function - users should use context managers instead.
     """
     _hook_context.reset(token)
-
-
-@contextmanager
-def disable_hook(*hook_types: type):
-    """Context manager to temporarily disable specific hook types.
-
-    Usage:
-        with PrintLogger(level=logging.INFO):
-            do_something()  # PrintLogger active
-
-            with disable_hook(PrintLogger):
-                do_other()  # PrintLogger disabled
-
-                with PrintLogger(level=logging.WARNING):
-                    do_third()  # New PrintLogger active (WARNING level)
-
-    Args:
-        *hook_types: Hook types to disable
-    """
-    current = get_current_hooks()
-    new_context = current
-    for hook_type in hook_types:
-        new_context = new_context.with_disabled(hook_type)
-
-    token = _set_hook_context(new_context)
-    try:
-        yield
-    finally:
-        _reset_hook_context(token)
-
-
-@contextmanager
-def isolated_hooks():
-    """Context manager that clears all parent hooks.
-
-    Usage:
-        with PrintLogger():
-            invoke(...)  # Has PrintLogger
-
-            with isolated_hooks():
-                invoke(...)  # No hooks at all
-    """
-    current = get_current_hooks()
-    empty_context = HookContext()
-    _token = _set_hook_context(empty_context)  # Token unused - we restore directly
-    try:
-        yield
-    finally:
-        _set_hook_context(current)

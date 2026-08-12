@@ -1,9 +1,7 @@
-import inspect
+import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Self
-
-from typing_extensions import TypeForm
 
 from jaz.library.core import Library
 
@@ -13,18 +11,22 @@ from .types import ExecResult
 class REPL(ABC):
     """Base contract for REPL implementations used by LM agents.
 
-    Subclasses store ``return_type`` and ``return_validator`` as instance
-    attributes set at initialization time so that ``exec()`` does not need
-    to receive them on every call.
+    The REPL knows nothing about the return type or its validation. Return-*type* checking,
+    return-*value* validation, and REPL-*input* validation all live in hooks (``ReturnType`` /
+    ``ValidateReturn`` / ``ValidateREPLInput``) that act on the effect path (#528/#568); the REPL
+    only produces a ``Return`` carrying the value and the hooks decide whether it's acceptable.
     """
 
     # REPL-specific description shown in the system prompt
     # Subclasses should override this with their specific instructions
     description: str
 
-    # Set at initialization; used by exec() to validate RETURN commands.
-    return_type: TypeForm[Any] | None
-    return_validator: Callable[[Any], None] | None
+    # Whether this REPL type surfaces ``__repl_history__`` in its namespace. A static
+    # *capability* (not session state): the core agent loop only builds and tracks a
+    # history list for REPLs that advertise support, so a REPL that keeps no history
+    # (e.g. a non-Python REPL) is skipped cleanly rather than
+    # accumulating a list nothing can read.
+    maintains_repl_history: bool = False
 
     @classmethod
     def get_description(cls, config: Mapping[str, Any] | None = None) -> str:
@@ -43,41 +45,72 @@ class REPL(ABC):
         return cls.description
 
     @classmethod
+    def from_dict(cls: type[Self], params: Mapping[str, Any] | None = None) -> Self:
+        """Build a configured (not yet initialized) REPL — ``REGISTRY[tag].from_dict(params)``.
+
+        Params this REPL does not declare as constructor arguments are ignored rather than
+        raising. Override for a REPL whose config shape does not match its ``__init__``.
+        """
+        # Filtered because `repl.configs[language]` is an open, host-authored bag: an eval YAML
+        # may carry a key meant for a different REPL, or one whose feature has since been
+        # removed. Raising TypeError on those would make an unrelated stale key fatal at invoke
+        # time. The keys a REPL *does* declare still reach it, which is the contract that
+        # matters.
+        known = cls.construction_keys()
+        return cls(**{k: v for k, v in (params or {}).items() if k in known})
+
+    @classmethod
+    def construction_keys(cls) -> frozenset[str]:
+        """Which ``repl.params`` keys configure this REPL at construction.
+
+        Derived from ``__init__``'s declared parameters, exactly as for an LLM backend or a
+        protocol — so a REPL declares its config simply by declaring its constructor.
+        """
+        from ..providers.base import declared_init_keys
+
+        return declared_init_keys(cls)
+
     @abstractmethod
-    def initialize[ReturnT](
-        cls: type[Self],
-        task: str,
-        return_type: TypeForm[ReturnT] | None,
+    def initialize(
+        self,
         inputs: dict[str, object],
-        libraries: list[Library],
-        allowed_imports: list[str],
-        repl_exec_timeout: float | None,
-        forbidden_names: list[str],
-        forbidden_attributes: list[str] | None = None,
+        jaz_library: Library | None,
         allowed_builtins: dict[str, object] | None = None,
         session_id: str = "",
-        config: Mapping[str, Any] | None = None,
-        return_validator: Callable[[ReturnT], None] | None = None,
-        repl_input_validator: Callable[[str], None] | None = None,
+        initial_repl_history: list[object] | None = None,
     ) -> Self:
-        """Initialize the REPL with given inputs and allowed built-ins.
+        """Return a **new** REPL carrying this one's configuration plus one invoke's state.
+
+        Takes **only invoke-time arguments**. Everything that configures the REPL —
+        ``exec_timeout``, the sandbox allow-lists, the finishing rules — is a constructor
+        parameter, so a REPL is *configured* by construction and *initialized* per run.
+
+        **The receiver is a reusable template and is left untouched**; the returned instance is
+        the one to ``exec`` against. Call it once per invoke on the same configured REPL::
+
+            template = PythonREPL(exec_timeout=30.0)
+            first = template.initialize(inputs=..., session_id="a")
+            second = template.initialize(inputs=..., session_id="b")  # independent of `first`
+
+        Implementations must not bind per-invoke state onto ``self``. Returning ``self`` would
+        make the object single-use — a second call would silently replace the first run's
+        namespace, library binding and session id — which rules out holding one configured REPL
+        and running many invokes from it.
 
         Arguments:
-            task: The task that initiated this REPL session.
-            return_type: The expected return type of the REPL session.
             inputs: A dictionary of initial inputs to the REPL.
-            libraries: List of library objects available in the REPL.
-            allowed_imports: List of allowed import module names.
+            jaz_library: The JAZ Library bound in the REPL, or None.
             allowed_builtins: A dictionary of allowed built-in functions and variables.
             session_id: Unique session identifier for this REPL instance.
-            config: Optional REPL-specific configuration dict. Used to configure
-                REPL behavior (e.g., multi_statement, allow_raise for PythonREPL).
-            repl_exec_timeout: Timeout in seconds for exec/eval operations.
-            forbidden_names: List of forbidden variable/function names.
-            forbidden_attributes: List of forbidden attribute names.
-            return_validator: Optional callable to validate the return value.
+            initial_repl_history: An empty list container the driver passes in to own
+                ``__repl_history__``, or ``None`` when history is disabled. A REPL that
+                supports history surfaces this exact list object in its namespace as
+                ``__repl_history__`` (by reference); the core agent loop then retains the
+                reference and is the single writer of subsequent (iteration) entries. REPLs
+                without a Python namespace (a non-Python REPL) ignore it (leaving it empty),
+                which signals to the driver that the REPL keeps no history.
         Returns:
-            The initialized REPL instance.
+            This REPL, initialized.
         """
 
     @abstractmethod
@@ -85,9 +118,6 @@ class REPL(ABC):
         self,
         src: str,
         input_id: str,
-        error_if_not_finish: Exception | None = None,
-        raise_if_not_finish: bool = False,
-        budget_forcing_active: bool = False,
         exec_timeout_override: float | None = None,
     ) -> ExecResult[Any]:
         # TODO: Fix static types
@@ -97,99 +127,44 @@ class REPL(ABC):
         be captured and returned, displayed to the user of the REPL. The result
         category in the case of an error is EXECUTE.
 
-        ``return_type`` and ``return_validator`` are read from the instance
-        attributes set during initialization.
-
         Arguments:
             src: The REPL input to execute.
             input_id: The unique identifier for the REPL input.
-            error_if_not_finish: The error to return if the command does not
-                end the REPL session. `None` means we don't require the command
-                to end the REPL session.
-            raise_if_not_finish: Whether to raise an error (i.e., result category is
-                RAISE instead of ERROR) if we require the command to end the REPL
-                session but it does not.
-            budget_forcing_active: If True, RETURN and RAISE commands are refused
-                and an ErrorResult is returned instead, encouraging the agent to
-                do more reasoning before finishing.
         Returns:
             exec_result: A tuple with result_category, output, and optional
             return value or error. The REPL state is mutated in place.
         """
 
-    def get_task_preamble(self) -> str:
-        """Extra text appended after 'The following is your task.' in user prompt."""
-        return ""
-
-    def get_inputs_preamble(self) -> str:
-        """Text describing how inputs are available in this REPL."""
-        return ""
-
-    def get_must_exit_warning(
+    async def aexec(
         self,
-        *,
-        template_name: str,
-        can_delegate: bool,
-        max_input_length: int,
-        delegate_exec_timeout: float | None,
-    ) -> str:
-        """Rendered must-exit warning for this REPL type."""
-        return ""
+        src: str,
+        input_id: str,
+        exec_timeout_override: float | None = None,
+    ) -> ExecResult[Any]:
+        """Async version of exec(). Runs exec() in a thread pool to avoid blocking
+        the event loop.
 
-    def get_truncation_advice(
-        self,
-        *,
-        template_name: str,
-        iteration: int,
-        output_truncated: bool,
-        error_truncated: bool,
-    ) -> str:
-        """Rendered truncation advice for this REPL type."""
-        return ""
+        Contextvar propagation: asyncio.to_thread copies the current context
+        snapshot into the thread (reads see the caller's values), but any
+        contextvar a hook rebinds *inside* the thread is not visible back on
+        the event loop — propagation is one-way (inward only).
+
+        Concurrency note: to_thread uses the default ThreadPoolExecutor
+        (bounded to roughly min(32, cpu_count+4) threads). Under a wide
+        asyncio.gather of agents that are all in REPL exec simultaneously,
+        excess tasks queue behind the thread limit rather than running in
+        true parallel — real concurrency is capped at the executor size.
+        """
+        return await asyncio.to_thread(
+            self.exec,
+            src,
+            input_id,
+            exec_timeout_override,
+        )
 
     def get_finish_command_hint(self) -> str:
-        """Text like '`RETURN ...`' or '`RETURN ...` or `RAISE ...`'."""
-        return "`RETURN ...`"
-
-    def run_return_validator(
-        self,
-        return_value: object,
-        *,
-        repl_history: object | None = None,
-    ) -> None:
-        """Run the configured return validator.
-
-        Validators may use either the legacy single-argument signature
-        ``validator(return_value)`` or opt into REPL history inspection with
-        ``validator(return_value, *, repl_history=...)``.
-        """
-        if self.return_validator is None:
-            return
-
-        validator = self.return_validator
-
-        try:
-            signature = inspect.signature(validator)
-        except (TypeError, ValueError):
-            validator(return_value)
-            return
-
-        accepts_repl_history = False
-        for parameter in signature.parameters.values():
-            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
-                accepts_repl_history = True
-                break
-            if parameter.name == "repl_history" and parameter.kind in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            ):
-                accepts_repl_history = True
-                break
-
-        if accepts_repl_history:
-            validator(return_value, repl_history=repl_history)  # type: ignore[call-arg]  # runtime-inspected kwarg
-        else:
-            validator(return_value)
+        """Text like '`return ...`' or '`return ...` or `raise ...`'."""
+        return "`return ...`"
 
     @abstractmethod
     def add_inputs(self, inputs: dict[str, object]) -> None:
@@ -207,5 +182,55 @@ class REPL(ABC):
             This method should be idempotent - calling it multiple times
             with the same key should update the value (last write wins).
             The behavior is implementation-specific - some REPLs may not
-            support this operation (e.g., BashREPL).
+            support this operation (e.g., a non-Python REPL).
+
+            Implementations that bind Python objects (e.g. PythonREPL) MUST apply the
+            same ``__jaz_get__`` payload substitution that initialization does, so an
+            injected ``Library``/``jaz.wrap`` binds its payload rather than the wrapper.
+            Hook authors can therefore pass the wrapper directly to ``AddInputs``.
+        """
+
+    @abstractmethod
+    def add_variables(self, variables: dict[str, object]) -> None:
+        """Bind ``variables`` **raw** into the REPL namespace (the per-turn ``AddVariables``).
+
+        The namespace-level counterpart of ``add_inputs``: where ``add_inputs`` is an
+        *input*-level operation that applies ``__jaz_get__`` payload substitution (so an
+        injected wrapper binds its payload) and is conceptually part of the prompt, this binds
+        the given objects **verbatim** into the REPL namespace and leaves the prompt untouched.
+        Applied at ``REPLExecEnter`` before each turn's code runs, so a hook may re-bind a name
+        every turn. The sandbox key ``__builtins__`` must never be bound this way (enforced at
+        effect composition and again in implementations, defensively).
+
+        Args:
+            variables: Dictionary of variable name -> value to bind verbatim.
+
+        Note:
+            Implementation-specific — a REPL that doesn't maintain a mutable namespace may
+            treat this as a no-op.
+        """
+
+    @abstractmethod
+    def drop_variables(
+        self, names: Iterable[str], allow_missing: Iterable[str] = ()
+    ) -> None:
+        """Remove ``names`` from the REPL namespace (the inverse of ``add_inputs``).
+
+        Applies a ``DropVariables`` effect: each name is unbound so the agent's next
+        turn sees it as undefined (referencing it raises ``NameError``). Dropping a name
+        that isn't currently bound raises ``MissingDropTargetError`` (a hook bug — a drop
+        of an absent name), UNLESS the name is in ``allow_missing`` (the set of names whose
+        ``DropVariables`` opted into tolerating absence), in which case it is skipped. The
+        compiler-sandbox key ``__builtins__`` is never dropped even if named (enforced
+        upstream at effect composition and again here, defensively), so import/attribute/
+        builtins policy can't be unbound.
+
+        Args:
+            names: The variable names to remove from REPL state.
+            allow_missing: Names exempt from the missing-target check (from
+                ``DropVariables(..., allow_missing=True)``); an absent one is skipped, not raised.
+
+        Note:
+            Implementation-specific — a REPL that doesn't maintain a mutable namespace
+            may treat this as a no-op.
         """

@@ -1,14 +1,3 @@
-{% if error_truncated %}
-{% if repl_history %}
-*Note:* The error summary was truncated; the magic variable `__repl_history__[{{ iteration }}].error` holds the string with the full error summary and you can inspect it by applying string operations such as searching and slicing.
-{% else %}
-*Note:* The error summary was truncated because it exceeded the maximum display length.
-{% endif %}
-{% endif %}
 {% if output_truncated %}
-{% if repl_history %}
-*Note:* Printed output was truncated; the magic variable `__repl_history__[{{ iteration }}].repl_output` holds the string with the full output and you can inspect it by applying string operations such as searching and slicing.
-{% else %}
-*Note:* Printed output was truncated because it exceeded the maximum display length.
-{% endif %}
+*Note:* Printed output was truncated; the magic variable `__repl_history__[{{ iteration - 1 }}].repl_output` holds the string with the full output and you can inspect it by applying string operations such as searching and slicing.
 {% endif %}

@@ -1,5 +1,19 @@
-from .secure_eval import secure_eval
-from .secure_exec import secure_exec
-from .secure_open import secure_open
+from .secure_attr import (
+    make_secure_delattr,
+    make_secure_getattr,
+    make_secure_hasattr,
+    make_secure_setattr,
+    make_secure_vars,
+)
+from .secure_import import make_secure_import
+from .secure_open import make_secure_open
 
-__all__ = ["secure_eval", "secure_exec", "secure_open"]
+__all__ = [
+    "make_secure_delattr",
+    "make_secure_getattr",
+    "make_secure_hasattr",
+    "make_secure_import",
+    "make_secure_open",
+    "make_secure_setattr",
+    "make_secure_vars",
+]

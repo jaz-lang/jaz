@@ -13,16 +13,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from typing_extensions import TypeForm
-
 from jaz.hooks.base import Event
 from jaz.hooks.dispatcher import Hook
 from jaz.hooks.events import (
     InvokeEnter,
     InvokeExit,
-    ReplIterationExit,
+    LLMQueryExit,
+    REPLExecEnter,
+    REPLExecExit,
 )
-from jaz.repl.types import ErrorResult, ExecResult, RaiseResult, ReturnResult
+from jaz.repl.types import Continue, ExecResult
 
 # Global counter for naming invocations (shared across all contexts)
 _global_counter: ContextVar[int] = ContextVar("workflow_replay_counter", default=0)
@@ -35,8 +35,14 @@ def _increment_counter() -> int:
     return new_val
 
 
+def _write_indented(f: Any, code: str, indent: str) -> None:
+    """Write each line of ``code`` prefixed with ``indent`` (blank lines stay blank)."""
+    for line in code.split("\n"):
+        f.write(f"{indent}{line}\n" if line.strip() else "\n")
+
+
 @dataclass
-class ReplIteration:
+class REPLIteration:
     """Record of a single REPL iteration."""
 
     iteration: int
@@ -54,8 +60,6 @@ class ChildInvocation:
     task_name: str
     function_name: str  # task_name + counter
     module_name: str  # function_name (without .py)
-    prompt: str
-    return_type: TypeForm[Any] | None
     has_children: bool  # Whether this invoke made nested calls
 
 
@@ -67,15 +71,23 @@ class InvocationContext:
     parent_id: str | None  # Parent's invoke_id UUID (None for root)
     counter_id: int  # Sequential counter for naming
     task_name: str
-    prompt: str
-    return_type: TypeForm[Any] | None
     inputs: dict[str, object]
-    recursion_depth: int
+    depth: int
     output_path: Path  # Where this invocation's output will be written
 
     # Accumulated during execution
-    repl_iterations: list[ReplIteration] = field(default_factory=list)
+    repl_iterations: list[REPLIteration] = field(default_factory=list)
     child_invocations: list[ChildInvocation] = field(default_factory=list)
+
+    # Per-turn record assembly (#481): the removed REPLIterationExit once carried a turn's
+    # code + exec_result + llm_response in one event. Those now arrive on three separate
+    # events — LLMQueryExit (response), REPLExecEnter (code), REPLExecExit (result) — so we
+    # stash the first two here and write the REPLIteration record at REPLExecExit. A
+    # parse-failure turn fires no REPLExec events, so it writes no record (the accepted
+    # "no hook point on a parse-failure turn" tradeoff); its stashed response is overwritten
+    # by the next turn's query.
+    _pending_llm_response: str | None = None
+    _pending_code: str | None = None
 
     def get_function_name(self) -> str:
         """Get the function name for this invocation."""
@@ -94,21 +106,26 @@ class InvocationContext:
         return len(self.child_invocations) > 0
 
 
-class WorkflowReplayHook(Hook):
-    """Hook that materializes Jaz workflows as executable Python programs.
+class WorkflowReplay(Hook):
+    """Materialize a run as an executable Python package that replays it.
 
-    This hook tracks all invocations and REPL iterations, then generates
-    structured Python packages that replay the workflow execution.
+    Under ``with`` the generated program covers invokes nested inside. Passed positionally,
+    only that invoke is materialized.
 
     Usage:
-        with WorkflowReplayHook(output_dir="./workflows"):
-            result = invoke("Analyze data", return_type=dict)
+        with WorkflowReplay(output_dir="./workflows"):
+            result = invoke(ReturnType(dict), task="Analyze data")
 
         # Creates: ./workflows/analyze_data_1/...
 
     Args:
         output_dir: Root directory for materialized workflows
     """
+
+    # Reads the per-invoke ``task_name`` label off the blackboard (set by a
+    # ``MetaData`` carrier hook); declaring it here lets that seed validate. Absent →
+    # ``"main"``.
+    blackboard_consumes = {"task_name": "Human label naming the replay dir/function."}
 
     def __init__(self, output_dir: str = "./workflows"):
         """Initialize the workflow replay hook.
@@ -121,7 +138,7 @@ class WorkflowReplayHook(Hook):
         # Map invoke_id (UUID) to InvocationContext
         self.contexts: dict[str, InvocationContext] = {}
 
-    def on_event(self, event: Event) -> list:
+    def on_any(self, event: Event) -> list:
         """Process events and build workflow materialization.
 
         Args:
@@ -135,12 +152,12 @@ class WorkflowReplayHook(Hook):
             case InvokeEnter(
                 invoke_id=invoke_id,
                 parent_invoke_id=parent_invoke_id,
-                prompt=prompt,
-                task_name=task_name,
-                return_type=return_type,
                 inputs=inputs,
-                cur_recursion_depth=depth,
+                depth=depth,
             ):
+                # task_name is per-invoke metadata carried on the blackboard (seeded
+                # by a MetaData hook), not a core event field. Absent → "main".
+                task_name = str(event.blackboard.get("task_name", "main"))
                 # Increment global counter for naming this invocation
                 counter_id = _increment_counter()
 
@@ -164,10 +181,17 @@ class WorkflowReplayHook(Hook):
                     parent_id=parent_invoke_id,
                     counter_id=counter_id,
                     task_name=task_name,
-                    prompt=prompt,
-                    return_type=return_type,
-                    inputs=inputs,
-                    recursion_depth=depth,
+                    # Full bound namespace: explicit inputs ∪ resolved scope (disjoint; #727 split
+                    # them into separate InvokeEnter fields). Unlike the observability hooks
+                    # (atif_trace / conversation_history / loggers / otel_tracing), which record the
+                    # two as SEPARATE provenance channels, WorkflowReplay is a *codegen* hook: it
+                    # lowers this namespace into the replay function's PARAMETERS and reconstructs it
+                    # in the __main__ call. Replay reproduces the namespace the agent saw, so it needs
+                    # every name regardless of provenance — hence the deliberate merge here (do NOT
+                    # "fix" it into a split; splitting would require emitting `with jaz.scope(...)`
+                    # wrappers in the generated code, a separate codegen change).
+                    inputs={**event.scope, **inputs},
+                    depth=depth,
                     output_path=output_path,
                 )
 
@@ -183,8 +207,6 @@ class WorkflowReplayHook(Hook):
                             task_name=task_name,
                             function_name=ctx.get_function_name(),
                             module_name=ctx.get_module_name(),
-                            prompt=prompt,
-                            return_type=return_type,
                             has_children=False,  # Will be updated at InvokeExit
                         )
                     )
@@ -193,20 +215,37 @@ class WorkflowReplayHook(Hook):
                 program_file = self._get_program_file(ctx)
                 self._write_function_header(ctx, program_file)
 
-            case ReplIterationExit(invoke_id=invoke_id, iteration=i, result=result):
-                # Write this iteration to file immediately
+            case LLMQueryExit(invoke_id=invoke_id, response=response):
+                # Stash this turn's LLM response; the record is written at REPLExecExit
+                # (below), where code + exec_result also become available.
+                ctx = self.contexts.get(invoke_id)
+                if ctx:
+                    ctx._pending_llm_response = response.content
+
+            case REPLExecEnter(invoke_id=invoke_id, code=code):
+                # Stash this turn's code (only present on the runnable-code branch).
+                ctx = self.contexts.get(invoke_id)
+                if ctx:
+                    ctx._pending_code = code
+
+            case REPLExecExit(invoke_id=invoke_id, iteration=i, exec_result=result):
+                # Assemble + write this turn's record now that all three parts are known
+                # (response from the LLMQueryExit above, code from REPLExecEnter, result
+                # here). REPLExec only fires on the runnable-code branch, so a parse-failure
+                # turn writes no record (accepted #481 tradeoff — see InvocationContext).
                 ctx = self.contexts.get(invoke_id)
                 if not ctx:
                     return []
 
-                # Create ReplIteration record
-                repl_iteration = ReplIteration(
+                repl_iteration = REPLIteration(
                     iteration=i,
-                    code=result.code or "",
-                    exec_result=result.exec_result,
-                    llm_response=result.response_content,
+                    code=ctx._pending_code or "",
+                    exec_result=result,
+                    llm_response=ctx._pending_llm_response,
                 )
                 ctx.repl_iterations.append(repl_iteration)
+                ctx._pending_code = None
+                ctx._pending_llm_response = None
 
                 # Write this iteration to file
                 self._write_iteration_to_file(ctx, repl_iteration)
@@ -246,7 +285,7 @@ class WorkflowReplayHook(Hook):
         return ctx.output_path.with_suffix(".py")
 
     def _write_iteration_to_file(
-        self, ctx: InvocationContext, iteration: ReplIteration
+        self, ctx: InvocationContext, iteration: REPLIteration
     ) -> None:
         """Write a single REPL iteration to the program file.
 
@@ -270,36 +309,26 @@ class WorkflowReplayHook(Hook):
 
                 # Handle different execution result types
                 match iteration.exec_result:
-                    case (
-                        ErrorResult(exception=exception)
-                        | RaiseResult(exception=exception)
-                    ):
-                        # Wrap in try-except block
+                    case Continue(exception=exception) if exception is not None:
+                        # Recoverable error the agent observed and continued past: wrap the
+                        # code in a try/except that swallows it, so the replayed program
+                        # likewise continues. This is the ONLY case that wraps. Guard on
+                        # `exception is not None`: a clean `Continue` (exception=None) must
+                        # fall through to write-as-is, not get a bogus `except NoneType`
+                        # wrapper (#566 step C).
                         exc_type = type(exception).__name__
                         f.write("    try:\n")
-                        for line in code.split("\n"):
-                            if line.strip():
-                                f.write(f"        {line}\n")
-                            else:
-                                f.write("\n")
+                        _write_indented(f, code, "        ")
                         f.write(f"    except {exc_type}:\n")
                         f.write("        pass\n")
 
-                    case ReturnResult():
-                        # Write code as-is, RETURN will be replaced at InvokeExit
-                        for line in code.split("\n"):
-                            if line.strip():
-                                f.write(f"    {line}\n")
-                            else:
-                                f.write("\n")
-
                     case _:
-                        # ExecuteResult or other - write code as-is
-                        for line in code.split("\n"):
-                            if line.strip():
-                                f.write(f"    {line}\n")
-                            else:
-                                f.write("\n")
+                        # Everything else — clean `Continue`, `Return`, and terminal
+                        # `Raise` — is written as-is. Crucially, a terminal `Raise` is NOT
+                        # swallowed (#710): writing it as-is lets the replay re-raise and
+                        # terminate where the original did. The `RETURN`/`RAISE` sentinels
+                        # in the code are lowered to `return`/`raise` at finalization.
+                        _write_indented(f, code, "    ")
 
     def _write_function_header(
         self, ctx: InvocationContext, program_file: Path
@@ -312,12 +341,6 @@ class WorkflowReplayHook(Hook):
         """
         lines = []
 
-        # Generate function signature
-        return_type_str = ""
-        if ctx.return_type:
-            type_name = getattr(ctx.return_type, "__name__", None)
-            return_type_str = f" -> {type_name or ctx.return_type}"
-
         # Generate parameter list from inputs with type hints
         if ctx.inputs:
             param_parts = []
@@ -329,10 +352,13 @@ class WorkflowReplayHook(Hook):
         else:
             params = ""
 
-        lines.append(f"def {ctx.get_function_name()}({params}){return_type_str}:")
-        lines.append('    """')
-        lines.append(f"    {ctx.prompt}")
-        lines.append('    """')
+        # No docstring: the invoke's prompt is not a distinct field (#538) and the `task`
+        # input — the only prompt-like candidate — is neither guaranteed to exist nor
+        # contractually a string suitable as a docstring, so we omit it rather than emit a
+        # misleading or malformed one. The materialized body is the REPL iterations below.
+        # No return annotation: the return type is a ReturnType(...) hook now, not a per-invoke
+        # field this codegen hook can see (#568).
+        lines.append(f"def {ctx.get_function_name()}({params}):")
         lines.append("")
 
         program_file.write_text("\n".join(lines))
@@ -385,9 +411,14 @@ class WorkflowReplayHook(Hook):
             import_lines.append("    return fn")
             import_lines.append("")
 
-        # Replace all RETURN with return in the final code FIRST
-        # (Must be done before AST parsing for invoke replacement, since RETURN is invalid Python)
+        # Lower the RETURN/RAISE REPL sentinels to real Python FIRST — both are invalid
+        # Python as-is and must go before the AST parse in _replace_invoke_calls (mirrors
+        # python_repl.py lowering both). Without the RAISE pass, a terminal `RAISE ...`
+        # iteration leaves a literal `RAISE ...` that fails ast.parse and silently aborts
+        # finalization for the invoke (#710). Crude str.replace (not `\bRAISE\b`) matches
+        # the existing RETURN handling.
         current_content = current_content.replace("RETURN", "return")
+        current_content = current_content.replace("RAISE", "raise")
 
         # Replace jaz.invoke() calls in the function body if we have children
         if ctx.child_invocations:
@@ -516,24 +547,28 @@ class WorkflowReplayHook(Hook):
                         is_jaz_invoke = True
 
                 if is_jaz_invoke:
-                    # Replace with: _get_next_invoke_fn()(args, kwargs)
-                    # Original: jaz.invoke(prompt, arg1, arg2, return_type, **kwargs)
-                    # New: _get_next_invoke_fn()(arg1, arg2, **kwargs)
-                    # We need to skip the prompt and return_type arguments
-
-                    # Extract actual arguments (skip prompt and return_type)
-                    # Typically: jaz.invoke(prompt, *args, return_type, **kwargs)
-                    new_args = []
-                    new_keywords = []
-
-                    # Skip first argument (prompt)
-                    if len(node.args) > 1:
-                        new_args = node.args[1:]
-
-                    # Filter out return_type, prompt, and task_name from keywords
-                    for kw in node.keywords:
-                        if kw.arg not in ("return_type", "prompt", "task_name"):
-                            new_keywords.append(kw)
+                    # Replace with: _get_next_invoke_fn()(**data_inputs)
+                    #
+                    # The recorded workflow already captures the original return value, so we
+                    # strip every "control" arg from the call and forward ONLY the data inputs.
+                    # The public signature is `invoke(ReturnType(...), *local_hooks, task=...,
+                    # config_override=None, **inputs)`: data inputs are keyword-only, so EVERY
+                    # positional is a control hook (ReturnType / ConfigOverride / MetaData / …)
+                    # and none should be forwarded — drop them all. (The former `node.args[2:]`
+                    # was a relic of the 2-positional `invoke(prompt, config_override)` shape: it
+                    # under-stripped a lone leading hook and forwarded any positional past index
+                    # 2 — e.g. `invoke(H1(), H2(), H3(), task=...)` leaked `H3` into the replay.)
+                    new_args: list[ast.expr] = []
+                    _CONTROL_KWARGS = {
+                        "return_type",
+                        "prompt",
+                        "task",
+                        "task_name",
+                        "config_override",
+                    }
+                    new_keywords = [
+                        kw for kw in node.keywords if kw.arg not in _CONTROL_KWARGS
+                    ]
 
                     # Create: _get_next_invoke_fn()
                     get_fn_call = ast.Call(
@@ -564,13 +599,17 @@ class WorkflowReplayHook(Hook):
             # If unparsing fails, return original
             return source_code
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Exit context and reset counters."""
+    def teardown(self, exc: BaseException | None = None) -> None:
+        """Reset counters and clear per-workflow state."""
         # Reset global counter for next workflow
         _global_counter.set(0)
 
         # Clear the contexts dict
         self.contexts.clear()
 
-        # Call parent to reset hook context
-        return super().__exit__(exc_type, exc_value, traceback)
+
+#: Deprecated alias for the pre-rename spelling — see the rationale block in
+#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
+#: site so the deep-path import keeps working and so the alias map stays checkable
+#: (``test_every_renamed_hook_has_an_alias``).
+WorkflowReplayHook = WorkflowReplay

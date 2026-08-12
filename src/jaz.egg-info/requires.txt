@@ -1,15 +1,14 @@
 jinja2>=3.1
 httpx>=0.27
 tenacity>=9.0.0
-tree-sitter>=0.23.0
-tree-sitter-bash>=0.23.0
 beartype>=0.18.0
 typing-extensions>=4.13.0
+pathspec>=0.12
 
 [eval-appworld]
 pyyaml>=6.0
 numpy
-appworld @ git+https://github.com/stonybrooknlp/appworld.git
+appworld
 
 [eval-arc-agi-3]
 pyyaml>=6.0
@@ -30,6 +29,16 @@ numpy
 termcolor
 matplotlib
 
+[eval-letta-stulife]
+pyyaml>=6.0
+numpy
+stulife
+letta-client>=1.0
+requests>=2.31
+
+[eval-mem0]
+mem0ai==2.0.2
+
 [eval-nle]
 pyyaml>=6.0
 numpy
@@ -39,6 +48,11 @@ nle>=1.0
 pyyaml>=6.0
 numpy
 datasets>=2.0
+
+[eval-smolagents]
+pyyaml>=6.0
+numpy
+smolagents>=1.26
 
 [eval-stulife]
 pyyaml>=6.0
@@ -50,6 +64,20 @@ pyyaml>=6.0
 jinja2>=3.0
 datasets>=2.0
 swebench>=4.0
+numpy
+matplotlib
+
+[eval-swebench-baselines]
+jaz[eval-swebench]
+aider-chat
+lox
+mini-swe-agent
+openai
+tiktoken
+python-dotenv
+sentence-transformers
+faiss-cpu
+gepa~=0.1.1
 
 [eval-textworld]
 pyyaml>=6.0
