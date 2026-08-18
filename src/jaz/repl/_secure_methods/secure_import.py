@@ -64,16 +64,19 @@ def make_secure_import(policy: _ImportPolicy) -> Callable[..., Any]:
       the sandbox's ``__builtins__`` dict (hence this wrapper) is still reachable through routes
       that do not write the name as an ``ast.Name``: ``globals()["__builtins__"]``,
       ``locals()["__builtins__"]``, no-arg ``vars()["__builtins__"]`` (``globals``/``locals`` are
-      allow-listed builtins; no-arg ``vars`` is unpoliced), and frame/generator introspection
-      (``(x for x in []).gi_frame.f_builtins`` — ``gi_frame``/``f_builtins``/``f_globals`` are
-      non-dunder, so the default ``allowed_attributes=["*", "!__*"]`` does not block them). All of
-      these land on *this* wrapper, so the allow-list is still enforced at run time — no forbidden
-      module is imported; the residual is only that a deferred closure over them can be *built*.
+      allow-listed builtins; no-arg ``vars`` is unpoliced). All of these land on *this* wrapper, so
+      the allow-list is still enforced at run time — no forbidden module is imported; the residual
+      is only that a deferred closure over them can be *built*. The frame/generator route
+      (``(x for x in []).gi_frame.f_builtins``) is a different matter: it reaches a *real module*
+      frame's builtins, i.e. the real ``__import__``, not this wrapper. The default
+      ``allowed_attributes`` denies ``gi_frame``/``f_builtins``/``f_globals`` by name, so it is
+      closed unless a host widens that list.
     - **The *real* ``__import__`` (full bypass, not the wrapper) stays reachable via the attribute
       sandbox's documented holes.** ``some_fn.__globals__["__builtins__"]["__import__"]`` needs a
       *Python* function ``some_fn`` (whose ``__globals__`` carry the real builtins) and is closed
-      today only because the default ``allowed_attributes`` forbids ``__globals__`` — widening it to
-      dunders silently reopens the escape. ``str.format`` is worse: ``"{0.__globals__[__builtins__]}"
+      today only because the default ``allowed_attributes`` forbids ``__globals__`` (and, since
+      #827, the non-dunder frame surface that reached the same table) — widening either silently
+      reopens the escape. ``str.format`` is worse: ``"{0.__globals__[__builtins__]}"
       .format(fn)`` does the attribute+index traversal inside a runtime format string, invisible to
       *both* the static ``AllowedAttributesChecker`` and the runtime ``getattr`` wrapper (C-level
       getattr), so no attribute allow-list closes it. Given any Python function in scope (e.g. a

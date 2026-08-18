@@ -3,8 +3,7 @@
 A *scoped* input is a value bound with ``with jaz.scope(name=value): ...`` that
 is automatically available to every ``jaz.invoke`` call lexically enclosed by the
 block — and to every nested invoke below them — without threading it by hand as a
-kwarg at each layer. It is the general form of the auto-propagation that
-``libraries=`` already provides for tool catalogs, lifted to arbitrary values
+kwarg at each layer. It lifts ambient propagation to arbitrary values
 (a session id, an API client, a shared dataframe, ...).
 
 Why a context manager rather than threading-by-kwarg: a value that should live
@@ -25,7 +24,7 @@ Storage — **a single dict-valued ``ContextVar``**:
   relied on to cross thread/task boundaries. The cross-boundary hop into a nested
   invoke is done by snapshotting the scope at the invoke boundary and binding it
   as plain data on the agent-facing ``jaz`` object — exactly how ``config``
-  already propagates (see ``invoke._invoke`` / ``library.get_jaz_library``). A
+  already propagates (see ``invoke._invoke`` / ``_invoke_tool.get_invoke_tool``). A
   bare ContextVar read inside a ``ThreadPoolExecutor`` worker would see an empty
   context and silently drop scope; binding-as-data does not.
 
@@ -69,28 +68,30 @@ def scope(**values: object) -> Iterator[None]:
     Equivalent to passing each value as a kwarg to every invoke (and every nested
     invoke) within the ``with`` block — but without manual threading::
 
-        with jaz.scope(fs=fs_tools, web=web_client):
-            jaz.invoke(jaz.ReturnType(Report), task="analyze logs", target_date="2026-05-30")
+        from jaz import invoke, scope
+
+        with scope(fs=fs_tools, web=web_client):
+            invoke(task="analyze logs", target_date="2026-05-30")
             # fs and web are bound in the REPL of this invoke and all recursive
             # sub-invokes. On the other hand, task and target_date are local to this
             # top-level invoke and do not propagate to sub-invokes.
 
-    The construct is **symmetric**: the agent uses it inside its REPL exactly as
-    user code does, to make an intermediate value ambient to the sub-invokes it
-    spawns.
+    ``jaz.scope`` is user/host-facing. It is not auto-bound on the agent's
+    ``jaz.*`` surface (which now exposes only ``jaz.invoke``); a host that wants an
+    agent to open scopes from its own REPL passes ``scope`` in as an ordinary input.
 
     Semantics:
 
     - **Kwargs-only.** Names must be valid Python identifiers (they land as REPL
-      globals); splat a dynamic mapping with ``jaz.scope(**d)``.
+      globals); splat a dynamic mapping with ``scope(**d)``.
     - **Inner shadows outer on the same name.** Nesting
-      ``with jaz.scope(fs=A): with jaz.scope(fs=B): ...`` rebinds ``fs`` to ``B``
+      ``with scope(fs=A): with scope(fs=B): ...`` rebinds ``fs`` to ``B``
       inside the inner block and restores ``A`` on exit (standard ``with``
       semantics).
     - **An explicit kwarg colliding with a scoped name raises.** Passing a scoped
       name again as an invoke kwarg raises a conflict ``ValueError`` at invoke
       time. To give one invoke a different value for a scoped name, nest another
-      ``jaz.scope`` around it rather than re-passing the kwarg.
+      ``scope`` block around it rather than re-passing the kwarg.
     - **No partial unbinding.** There is no way to remove a name for a block; an
       inner scope can only shadow it with a new value.
     """
@@ -111,12 +112,21 @@ def scope(**values: object) -> Iterator[None]:
         _scope_var.reset(token)
 
 
-def current_scope() -> dict[str, object]:
+def get_scope() -> dict[str, object]:
     """Return a copy of the values currently in scope (a runtime escape hatch).
 
-    Exposed both to user code and in the agent's REPL (``jaz.current_scope``) for
-    introspection and testing. Returns a defensive copy so callers cannot mutate
+    Available to user code for introspection and testing. (No longer bound on the
+    agent-facing ``jaz.*`` surface, which now exposes only ``jaz.invoke``.)
+    Returns a defensive copy so callers cannot mutate
     the live binding; mutating a *value* inside the returned dict still mutates
     the shared object (values are shared by reference — see the module docstring).
     """
     return dict(_scope_var.get() or {})
+
+
+# Deprecated alias for the pre-rename spelling. Renamed ``current_scope`` -> ``get_scope`` to
+# parallel :func:`jaz.get_config` — the repo's accessor convention is ``get_*``, and a no-arg
+# ambient getter is inherently "the current one", so that qualifier belonged in the docstring,
+# not the identifier. Kept reachable (like the other renamed spellings) rather than hard-removed,
+# and removable at the next major bump.
+current_scope = get_scope

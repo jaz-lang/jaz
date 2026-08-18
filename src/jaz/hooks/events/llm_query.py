@@ -1,16 +1,19 @@
-"""LLM query event, context, and span."""
+"""LLM query events, contexts, and span."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from jaz._llm_client import LLMResponse
-from jaz.providers import MessageDict
-from jaz.repl.types import ExecResult
+from jaz.llm import MessageDict
 
 from ..base import Event, ExecutionContext
 from ..effects import AddMessages
+from .base import Aborted, Completed, Failed
+
+#: The LLM-query span's outcome union — what :attr:`LLMQueryExit.outcome` holds.
+type LLMQueryOutcome = Completed[LLMResponse] | Aborted | Failed
 
 
 @dataclass(frozen=True)
@@ -18,17 +21,19 @@ class LLMQueryEnter(Event):
     """Fired once per turn, before making an LLM API call.
 
     **Fires on every turn** — it is the always-present per-turn boundary, unlike the
-    conditional REPL execution events (skipped when the response fails to parse) and
-    :class:`LLMQueryExit` (skipped when the query never completes). That makes it the home of
-    per-turn loop and budget control.
+    conditional REPL execution events (skipped when the response fails to parse). That
+    makes it the home of per-turn loop and budget control.
 
     Allowed effects:
 
-    - :class:`Abort` — terminate the invoke; this is where the iteration and budget
+    - :class:`Abort` — abort the invoke; this is where the iteration and budget
       hard-stops fire.
     - :class:`AddMessages` — add a message to the prompt for this query.
     - :class:`DropMessages` — remove messages from the prompt for this query.
-    - :class:`OverrideResponse` — supply a response and skip the LLM call.
+
+    Suppliers do not compose here: :class:`SupplyLLMResponse` is a :class:`LLMQuerySend`
+    effect — a supplier decides on the basis of the message list, and the list it must see is
+    the committed post-edit one, which at this event composition may still rewrite.
 
     Attributes:
         messages: The message buffer as it stands before this query's edits are folded in.
@@ -36,11 +41,13 @@ class LLMQueryEnter(Event):
         iteration: The agent-loop iteration this query belongs to.
         can_recurse: Whether this invoke still has the recursive ``jaz.invoke`` tool.
         can_report_cost: Whether the client will report a per-call cost for this model
-            (see :meth:`~jaz.providers.llm.LLM.can_report_cost`). Lets a cost budget be
+            (see :meth:`~BaseLLM.can_report_cost`). Lets a cost budget be
             rejected before the first query instead of after paying for a turn.
     """
 
-    messages: list[MessageDict]
+    # ``Sequence`` in the annotation, ``tuple`` at runtime (see __post_init__): the
+    # constructor accepts the caller's list, the type forbids mutation through the field.
+    messages: Sequence[MessageDict]
     model: str
     iteration: int
     # Whether this invoke still has the recursive ``jaz.invoke`` tool (i.e. no
@@ -52,7 +59,8 @@ class LLMQueryEnter(Event):
     # no longer a framework value the primitive knows — it lives in the opt-in hook — so the
     # primitive only knows the boolean "is recursion still available for this invoke".
     can_recurse: bool
-    # Whether the client will populate ``LLMQueryExit.response.cost`` for this model, asked
+    # Whether the client will populate the response's ``cost_usd`` (read off
+    # ``LLMQueryExit.outcome.result`` on the Completed arm) for this model, asked
     # of the backend itself (``LLM.can_report_cost``) rather than inferred from a price
     # table — only the client knows where its cost comes from. Carried as a plain bool rather
     # than exposing the client object, which would hand every hook the ability to issue
@@ -60,44 +68,20 @@ class LLMQueryEnter(Event):
     # reading: cost is assumed reportable unless the client says otherwise.
     can_report_cost: bool = True
 
-
-@dataclass(frozen=True)
-class LLMQueryExit(Event):
-    """Fired after receiving LLM response.
-
-    **Not every turn.** It is skipped whenever the query never completed: a hook emitted an
-    :class:`Abort` at :class:`LLMQueryEnter` (the call never happened), or the call failed and
-    its retries were exhausted. A response supplied by :class:`OverrideResponse` *does* fire it — no call is
-    made, but the query completes normally.
-
-    This event is purely observational - no effects can be emitted.
-
-    Attributes:
-        response: The ``LLMResponse`` the client returned — content, token counts, and cost.
-        model: Which model was called; mirrors :class:`LLMQueryEnter`'s ``model``.
-        iteration: The agent-loop iteration this query belongs to.
-        start_time: When the call started, measured by the agent.
-        end_time: When the call finished, measured by the agent.
-        message_edits: The :class:`DropMessages` / :class:`AddMessages` edits composed for this query —
-            the only way a hook can see which messages were *removed*.
-    """
-
-    # ``model`` / ``start_time`` / ``end_time`` stay **event** fields rather than folding into
-    # ``response`` (a divergence from the #481 doc): they are *query* metadata, not *response*
-    # content. The timing is wall-clock measured by the agent around the call, not returned by
-    # the provider, so hanging it off the provider's ``LLMResponse`` would force that return
-    # type to carry fields it never populates.
-    #
-    # ``message_edits`` is the only removal-visible surface: a dropped message leaves the
-    # buffer, so per-message provenance on the survivors cannot reveal it. ``ConversationHistory``
-    # resolves the drop indices against the query's enter snapshot to log removals + reasons.
-
-    response: LLMResponse
-    model: str
-    iteration: int
-    start_time: datetime | None = None
-    end_time: datetime | None = None
-    message_edits: MessageEdits | None = None
+    def __post_init__(self) -> None:
+        # Sever the event's list from the loop's LIVE conversation buffer (the agent
+        # passes it uncopied): without this, a hook appending/removing/reordering
+        # ``event.messages`` silently edits the real conversation — the invoke events
+        # made the equivalent mistake structurally impossible (read-only ``inputs``),
+        # while this span handed hooks the live object (consistency audit C1). A tuple,
+        # not a mutable list copy (review of this PR): one shared event instance is
+        # dispatched to every hook, so a mutable copy would still let an earlier hook
+        # alias-mutate what a later hook observes — and would desync the dispatcher's
+        # Send-time edit resolution, which reads this field. Membership/order are pinned;
+        # the dicts inside are still shared, the same deep/shallow ceiling as
+        # ``InvokeEnter.inputs`` (see Event's docstring TODO). ``object.__setattr__`` is
+        # the frozen-dataclass escape hatch for this framework-internal coercion.
+        object.__setattr__(self, "messages", tuple(self.messages))
 
 
 @dataclass
@@ -130,24 +114,267 @@ class MessageEdits:
         return bool(self.persistent_drops or self.persistent_adds)
 
 
+# The resolved-edit record types below are PURE DATA on purpose: the resolution itself
+# (raw drop indices / add slots → these self-contained records, against the enter
+# snapshot) lives in the dispatcher, which holds both lists at emission time. The events
+# package must not import from the effects layer (cycle hazard — see the comment on
+# ``InvokeCompleteContext.modify_effects`` in events/invoke.py), so nothing here touches
+# ``_resolve_edit_index``. Shipping bare indices instead would force every edit-consuming
+# observer to keep its own snapshot of Enter's list to resolve against — rebuilding, one
+# event earlier, exactly the machinery the pre-resolved records delete.
+
+
+@dataclass(frozen=True)
+class MessageDropRecord:
+    """One message dropped from this query's committed input.
+
+    Attributes:
+        message: The dropped message itself (with its provenance stamp, so its stable
+            per-message id is readable via :func:`jaz.provenance.provenance_of`).
+        persistent: Whether the drop also removed the message from the carried-forward
+            buffer (``True``) or applied to this query's view only (``False``).
+    """
+
+    message: MessageDict
+    persistent: bool
+
+
+@dataclass(frozen=True)
+class MessageAddRecord:
+    """One :class:`AddMessages` edit folded into this query's committed input.
+
+    Attributes:
+        messages: The inserted messages.
+        position: The resolved slot in the enter-time snapshot the messages were inserted
+            before (``len(snapshot)`` for an append).
+        persistent: Whether the add also survives into later turns' buffers.
+    """
+
+    # Tuple-coerced like the events' message lists (see LLMQueryEnter.__post_init__):
+    # these records ride a shared event (LLMQuerySend.edits), so a mutable list here
+    # would let one hook alias-mutate what a later-dispatched hook observes.
+    messages: Sequence[MessageDict]
+    position: int
+    persistent: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "messages", tuple(self.messages))
+
+
+@dataclass(frozen=True)
+class ResolvedMessageEdits:
+    """This query's composed message edits as self-contained, pre-resolved records."""
+
+    # Tuple-coerced for the same shared-event reason as MessageAddRecord.messages.
+    drops: Sequence[MessageDropRecord] = ()
+    adds: Sequence[MessageAddRecord] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "drops", tuple(self.drops))
+        object.__setattr__(self, "adds", tuple(self.adds))
+
+
+@dataclass(frozen=True)
+class LLMQuerySend(Event):
+    """Fired when a query's input has committed — the post-edit message list is final.
+
+    Fires after :class:`LLMQueryEnter`'s edits have composed, once per query, on **every**
+    path where the input commits: before a live provider call, and equally when a
+    :class:`SupplyLLMResponse` (e.g. :class:`ATIFReplay`) answers here and skips the call — the
+    commitment of the input is real on both. It does not fire when the query is aborted at
+    :class:`LLMQueryEnter` (the input never commits).
+
+    Allowed effects:
+
+    - :class:`SupplyLLMResponse` — supply a response, overriding the default producer (the
+      provider call); the query still completes normally with it.
+    - :class:`Abort` — abort the invoke, declining the committed input.
+
+    Attributes:
+        messages: The committed message list — exactly what is handed to the result
+            producer (wire form, provenance stripped).
+        model: The model the query is addressed to.
+        iteration: The agent-loop iteration this query belongs to.
+        edits: The enter-time edits that produced ``messages``, as self-contained records
+            (dropped message content + persistence; added messages + resolved position).
+    """
+
+    # Send is a *default-action* event (span_event_lifecycle.md): emitting it IS the offer
+    # of the committed input to result producers — the DOM model, where handlers may take
+    # over (a supply effect answers inline, overriding the default producer; an abort
+    # declines the input) and otherwise the default action runs (the provider call). That is
+    # why it fires on the supplied path too, and why suppliers live here rather than at
+    # Enter (a supplier decides on the basis of the input, and the input it must see is the
+    # committed one — at Enter, composition may still rewrite it; a response cache keyed at
+    # Enter would key on the proposal and return wrong hits under compaction).
+
+    # ``Sequence`` in the annotation, ``tuple`` at runtime (see __post_init__): the
+    # constructor accepts the caller's list, the type forbids mutation through the field.
+    messages: Sequence[MessageDict]
+    model: str
+    iteration: int
+    edits: ResolvedMessageEdits = field(default_factory=ResolvedMessageEdits)
+
+    def __post_init__(self) -> None:
+        # Sever the event's list from the committed list the PROVIDER is about to be
+        # handed (the agent passes ``shown`` to both this event and the LLM call):
+        # a hook mutating ``event.messages`` here would otherwise edit the actual
+        # provider request. Same tuple coercion + shallow-copy ceiling as
+        # LLMQueryEnter (see its __post_init__).
+        object.__setattr__(self, "messages", tuple(self.messages))
+
+
+@dataclass(frozen=True)
+class LLMQueryComplete(Event):
+    """Fired when the query's raw response exists — the response control boundary.
+
+    Fires once per completed query, with the response the producer made: the provider's
+    return, or the response a :class:`SupplyLLMResponse` supplied at :class:`LLMQuerySend`.
+    It does not fire when the query was aborted before a response existed, or when the
+    call raised (no raw response — only :class:`LLMQueryExit` fires then, with the failure).
+
+    This is the earliest point a hook can decide "this run must not continue" on the basis
+    of what came back — an unpriceable cost, a policy-violating completion, a provider
+    degradation. The query itself is already finished and is never un-done: an abort
+    here stops the turn *after* the response, before the agent acts on it, so the code the
+    model just proposed is never executed.
+
+    Allowed effects:
+
+    - :class:`Abort` — abort the invoke on the basis of the response.
+
+    Attributes:
+        response: The raw ``LLMResponse`` the producer returned — content, token counts,
+            and cost.
+        model: Which model was called; mirrors :class:`LLMQueryEnter`'s ``model``.
+        iteration: The agent-loop iteration this query belongs to.
+    """
+
+    # The modify slot is documented-but-empty by design: this event is the stage that would
+    # host a response-transforming effect (the ``ModifyExecResult`` analogue for responses),
+    # but no such effect exists yet — substituting a response after the call happened is a
+    # semantic minefield (the observed exit and the acted-on response would need to agree),
+    # so the slot stays unfilled until a concrete consumer motivates it. Abort-only for now.
+    #
+    # ``BudgetPool``'s uncosted-model backstop lives here (#1071): its predicate reads the
+    # response ("this turn reported no cost"), which is exactly this event's firing
+    # condition — at Exit the outcomes where no response exists are already terminating.
+
+    response: LLMResponse
+    model: str
+    iteration: int
+
+
+@dataclass(frozen=True)
+class LLMQueryExit(Event):
+    """Fired when the LLM-query span closes, with the query's outcome.
+
+    ``outcome`` is the tagged union :data:`LLMQueryOutcome`: :class:`Completed` carries the
+    ``LLMResponse`` the query produced (``outcome.result``) — including a response supplied
+    by :class:`SupplyLLMResponse` (no call is made, but the query completes normally);
+    :class:`Aborted` means a hook's :class:`Abort` at one of this query's control stages
+    ended the invoke (``outcome.exception`` carries the abort's error, which propagates
+    after the event fires); :class:`Failed` carries the exception the call (or the span's
+    own machinery) raised (``outcome.exception``; it still propagates after the event
+    fires). The event fires on **every** path once the query span opened — an aborted
+    query closes ``Aborted``, it no longer skips the exit.
+
+    Observation-only: no effect is valid here — the outcome is already final (an effect
+    returned here raises :class:`~jaz.exceptions.InvalidEffectError`). A hook that
+    must stop the run on the basis of the response aborts at :class:`LLMQueryComplete`.
+
+    Timing: like every event, this exit carries only :attr:`~jaz.hooks.events.Event.timestamp`
+    (its emission time); a span's duration is ``Exit.timestamp - Enter.timestamp``.
+
+    Attributes:
+        outcome: How the span ended, with its payload — match on the variant
+            (``Completed[LLMResponse] | Aborted | Failed``).
+        model: Which model was called; mirrors :class:`LLMQueryEnter`'s ``model``.
+        iteration: The agent-loop iteration this query belongs to.
+    """
+
+    # ``model`` stays an **event** field rather than folding into the outcome (a divergence
+    # from the #481 doc): it is *query* metadata, not *response* content.
+    #
+    # No time fields here: the former ``start_time``/``end_time`` (interval-on-record,
+    # #1011) and ``call_start_time``/``call_end_time`` were replaced by the base
+    # ``Event.timestamp`` — see its field comment in hooks/base.py for the decision record
+    # (uniform emission stamp; intervals are consumer arithmetic; the call fields had no
+    # consumer after #1159).
+    #
+    # ``outcome`` has NO default on purpose: the pure tagged union replaced the former
+    # ``response`` + ``outcome`` + ``exception`` field triple (whose parallel defaults let a
+    # constructor produce an incoherent event, e.g. COMPLETED with response=None), so every
+    # construction site must say how the span ended.
+    #
+    # The former ``message_edits`` field is gone: :class:`LLMQuerySend` ships the same edits
+    # pre-resolved (``edits``), and its sole consumer (``ATIFTrace``) reads them there now.
+    # ``Send`` owns the final input; ``Exit`` owns the final outcome.
+
+    outcome: LLMQueryOutcome
+    model: str
+    iteration: int
+
+
 @dataclass
 class LLMQueryContext(ExecutionContext):
-    """Context for LLM query events.
+    """Context for LLM query *enter* events.
 
     Hooks can:
-    - Terminate the invoke via :class:`Abort` — this is the always-present per-turn point where
-      loop/budget hard-stops live; the composed exceptions are collected in ``abort_errors``
-      and resolved to a terminal :class:`Raise` by ``span_llm_query`` (before the LLM call).
+    - Abort the invoke via :class:`Abort` — this is the always-present per-turn point
+      where loop/budget hard-stops live; the composed exceptions are collected in
+      ``abort_errors`` and ``span_llm_query`` raises the combined exception (before the
+      LLM call; the span closes ``Aborted``).
     - Edit the messages before the query via :class:`DropMessages` / :class:`AddMessages`, each
       *transient* (a per-query view) or *persistent* (edits the carried-forward buffer);
       composition is order-independent (see :class:`MessageEdits`).
-    - Override the response, skipping the API call (via OverrideResponse).
+
+    Response supply is NOT here: :class:`SupplyLLMResponse` composes at
+    :class:`LLMQuerySend` (see :class:`LLMQuerySendContext`).
     """
 
     message_edits: MessageEdits = field(default_factory=MessageEdits)
-    override_response: LLMResponse | None = None
-    # Exceptions from ``Abort`` effects emitted at ``LLMQueryEnter``. Resolved to a terminal
-    # ``Raise`` in ``span_llm_query`` (kept named for the exceptions they carry).
+    # Exceptions from ``Abort`` effects emitted at ``LLMQueryEnter``. ``span_llm_query``
+    # raises their combination (kept named for the exceptions they carry).
+    abort_errors: list[Exception] = field(default_factory=list)
+
+
+@dataclass
+class LLMQuerySendContext(ExecutionContext):
+    """Context for LLM query *send* events — the supply boundary.
+
+    Hooks can **supply** the response via :class:`SupplyLLMResponse` (the provider call is
+    skipped and the supplied response is used, ``supplied_response``) or abort via
+    :class:`Abort` (``abort_errors``). Composition of the supply is order-independent:
+    identical overrides compose to one; two distinct overrides raise
+    :class:`~jaz.exceptions.LLMResponseConflictError`.
+    """
+
+    supplied_response: LLMResponse | None = None
+    abort_errors: list[Exception] = field(default_factory=list)
+
+
+@dataclass
+class LLMQueryCompleteContext(ExecutionContext):
+    """Context for LLM query *complete* events.
+
+    Hooks can abort the invoke via :class:`Abort`; the composed exceptions are
+    collected in ``abort_errors`` and ``span_llm_query`` raises their combination (the
+    span closes ``Aborted``). No other effect is valid here (no response-modify effect
+    exists yet — see the comment on :class:`LLMQueryComplete`).
+    """
+
+    # Why this boundary exists at all: the response's first-existence point used to be
+    # `LLMQueryExit`, which grew an Abort channel because denying it forced hooks to stash
+    # state on themselves and re-decide at the *next* `LLMQueryEnter` (see
+    # `BudgetPool`'s former `_uncosted_model` field). Be precise about what that deferral
+    # cost, because it is easy to overstate: it was NOT an extra query — an abort at the next
+    # enter returns before the call, and the turn that revealed the condition was already
+    # spent. What it cost is an *execution*: between the two events the agent runs the code
+    # from that very turn. For a policy-violating completion that is the whole ballgame. A
+    # hook field whose only job is to defer a decision to a later event is the tell that an
+    # effect site is missing. The pipeline gives the site a proper home: `Complete` is the
+    # response-control stage, and `Exit` reverts to pure observation.
     abort_errors: list[Exception] = field(default_factory=list)
 
 
@@ -155,38 +382,68 @@ class LLMQuerySpan:
     """Span for LLM query.
 
     Usage:
-        with dispatcher.span_llm_query(...) as span:
-            response = llm.complete(...)  # an LLMResponse
-            span.complete(response=response, iteration=..., start_time=..., end_time=...)
+        with dispatcher.span_llm_query(enter_event) as span:
+            span.send(shown_messages)      # fires LLMQuerySend; suppliers compose
+            if span.supplied_response is not None:
+                response = span.supplied_response
+            else:
+                response = llm.complete(...)
+            span.complete(response=response)
+
+    An ``Abort`` composed at any of the query's control stages never surfaces on the
+    span: the ``span_llm_query`` context manager raises the carried exception (from the
+    ``with`` statement at enter, from ``send()`` at the committed-input veto, from the
+    block's close for a Complete-time one), after closing the span with an ``Aborted``
+    outcome. The former per-stage abort fields (``abort`` / ``send_abort`` /
+    ``complete_abort``) were the legacy laundering channel and are gone.
     """
 
     def __init__(self, ctx: LLMQueryContext) -> None:
         self.ctx = ctx
         self._completed: bool = False
         self._response: LLMResponse | None = None
-        self._iteration: int | None = None
-        self._start_time: datetime | None = None
-        self._end_time: datetime | None = None
-        # Terminal ``Raise`` produced by an enter-time ``Abort``, if any. When set, the
-        # caller skips the LLM call and returns this to terminate the invoke; the span fires
-        # no ``LLMQueryExit`` (the query never happened). Set by ``span_llm_query`` at enter.
-        self.abort: ExecResult | None = None
+        # No _iteration: the span deliberately has no iteration channel of its own — the
+        # CM reads it off the enter event for every event it constructs, so one query's
+        # events can never disagree about which iteration they belong to (the removed
+        # complete(iteration=...) parameter was a second, mismatchable source;
+        # consistency audit C3). Neither REPLExecSpan nor InvokeSpan ever had one.
+        # Emitter for LLMQuerySend, installed by ``span_llm_query`` (the span is pure data
+        # and must not import the dispatcher; the CM closes over the enter event + composed
+        # edits so ``send()`` needs only the committed list, and stores the Send-composed
+        # supply on ``supplied_response``). None on a hand-built span.
+        self._emit_send: Callable[[list[MessageDict]], None] | None = None
+        # Response supplied by a Send-composed ``SupplyLLMResponse`` (e.g. ``Replay``), if
+        # any. When set, the caller uses it in place of calling the provider; the query
+        # still completes normally with it. Set by ``send()``.
+        self.supplied_response: LLMResponse | None = None
+
+    def send(self, shown_messages: list[MessageDict]) -> None:
+        """Fire :class:`LLMQuerySend` with this query's committed message list.
+
+        Called by the agent loop once the enter-time edits have been folded into the list
+        actually handed to the result producer — i.e. exactly when the input commits. A
+        Send-composed supply is stored on :attr:`supplied_response`; a Send-composed
+        :class:`Abort` raises its carried exception from this call (the span closes
+        ``Aborted``).
+
+        Raises:
+            RuntimeError: If the span was not created by ``span_llm_query``.
+        """
+        if self._emit_send is None:
+            raise RuntimeError(
+                "LLMQuerySpan.send() requires a span created by span_llm_query"
+            )
+        self._emit_send(shown_messages)
 
     def complete(
         self,
         *,
         response: LLMResponse,
-        iteration: int,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
     ) -> None:
-        """Complete span with the LLM response and query timing.
+        """Complete span with the LLM response.
 
         Args:
             response: The LLMResponse (content + token counts + cost) the client returned.
-            iteration: The REPL iteration number.
-            start_time: When the LLM call started (agent-measured).
-            end_time: When the LLM call finished (agent-measured).
 
         Raises:
             RuntimeError: If span was already completed
@@ -194,9 +451,6 @@ class LLMQuerySpan:
         if self._completed:
             raise RuntimeError("Span already completed")
         self._response = response
-        self._iteration = iteration
-        self._start_time = start_time
-        self._end_time = end_time
         self._completed = True
 
     def is_completed(self) -> bool:
@@ -213,46 +467,6 @@ class LLMQuerySpan:
             raise RuntimeError("Span not completed")
         assert self._response is not None
         return self._response
-
-    def get_iteration(self) -> int:
-        """Get the iteration number.
-
-        Returns:
-            The iteration provided to complete()
-
-        Raises:
-            RuntimeError: If span was not completed
-        """
-        if not self._completed:
-            raise RuntimeError("Span not completed")
-        assert self._iteration is not None
-        return self._iteration
-
-    def get_start_time(self) -> datetime | None:
-        """Get the LLM call start time.
-
-        Returns:
-            The start_time provided to complete()
-
-        Raises:
-            RuntimeError: If span was not completed
-        """
-        if not self._completed:
-            raise RuntimeError("Span not completed")
-        return self._start_time
-
-    def get_end_time(self) -> datetime | None:
-        """Get the LLM call end time.
-
-        Returns:
-            The end_time provided to complete()
-
-        Raises:
-            RuntimeError: If span was not completed
-        """
-        if not self._completed:
-            raise RuntimeError("Span not completed")
-        return self._end_time
 
 
 # Retry lives here with the rest of the LLMQuery* family (rather than a standalone

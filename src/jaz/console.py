@@ -37,7 +37,10 @@ Design principles (settled with the user — see design/design_features/interact
 - **No hooks by default.** Bare ``jaz`` enables nothing that requires an external service
   (fixing the Jaeger footgun); tracing/logging/budgets are opt-in CLI flags.
 - **Config via CLI flags + in-session reconfigure.** Startup flags feed ``jaz.configure``;
-  because it is a real console, ``jaz.configure(...)`` also works mid-session.
+  because it is a real console, ``jaz.configure(...)`` also works mid-session. Both are
+  per-session; defaults that should outlive the session go in ``~/.jaz/settings.json``
+  (:mod:`jaz.user_settings`), and API keys in ``~/.jaz/credentials.json`` — written from
+  here by :func:`set_credential`, which prompts so the key never reaches the history file.
 
 The sigils
 ----------
@@ -56,9 +59,11 @@ Typed line           Rewrites to
 ``t: T <- prompt``   ``t = invoke(ReturnType(T), task=t"prompt")`` (``T`` eval'd in the ns)
 ``?expr``            ``jprint(expr)`` — print ``expr``'s ``jaz.describe`` description.
 ``% request``        ``__jaz_settings__("request", globals())`` — a *sandboxed* helper
-                     agent replies with either a plain-language ``answer`` (printed) or a
-                     settings ``snippet`` (``jaz.configure(...)`` etc.), the latter run only
-                     after the user confirms ``Run this? [y/N]``. See :func:`jaz_settings`.
+                     agent for anything jaz: it answers questions (settings, usage, how jaz
+                     works — it can read the current config and the jaz source) as a printed
+                     ``answer``, and meets action requests (``jaz.configure(...)`` etc.) with
+                     a ``snippet`` run only after the user confirms ``Run this? [y/N]``.
+                     See :func:`jaz_settings`.
 ===================  ==================================================================
 
 Known limitations (intentional, v1)
@@ -74,10 +79,14 @@ Known limitations (intentional, v1)
   ``.py`` file; the portable form is plain ``invoke(task=t"...")`` / ``jprint(...)``.
 - **Literal braces in prose must be doubled.** The rewritten body is a t-string, so ``{``
   and ``}`` mean interpolation. Brace-bearing prose therefore lowers to broken source:
-  ``> explain {} in Python`` becomes an empty interpolation (a ``SyntaxError`` from
-  ``<jaz>``), and ``> what does {x} do`` quietly binds ``x`` as an input the user never
-  meant. Escape literal braces by doubling them (``{{``/``}}``). This is inherent to reusing
-  the t-string path; a friendlier diagnostic than the raw ``SyntaxError`` is tracked in #547.
+  ``> explain {} in Python`` becomes an empty interpolation, and ``> what does {x} do``
+  quietly binds ``x`` as an input the user never meant. Escape literal braces by doubling
+  them (``{{``/``}}``). This is inherent to reusing the t-string path — but a lone/empty
+  brace that *would* raise a ``SyntaxError`` is now caught and re-raised as a clean
+  ``SyntaxError`` (naming the unpaired or empty brace, plus one-line recovery guidance)
+  instead of a raw traceback from the synthesized t-string (:func:`_tstring_brace_error`,
+  #547); the
+  ``{x}``-binds-an-unintended-input case is valid syntax and so stays a documented surprise.
 - **Double quotes inside ``{...}`` interpolations are not supported by the sugar.** The
   rewrite escapes ``"`` so the synthesized ``t"..."`` literal stays well-formed, which also
   escapes quotes *inside* an interpolation expression. Use single quotes inside ``{...}``
@@ -104,15 +113,19 @@ from __future__ import annotations
 import argparse
 import atexit
 import code
+import difflib
+import getpass
 import inspect
-import os
 import random
 import re
 import sys
 import threading
 import time
+import warnings
 from collections.abc import Mapping
 from contextlib import ExitStack
+from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 import jaz
@@ -122,10 +135,11 @@ import jaz
 # access trips the #962 NonPublicAPIWarning — which surfaced as warning noise in the
 # user's console session.
 from jaz.hooks import Hook, ReturnType
+from jaz.paths import ensure_config_dir
 
 from .instantiate import build_config
-from .protocol.default import DefaultProtocol
-from .repl.python_repl import PythonREPL
+from .protocol.code_only import CodeOnlyProtocol
+from .repl.python_repl import DEFAULT_ALLOWED_ATTRIBUTES, PythonREPL
 from .user_settings import (
     SETTINGS_RECOVERY_HINT,
     load_user_settings,
@@ -186,8 +200,13 @@ def jprint(value: object) -> None:
 
 
 # ---------------------------------------------------------------------------
-# `% request` settings helper: answer in words, or propose a snippet to confirm and run
+# `% request` jaz helper: answer in words, or propose a snippet to confirm and run
 # ---------------------------------------------------------------------------
+# Née the *settings* helper — successive PRs gave it a config view, the jaz source, and
+# finally a general "anything jaz" mission. The internal names (`jaz_settings`,
+# `_propose_settings_response`, `_settings_reference`, the "settings" sigil kind) keep the
+# original spelling on purpose: they are private, renaming them would churn every test and
+# rewrite-path reference for zero behaviour, and settings remain the one *action* surface.
 def _strip_code_fences(text: str) -> str:
     """Strip a single markdown code-fence wrapper (```` ```lang ... ``` ````), if present.
 
@@ -202,23 +221,26 @@ def _strip_code_fences(text: str) -> str:
 # Curated addendum for the helper's reference document: everything a settings snippet
 # might need that the `jaz.configure` / `jaz.ConfigOverride` docstrings do not cover
 # (hook-based knobs) or do not make operational enough for reliable generation.
+# The non-settings block deliberately pins no how-to phrasing to ('code', ...): "show me
+# how to …" is ambiguous between wanting an explanation and wanting to run something, so
+# the general question/action split does the routing rather than a per-example steer.
 _SETTINGS_ADDENDUM = """\
 Additional jaz settings knowledge:
 
 - Config holds CONFIGURED COMPONENTS, one per group: llm=, repl=, protocol=. You pass the
   object itself, and its constructor is the list of that group's settings. Dicts of leaves
   and flat option names (model_config, repl_configs, ...) are REJECTED. Import what you use:
-      from jaz.providers.openai import OpenAILLM
+      from jaz.llm import LiteLLM
       from jaz.repl.python_repl import PythonREPL
-      from jaz.protocol.default import DefaultProtocol
+      from jaz.protocol.code_only import CodeOnlyProtocol
 - Setting a group REPLACES it — a component states itself completely, so there is no partial
   update. To change one setting, restate the whole component INCLUDING the values you want to
   keep, reading them off the current config first (see READING below).
-- Model: jaz.configure(llm=OpenAILLM(model="gpt-5-mini")). OpenAILLM's constructor takes
-  model, base_url, the retry_* settings, and any per-request default (temperature,
-  max_tokens, reasoning_effort, ...) passed through to the provider API. A "provider/model"
-  prefix is carried through to the request as written; it does NOT select the backend — the
-  class does.
+- Model: jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini")). LiteLLM's
+  constructor takes model (a LiteLLM route like openai/gpt-5-mini), the retry_* settings,
+  allowed_openai_params/drop_params, and any per-request default (temperature, max_tokens,
+  reasoning_effort, ...) forwarded to LiteLLM. The "provider/" prefix is LiteLLM's routing key:
+  it selects the provider within the litellm backend, not the jaz backend — the class does that.
 - The agent's Python sandbox is configured by allow-lists on the REPL (gitignore-glob
   patterns): allowed_imports (default [] = deny all; ["*"] = allow all; ["numpy", "pandas"]
   = just those root modules), allowed_attributes, allowed_read_paths, allowed_write_paths,
@@ -235,29 +257,96 @@ Additional jaz settings knowledge:
       with jaz.hooks.IterationLimit(max_iterations=10): ...
       with jaz.hooks.RecursionLimit(max_depth=3): ...
   (RecursionLimit is `with`-only — it rejects positional/per-invoke activation.)
-- READING current settings (for questions like "what model am I using?"): the snippet
-  should print the answer from jaz.get_config(), e.g.
-      cfg = jaz.get_config()
-      print(type(cfg.llm).__name__, cfg.llm.model)
-  Other reads: cfg.repl.exec_timeout, cfg.repl.allowed_imports, cfg.protocol.max_input_length,
-  cfg.protocol.max_output_length. Each group IS the component that will be used, so what you
-  read is what is in force — there is no separate "but what is the default?" question, and no
-  .get() on a bag.
+- ANSWERING a question about current settings ("what model am I using?"): a read-only
+  snapshot of the CURRENT config is handed to you as `config`. Read it and answer in words —
+  e.g. config.llm.type, config.llm.model, config.repl.exec_timeout, config.repl.allowed_imports,
+  config.protocol.max_invoke_input_length, config.protocol.max_repl_output_length. It is plain data (no
+  methods; secrets like api_key are redacted). Each group IS the component that will be used,
+  so what you read is what is in force — there is no separate "but what is the default?"
+  question. Return ('answer', ...) with the value, not code.
+- Any CODE you propose that must itself read current settings — e.g. to restate a component
+  while preserving values you are not changing — reads them at runtime with jaz.get_config(),
+  e.g. cfg = jaz.get_config(); jaz.configure(llm=OpenAILLM(model=cfg.llm.model, base_url=...)).
+  That code runs later in the user's console (which can import jaz); you cannot, which is why
+  you ANSWER from `config` but generated CODE reads from jaz.get_config().
 - In the interactive console a session-global jaz.configure(...) line is usually what the
   user wants; produce `with`-scoped forms only when the request asks for a temporary or
   one-off change.
+- READING THE JAZ SOURCE: the installed jaz package is readable with the builtin open().
+  `source_root` is the package directory and `source_files` lists every Python file under
+  it, relative to that root — e.g. open(f"{source_root}/config.py").read(). Nothing outside
+  the package tree is readable, and there is nothing to import. Prefer `config` and this
+  reference for settings questions; read the source when a question turns on how jaz
+  actually behaves (defaults, error text, mechanism). Big files: print a slice at a time.
+  When your answer leans on source you read, cite the file path so the user can look too.
+- NON-SETTINGS REQUESTS are in scope: this reference only covers settings, so answer
+  usage/behaviour/debugging questions from the source tree. When the user asks you to run
+  something, hand back a ('code', ...) snippet they confirm before it runs — jaz, invoke and
+  jprint are already bound in their console. Route by the question/action split above: a
+  "how do I …" seeking understanding is a QUESTION (answer it, code block inline if useful);
+  reserve ('code', ...) for an action they want executed now.
 """
 
 
-# The helper invoke pins protocol.max_input_length to this so the reference document (handed
+# The helper invoke pins protocol.max_invoke_input_length to this so the reference document (handed
 # in as an ordinary invoke input, and thus subject to per-input truncation) can never be
-# silently truncated as the config docstrings grow. The live reference is ~10.2k and the default
-# ceiling is 10k, so it is already *over* it — and truncation_prefix_ratio=0.5 takes the
-# *middle*, i.e. exactly the per-component catalogues a snippet most needs. Generating those
-# from the registry is what closed the gap: the doc grows with every backend registered, so the
-# pin has to sit well clear of it. Shared with the drift-guard test so the ceiling is asserted
-# against the same number that is enforced.
+# silently truncated as the config docstrings grow. The pin is a fixed, doc-appropriate ceiling
+# held independent of the ambient default: the live reference is ~10.2k, so 40k sits well clear
+# of it — and if the doc ever outgrew the ceiling, truncation_prefix_ratio=0.5 would take the
+# *middle*, i.e. exactly the per-component catalogues a snippet most needs. Generating those from
+# the registry is what makes the doc grow with every backend registered, so the pin has to stay
+# well clear of it. It now sits *below* the 50k default rather than above the old 10k one, which
+# is fine: 40k still clears the ~10.2k reference, and the point is a stable ceiling a host's
+# default can't move, not one relative to it. Shared with the drift-guard test so the ceiling is
+# asserted against the same number that is enforced.
 _HELPER_MAX_INPUT_LENGTH = 40000
+
+# Ceiling for the helper's rendered REPL output, pinned alongside max_invoke_input_length. Even
+# the raised 50k default is too small for this helper's main use: printing a source file to study
+# it. 80k is chosen to fit the settings-relevant core modules
+# — `config.py` (~56k) and `_agent.py` (~77k) — in a single read: `config.py` in particular is
+# the file the helper is likeliest to open whole for a settings question, and truncating it
+# would force a slice-and-re-read that costs turns against the tight first-grant budget. The
+# three genuine giants — `dispatcher.py` (~106k), `python_repl.py` (~112k), `console.py` (~137k)
+# — still exceed it and are read in slices; whole-file reads of those are rarely what a
+# *settings* answer needs, and an unbounded ceiling would spend the turn/token budget on one
+# dump. Truncation past the ceiling is not silent — abbreviate_string splices a visible
+# "[...N characters omitted...]" marker at the cut — so the helper sees a read was cut and where,
+# which is what makes the task's "print a slice at a time" instruction actionable on the giants.
+_HELPER_MAX_OUTPUT_LENGTH = 80000
+
+# The one directory the helper may READ: the installed jaz package itself. Resolved so the
+# pattern and secure_open's resolved targets share one canonical space (a symlink that
+# points outside the tree resolves outside it and is denied — fail-closed). The f"/{...}"
+# spelling yields a "//<abs-path>/**" pattern, i.e. absolute-anchored in secure_open's
+# anchor vocabulary. Computed, not a literal, unlike the other sandbox pins: the install
+# location is only known at import time, and pinning a stale path would deny everything
+# (fail-closed) rather than widen anything.
+_JAZ_SOURCE_ROOT = Path(jaz.__file__).resolve().parent
+
+
+# Iteration budget for the settings-helper invoke, and how it grows when the helper can't
+# finish. The first attempt runs on a deliberately small budget: most settings requests are
+# one or two turns, and a tight cap keeps a model that dithers in its REPL cheap. If that
+# attempt exhausts without a response, the user is asked whether to grant more turns, and the
+# offered grant DOUBLES each round — 10, then 20, then 40, ... — so a genuinely hard request
+# can be pushed further on demand while a hopeless one is abandoned after one or two declines.
+#
+# Each grant is a *fresh* invoke with the larger cap, not a resumption: an invoke does not
+# expose a "continue with N more turns" entry point, and the helper is stateless across calls
+# anyway (its only input is the request text). So "give it 10 more turns" is implemented as
+# "re-run it from scratch allowed 10 turns" — the user-facing promise (more room to finish)
+# holds, and 10 > the initial 3, 20 > 10, 40 > 20, so every round really is *more* than the
+# last attempt got.
+_HELPER_INITIAL_ITERATIONS = 3
+_HELPER_FIRST_GRANT = 10
+# Cap the number of escalation rounds so a genuinely hopeless request is abandoned after a few
+# declines rather than re-prompting with a doubled offer indefinitely: 3 rounds = grants of 10,
+# 20, 40 before falling through to the rephrase hint. Only the turn-cap
+# (IterationLimitExhaustedError) path escalates; a spent BudgetPool is caught separately and
+# reported without an offer (#1079 gave the two causes distinct exception types), so this cap is no
+# longer doing double duty as the BudgetPool backstop.
+_HELPER_MAX_GRANTS = 3
 
 
 # The settings helper's sandbox pin, hoisted to a module constant so the security property can
@@ -270,14 +359,42 @@ _HELPER_MAX_INPUT_LENGTH = 40000
 # that had switched REPLs. Built once at import and shared: safe because ``REPL.initialize()``
 # returns a copy with its mutable allow-lists rebound, so a run cannot write back through this
 # template and widen the sandbox for the next one.
+#
+# allowed_read_paths grants exactly the jaz package tree (and nothing else): the helper's
+# job is to explain jaz, and the installed source is public, secret-free material for that.
+# The grant rides the existing secure_open enforcement — reads happen through the builtin
+# open(), the only file API the sandbox exposes. allowed_imports staying [] is load-bearing
+# for this axis too, not just for reaching `configure`: pathlib/os/io read files through
+# their own OS calls, not the wrapped open(), so any import that can touch the filesystem
+# would bypass the read allow-list entirely.
 _HELPER_SANDBOX_OVERRIDE: dict[str, Any] = {
     "repl": PythonREPL(
         allowed_imports=[],
-        allowed_attributes=["*", "!__*"],
-        allowed_read_paths=[],
+        # Restates the shipped default rather than a tighter list of its own. The frame-bearing
+        # deny-list this pin used to carry lives in `DEFAULT_ALLOWED_ATTRIBUTES` now (see the block
+        # comment there): the escape it closes is not helper-specific, so fixing it per-sandbox
+        # meant every future sandbox re-deriving the same list and the one that forgot being
+        # silently escapable. Consequence accepted deliberately: the helper no longer holds an
+        # attribute policy *stricter* than the default, so a widening of the default widens the
+        # helper too — this change already is one, since the default re-admits `__init__`/`__name__`/
+        # `__qualname__` and the helper had none of them before. The pin's job is to be independent
+        # of SESSION config — which it still is, since a group is replaced wholesale — not of the
+        # module default.
+        #
+        # Passed explicitly even though it equals the default (as `allowed_imports=[]` already is),
+        # so `test_settings_helper_sandbox_pins_every_containment_axis` asserts every axis against a
+        # real value and a future edit dropping an axis is a test failure rather than a silent
+        # inherit.
+        allowed_attributes=list(DEFAULT_ALLOWED_ATTRIBUTES),
+        # Reads only, jaz package tree only (absolute-anchored `//<root>/**`); writes stay []
+        # even inside the tree. This is the grant that lets the helper consult the source.
+        allowed_read_paths=[f"/{_JAZ_SOURCE_ROOT}/**"],
         allowed_write_paths=[],
     ),
-    "protocol": DefaultProtocol(max_input_length=_HELPER_MAX_INPUT_LENGTH),
+    "protocol": CodeOnlyProtocol(
+        max_invoke_input_length=_HELPER_MAX_INPUT_LENGTH,
+        max_repl_output_length=_HELPER_MAX_OUTPUT_LENGTH,
+    ),
 }
 
 
@@ -292,7 +409,7 @@ def _component_catalogue(group: str, entries: Mapping[str, type], default: type)
     holding components, the constructor *is* that group's settings: the helper needs both to
     write ``jaz.configure(llm=MyBackend(...))`` at all.
     """
-    from jaz.providers.base import declared_init_keys
+    from jaz.llm.base import declared_init_keys
 
     lines = []
     for tag, cls in sorted(entries.items()):
@@ -341,8 +458,8 @@ def _registered_components() -> dict[str, Mapping[str, type]]:
     """Every registered component per group, resolving deferred entries.
 
     ``LLM_REGISTRY`` alone would miss a backend whose module is imported on first use (``rlm``),
-    so the tags come from :func:`~jaz.providers.registry.registered_llm_tags` and each is
-    resolved through :func:`~jaz.providers.registry.resolve_llm`, which materialises those.
+    so the tags come from :func:`~jaz.llm.registry.registered_llm_tags` and each is
+    resolved through :func:`~jaz.llm.registry.resolve_llm`, which materialises those.
     """
     # `ImportError` is skipped rather than fatal: this builds a *document*, and one entry
     # failing to import must not take the settings helper down with it.
@@ -355,8 +472,8 @@ def _registered_components() -> dict[str, Mapping[str, type]]:
     # re-exports: those are flagged experimental and emit `NonPublicAPIWarning` on attribute
     # access, which a console path must not do (pinned by
     # `test_console_paths_emit_no_non_public_api_warnings`).
+    from jaz.llm.registry import registered_llm_tags, resolve_llm
     from jaz.protocol.registry import INTERACTION_PROTOCOL_MAP
-    from jaz.providers.registry import registered_llm_tags, resolve_llm
     from jaz.repl.registry import REPL_LANGUAGE_MAP
 
     llms: dict[str, type] = {}
@@ -428,11 +545,97 @@ def _settings_reference() -> str:
     return "\n\n".join(parts)
 
 
+# Redact any setting whose NAME looks secret, so a secret value never enters the helper's
+# prompt/sandbox. Substring match (case-insensitive) on these markers rather than an exact name:
+# the view is built generically from any registered backend's `declared_init_keys`, and a
+# third-party backend's secret may be spelled `auth_token`, `client_secret`,
+# `aws_secret_access_key`, `password`, `credentials`, ... — the built-ins all use `api_key`.
+# Chosen (user's call on the PR that added this view) over an allow-list of safe names, which
+# would lose the "a newly added non-secret setting shows up on its own" property, and over the
+# prior single-name deny-list, which failed *open* for any backend not named here. It still
+# guesses by name, so it errs two ways, both deliberately toward safety: a secret under a name
+# matching none of these markers slips through, and a benign field whose name happens to contain
+# one (e.g. `max_tokens` → "token") is over-redacted and simply won't appear. Hiding a non-secret
+# is a cosmetic loss; leaking a secret is not.
+_SETTINGS_SECRET_MARKERS = ("key", "secret", "token", "password", "credential")
+
+
+def _is_secret_setting(name: str) -> bool:
+    """True if ``name`` looks like a secret-bearing setting that must be kept out of the view."""
+    lowered = name.lower()
+    return any(marker in lowered for marker in _SETTINGS_SECRET_MARKERS)
+
+
+def _current_settings_view() -> str:
+    """A read-only, secret-redacted snapshot of the CURRENT config as plain text — one line per
+    group (``config.llm`` / ``config.repl`` / ``config.protocol``).
+
+    Handed to the settings helper as ``config`` so a read-only question ("what model am I
+    using?") is answered directly from live state, instead of coming back as code the user must
+    confirm and run. The helper's sandbox denies imports, so it cannot call
+    :func:`jaz.get_config` itself; this text gives it the values — and only the values — it needs.
+
+    Each line names the component class as ``type`` (for "what backend am I on?") followed by
+    that component's declared settings, rendered with ``repr``. Built from ``declared_init_keys``
+    (the same MRO walk the config boundary uses), so a component's settings appear without being
+    named here — a newly added, non-secret setting shows up on its own. Secret-looking fields are
+    dropped (see :func:`_is_secret_setting`). Per-request defaults riding the ``**request_defaults``
+    tail (``temperature`` &c.) are not enumerated here — a follow-up can surface them if needed.
+    """
+    # Rendered as TEXT, not an object, by explicit user decision (weighing a review note that a
+    # live object is the first non-string ever put in this sandbox). The helper only reads values
+    # to write prose — it never navigates the snapshot programmatically — so text loses nothing.
+    # A string keeps the sandbox's inputs strings-only: there is no instance whose `__class__` /
+    # `__globals__` a reader could walk, so read-only holds BY CONSTRUCTION rather than via a
+    # guard, and the one un-closeable CPython route a live object would expose —
+    # `"{0.__globals__}".format(obj)`, which reaches attributes at the C level below the sandbox's
+    # `allowed_attributes` deny-list — has nothing to reach. The alternative (a frozen
+    # `_ReadOnlyView` object plus a test that its class is rejected in the sandbox) was rejected as
+    # strictly more surface for zero functional gain. `repr` on each value is likewise safe by
+    # construction: text can't leak a live object, and repr never raises on the stdlib types here.
+    from jaz.llm.base import declared_init_keys
+
+    cfg = jaz.get_config()
+    lines: list[str] = []
+    for group in ("llm", "repl", "protocol"):
+        component = getattr(cfg, group)
+        # `type` is the class name (the "what backend am I on?" answer). Seed it first and skip a
+        # declared key literally named `type`, so a component that declares one can't overwrite the
+        # class name — the model would otherwise answer confidently and wrongly.
+        pairs = [f"type={type(component).__name__!r}"]
+        for key in sorted(declared_init_keys(type(component))):
+            if key == "type" or _is_secret_setting(key) or not hasattr(component, key):
+                continue
+            pairs.append(f"{key}={getattr(component, key)!r}")
+        lines.append(f"config.{group}: " + ", ".join(pairs))
+    return "\n".join(lines)
+
+
+def _jaz_source_listing() -> list[str]:
+    """Relative paths of every Python file in the installed jaz package, sorted.
+
+    Handed to the settings helper as ``source_files`` — its map of what it may read. The
+    sandbox denies all imports, so the helper has ``open()`` but no way to *list* a
+    directory (``os``/``pathlib`` are unreachable); without this input the read grant on
+    ``_JAZ_SOURCE_ROOT`` would only cover files it could guess the names of.
+    """
+    # ~99 files ≈ 3k characters — comfortably inside the 40k per-input ceiling, so the
+    # listing cannot be the thing truncation eats. __pycache__ is skipped as noise (the
+    # read grant still covers it; hiding it from the map is curation, not containment).
+    return sorted(
+        p.relative_to(_JAZ_SOURCE_ROOT).as_posix()
+        for p in _JAZ_SOURCE_ROOT.rglob("*.py")
+        if "__pycache__" not in p.parts
+    )
+
+
 # The helper answers in one of two shapes, tagged by the first tuple element so the console
 # can tell them apart without guessing from the text:
-#   ("code",   snippet) — Python to CONFIRM then run (a settings change, or a read that prints).
-#   ("answer", text)    — a plain-language reply to PRINT verbatim (a how-to/conceptual question,
-#                         or an explanation of why a request can't be fulfilled).
+#   ("code",   snippet) — Python to CONFIRM then run: a settings change (jaz.configure(...))
+#                         or any other jaz-related action the user asked to perform.
+#   ("answer", text)    — a plain-language reply to PRINT verbatim: a question answered from the
+#                         redacted `config` text snapshot, `reference`, or the jaz source, or why a
+#                         request can't be met.
 # A tagged tuple of built-ins (not a custom dataclass) is deliberate: the helper's sandbox denies
 # all imports, so it can only `return` values it can spell with literals — a `(str, str)` tuple it
 # can, a `SettingsResponse(...)` it could not (the class is unreachable without an import). The
@@ -441,7 +644,9 @@ def _settings_reference() -> str:
 _HELPER_RESPONSE_TYPE = tuple[Literal["code", "answer"], str]
 
 
-def _propose_settings_response(request: str) -> _HELPER_RESPONSE_TYPE:
+def _propose_settings_response(
+    request: str, max_iterations: int = _HELPER_INITIAL_ITERATIONS
+) -> _HELPER_RESPONSE_TYPE:
     """Ask a sandboxed helper agent how to handle ``request``; return ``(kind, content)``.
 
     ``kind`` is ``"code"`` (``content`` is a Python snippet the caller confirms and runs) or
@@ -461,8 +666,15 @@ def _propose_settings_response(request: str) -> _HELPER_RESPONSE_TYPE:
     2. ``RecursionLimit(max_depth=1)`` makes the helper a leaf: ``DisableRecursion`` means
        no agent-facing ``jaz`` library is bound in its REPL at all — no ``configure``, no
        nested ``invoke``. (Entered via ``with`` — RecursionLimit rejects positional use.)
-    3. Its REPL namespace holds only the two string inputs; the console namespace is
-       unreachable from inside the invoke.
+    3. Its REPL namespace holds only the inputs — the ``request``/``reference`` strings, the
+       ``config`` TEXT snapshot (a redacted view of current settings, see
+       :func:`_current_settings_view`), and the ``source_root``/``source_files`` map of the jaz
+       package; the console namespace is unreachable from inside the invoke. Because ``config``
+       is text and not an object, it widens what the helper can *read* without adding any
+       instance whose class or globals a reader could walk. File reads go through the sandboxed
+       ``open()``, whose allow-list grants exactly the jaz package tree (see
+       ``_HELPER_SANDBOX_OVERRIDE``) — the same read-not-reach property, extended from config
+       values to jaz's own source.
     4. Its sole effect channel is the returned ``(kind, content)`` tuple. A ``"code"``
        ``content`` crosses into the console only through :func:`jaz_settings`'
        printed-snippet + ``[y/N]`` confirmation — the same trust boundary as the user typing
@@ -471,8 +683,9 @@ def _propose_settings_response(request: str) -> _HELPER_RESPONSE_TYPE:
 
     Cost/model: uses the ambient model config (respects ``--model`` and in-session
     ``jaz.configure``) rather than a hardcoded cheap model — there is no guarantee which
-    provider keys exist. Cost is bounded instead: leaf-only + ``IterationLimit(3)`` + a
-    small prompt.
+    provider keys exist. Cost is bounded instead: leaf-only + ``IterationLimit(max_iterations)``
+    + a small prompt. ``max_iterations`` defaults to a tight cap; :func:`jaz_settings` re-calls
+    with a larger one when the user grants the helper more turns (see ``_HELPER_FIRST_GRANT``).
 
     The task is a plain ``str`` (NOT a t-string): ``task`` is an ordinary input, and this
     module must stay importable on Python < 3.14, so no literal ``t"..."`` may appear in
@@ -484,15 +697,21 @@ def _propose_settings_response(request: str) -> _HELPER_RESPONSE_TYPE:
     # - "deliver by RETURNING the value" must be explicit. The first wording ("return
     #   only the code") read as *formatting* advice; on a read-only request the agent
     #   wrote `#`-comment REPL turns without ever finishing, burned its 3 iterations, and
-    #   the user got a BudgetExhaustedError traceback instead of a proposal.
-    # - Read-only questions ("what model am I using?") are first-class: a settings *helper*
-    #   that rejects settings *questions* is exactly the discoverability failure `%` exists
-    #   to fix. Two ways to answer are offered, and picking between them is left to the model
-    #   because it turns on what the helper can see: a plain-language question it can settle
-    #   from the reference (a how-to, or why something can't be done) comes back as an
-    #   ("answer", text) printed verbatim; a question about *live* state ("what model am I
-    #   using?") still comes back as ("code", ...) that prints from jaz.get_config() when run,
-    #   because the sandbox denies imports and cannot read the running config itself.
+    #   the user got an IterationLimitExhaustedError traceback instead of a proposal. (The
+    #   wording used to add "finish IMMEDIATELY — do NOT run anything"; the source-read grant
+    #   retired that half, since consulting a file IS running something. The pinned part is
+    #   the delivery contract — the response arrives by `return`, never as comment/print.)
+    # - Questions are first-class: a *helper* that rejects *questions* is exactly the
+    #   discoverability failure `%` exists to fix. Every question is an ("answer", text):
+    #   live-state questions are read straight off the `config` text snapshot handed in below,
+    #   how-to/conceptual ones off the `reference`, how-does-jaz-work ones off the source
+    #   tree, and an impossible request explains itself. ("code", ...) is reserved for
+    #   ACTIONS — a settings change or other jaz code the user asked to run — so the [y/N]
+    #   gate only ever appears when something would actually execute. This split is what the
+    #   `config` text snapshot buys — before it, a live-state question had to come back as code
+    #   that reads jaz.get_config() at run time (the sandbox denies imports, so the helper
+    #   itself could not read the running config), forcing a needless [y/N] on a pure
+    #   question.
     # Naming a `PythonREPL` pins the language as well as the deny-all import list, and that is
     # load-bearing: the allow-lists are Python-REPL settings, so in a bash session the helper
     # would otherwise inherit a shell and they would be inert — quietly turning "a sandbox that
@@ -516,34 +735,73 @@ def _propose_settings_response(request: str) -> _HELPER_RESPONSE_TYPE:
     # `allow_raise` is deliberately NOT pinned: it decides whether a raise finishes the turn,
     # its default is True, and it is not a containment axis.
     #
-    # protocol.max_input_length is pinned so the reference doc can't be truncated regardless of
+    # protocol.max_invoke_input_length is pinned so the reference doc can't be truncated regardless of
     # docstring growth (see _HELPER_MAX_INPUT_LENGTH).
     with RecursionLimit(max_depth=1):
         raw = jaz.invoke(
             ReturnType(_HELPER_RESPONSE_TYPE),
             jaz.ConfigOverride(**_HELPER_SANDBOX_OVERRIDE),
-            IterationLimit(max_iterations=3),
+            # Supply the last-turn nudge explicitly: core hooks no longer emit any default
+            # framing, so a bare IterationLimit would give the helper only the hard abort. With
+            # warn_remaining=1 the agent gets this warning on its final allowed turn (mirrors the
+            # old built-in "last allowed REPL interaction" NOTE, now caller-owned text).
+            IterationLimit(
+                max_iterations=max_iterations,
+                warning_text=(
+                    "This is your last allowed REPL iteration -- you must finish up "
+                    "your work and terminate the REPL session in this turn."
+                ),
+                warn_remaining=1,
+            ),
             task=(
-                "The user typed a request about jaz settings; it is in `request`. Using "
-                "ONLY the jaz API documented in `reference`, decide how to respond and "
-                "finish IMMEDIATELY by RETURNING a (kind, content) tuple — do NOT run "
-                "anything, print, or leave it as a REPL comment.\n"
-                "- Return ('code', snippet) when the request wants an ACTION: a settings "
-                "CHANGE (usually jaz.configure(...)), or a QUESTION about the CURRENT/live "
-                "settings, where `snippet` is Python that prints the answer read from "
-                "jaz.get_config(). `snippet` is one plain string of Python, no prose and no "
-                "markdown fences, e.g. return ('code', 'jaz.configure(...)').\n"
-                "- Return ('answer', text) when a plain-language reply is the better answer "
-                "and no code needs to run: a how-to or conceptual question you can settle "
-                "from `reference`, or an explanation of why the request cannot be fulfilled "
-                "with this API. `text` is the reply itself, e.g. return ('answer', '...')."
+                "The user typed a request about jaz (the LLM-agent framework this console "
+                "runs) — its settings, API, usage, behaviour, or a problem they hit; it is in "
+                "`request`. You are given `config`, a read-only TEXT snapshot of the CURRENT "
+                "settings (one line per group — `config.llm`, `config.repl`, `config.protocol` — "
+                "each listing `type` and its settings, e.g. the `config.llm` line shows `type` "
+                "and `model`), and `reference`, the settings API docs. You can also READ the jaz "
+                "source code: `source_files` lists every Python file in the installed jaz package "
+                "as a path relative to `source_root`, and open(f'{source_root}/<path>').read() "
+                "returns one — consult it whenever `config` and `reference` do not settle the "
+                "question (print slices of big files). Only these are available; decide how "
+                "to respond and finish by RETURNING a (kind, content) tuple — do NOT leave "
+                "your response as a REPL comment or print it.\n"
+                "- Return ('answer', text) for any QUESTION: read the answer off `config` for "
+                "current settings ('what model am I using?'), settle how-to/conceptual "
+                "questions from `reference`, read the source for anything about how jaz "
+                "works or why it behaved some way, or explain why a request cannot be done. "
+                "`text` is the reply, e.g. return ('answer', 'You are using ...').\n"
+                "- Return ('code', snippet) for any ACTION the user asked to perform: a "
+                "settings change (usually jaz.configure(...)) or other jaz-related Python "
+                "they want to run (e.g. an example jaz.invoke(...) call). The user confirms "
+                "before it runs in their console. `snippet` is one plain string of Python, no "
+                "prose and no markdown fences, e.g. return ('code', 'jaz.configure(...)')."
             ),
             request=request,
             reference=_settings_reference(),
+            config=_current_settings_view(),
+            source_root=str(_JAZ_SOURCE_ROOT),
+            source_files=_jaz_source_listing(),
         )
     kind, content = raw
     # Fences only make sense to strip on code; an answer is printed verbatim.
     return kind, (_strip_code_fences(content) if kind == "code" else content)
+
+
+def _grant_more_helper_turns(grant: int) -> bool:
+    """Ask the user whether to retry the settings helper with a budget of ``grant``; True on yes.
+
+    Called only after the helper exhausted its budget, and only with a tty present (the caller
+    checks), so there is always a human to answer. Defaults to No — like the ``Run this?``
+    prompt, silence does not spend more of the user's budget.
+    """
+    # "Retry with a budget of {grant}", not "give it {grant} more": each round is a fresh invoke
+    # capped at ``grant`` turns *total* (the prior attempt's turns are discarded, not added to),
+    # so additive phrasing would overstate what the grant buys. "Retry" also signals the restart.
+    answer = input(
+        f"%: the helper ran out of turns. Retry with a budget of {grant}? [y/N] "
+    )
+    return answer.strip().lower() in {"y", "yes"}
 
 
 def jaz_settings(request: str, namespace: dict[str, Any]) -> None:
@@ -552,10 +810,10 @@ def jaz_settings(request: str, namespace: dict[str, Any]) -> None:
     The helper (sandboxed — see :func:`_propose_settings_response` for why it cannot apply
     anything itself) replies in one of two shapes:
 
-    - ``"answer"`` — a plain-language reply (a how-to, or why a request can't be done). It is
-      **printed verbatim and never executed**, so there is nothing to confirm: it prints in
-      every mode, including a ``.jaz`` script or piped stdin, because reading back text is
-      safe with no human present.
+    - ``"answer"`` — a plain-language reply (a how-to, an explanation of jaz behaviour, or
+      why a request can't be done). It is **printed verbatim and never executed**, so there
+      is nothing to confirm: it prints in every mode, including a ``.jaz`` script or piped
+      stdin, because reading back text is safe with no human present.
     - ``"code"`` — a snippet to run. It is printed, then ``Run this? [y/N]`` is asked; only an
       explicit ``y``/``yes`` executes it **in the console namespace**, exactly as if the user
       had typed it at the prompt (``namespace`` arrives via the ``globals()`` argument in the
@@ -568,12 +826,17 @@ def jaz_settings(request: str, namespace: dict[str, Any]) -> None:
     ``errored`` set for the script runner's fail-fast, exit 1 in one-shot mode).
 
     One deliberate exception to "errors propagate": a helper invoke that runs out of
-    iterations without returning a response (``BudgetExhaustedError``, e.g. the model
+    *iterations* without returning a response (``IterationLimitExhaustedError``, e.g. the model
     dithered in its REPL) is a *helper quality* failure, not a user error — surfacing it
     as a 30-line traceback through ``jaz.invoke`` internals (the observed UX) buries the
-    one actionable fact. It is reported as a one-line hint to rephrase instead. Other
-    exceptions (config errors, provider/network failures) still propagate with full
-    tracebacks — those need their detail.
+    one actionable fact. Before giving up, the user is offered progressively larger turn
+    budgets (see ``_HELPER_FIRST_GRANT``): a request that just needed more room to finish can
+    be pushed further on demand, and only after a decline (or the offer cap, or with no tty
+    to ask) is it reported as a one-line hint to rephrase. A spent session cost/calls pool
+    (``BudgetPoolExhaustedError`` from ``jaz --max-cost/--max-calls``) is reported the same
+    one-line way but *without* a turn offer — more turns cannot refill it. Other exceptions
+    (config errors, provider/network failures) still propagate with full tracebacks — those
+    need their detail.
 
     Applying ``"code"`` is interactive-only. When stdin is not a tty (a ``.jaz`` script or
     piped input) there is nobody to confirm, so the snippet is printed (for copy-paste) and
@@ -582,17 +845,47 @@ def jaz_settings(request: str, namespace: dict[str, Any]) -> None:
     than continuing against the unconfigured session and exiting 0. (An ``"answer"`` needs no
     confirmation, so it does not hit this path.)
     """
-    from jaz.exceptions import BudgetExhaustedError
+    from jaz.exceptions import BudgetExhaustedError, IterationLimitExhaustedError
 
-    try:
-        kind, content = _propose_settings_response(request)
-    except BudgetExhaustedError as exc:
-        print(
-            f"%: the helper could not produce a response ({exc}). "
-            "Try rephrasing the request.",
-            file=sys.stderr,
-        )
-        return
+    # Start on the tight default budget. On the helper's own turn-cap exhaustion, offer the
+    # user a doubling grant (10 -> 20 -> 40 -> ...) and re-run with it, up to _HELPER_MAX_GRANTS
+    # rounds. Interactive-only: a run with no tty has nobody to grant more turns, so it falls
+    # straight through to the rephrase hint. A session-wide BudgetPool (jaz --max-cost/--max-calls)
+    # propagates into this nested invoke and exhausts as a BudgetPoolExhaustedError; more *turns*
+    # cannot refill a spent cost/calls pool, so that case is reported without an offer. The distinct
+    # exception types (#1079) are what let the two be told apart here — previously both arrived as a
+    # bare BudgetExhaustedError and only the round cap kept the pool case from looping forever.
+    budget = _HELPER_INITIAL_ITERATIONS
+    grant = _HELPER_FIRST_GRANT
+    grants_offered = 0
+    while True:
+        try:
+            kind, content = _propose_settings_response(request, max_iterations=budget)
+            break
+        except IterationLimitExhaustedError as exc:
+            if (
+                grants_offered >= _HELPER_MAX_GRANTS
+                or not sys.stdin.isatty()
+                or not _grant_more_helper_turns(grant)
+            ):
+                print(
+                    f"%: the helper could not produce a response ({exc}). "
+                    "Try rephrasing the request.",
+                    file=sys.stderr,
+                )
+                return
+            budget, grant = grant, grant * 2
+            grants_offered += 1
+        except BudgetExhaustedError as exc:
+            # A spent cost/calls pool (BudgetPoolExhaustedError, or any other non-iteration
+            # BudgetExhaustedError): more turns cannot help, so report and stop with no offer.
+            # Listed after IterationLimitExhaustedError so the subclass branch wins.
+            print(
+                f"%: the helper could not run — the session budget is exhausted ({exc}). "
+                "Raise the --max-cost/--max-calls ceiling or start a new session.",
+                file=sys.stderr,
+            )
+            return
 
     # An answer is just text: print it and stop. No confirmation, and no interactive-only
     # gate — nothing runs, so it is safe with no human at the prompt (a script/piped `%
@@ -626,10 +919,10 @@ def jaz_settings(request: str, namespace: dict[str, Any]) -> None:
         # guard against), whereas this raise guards the `code` path — the only one where a
         # settings change was intended and would otherwise be silently skipped.
         raise RuntimeError(
-            "%: the settings helper is interactive-only — it needs a tty to confirm before "
-            "applying, so it cannot run in a script or piped input. The proposed snippet is "
-            "shown above; apply it from an interactive session or paste it into your script "
-            "directly."
+            "%: applying the helper's code is interactive-only — it needs a tty to confirm "
+            "before applying, so it cannot run in a script or piped input. The proposed "
+            "snippet is shown above; apply it from an interactive session or paste it into "
+            "your script directly."
         )
     answer = input("Run this? [y/N] ").strip().lower()
     if answer not in {"y", "yes"}:
@@ -815,13 +1108,15 @@ _LABEL_RETRYING = "retrying"
 # ConsoleProgress instances whose activation scope (`with hook:` in main's ExitStack) is
 # currently live — maintained by setup()/teardown(). Exists for exactly one caller:
 # `_finish_progress_turns()`, the console's end-of-line cleanup. The hook's scope is the
-# whole *session*, but a spinner belongs to one *turn* — and no hook event is guaranteed
-# to fire when a turn dies exceptionally (a Ctrl-C mid-LLM-call aborts the invoke with no
-# LLMQueryExit and no InvokeExit: the spans only fire exits after `complete()`). Without
-# an end-of-turn signal from the console itself, that abort orphaned a live spinner
-# thread, which kept overdrawing "⠹ thinking…" on the idle prompt — making an already
-# interrupted invoke look un-killable (each further Ctrl-C just printed another
-# KeyboardInterrupt while the orphan kept animating).
+# whole *session*, but a spinner belongs to one *turn* — and while the span CMs now fire
+# LLMQueryExit/InvokeExit on every path including exceptional unwinds (#892), the exit
+# *emission itself* is not unconditional in the ways that matter here: a Ctrl-C can land
+# during the exit-emit, and a hook exception on the guarded close is swallowed by the
+# dispatcher rather than retried. Before the console grew this end-of-turn signal of its
+# own, a mid-LLM-call abort orphaned a live spinner thread, which kept overdrawing
+# "⠹ thinking…" on the idle prompt — making an already interrupted invoke look
+# un-killable (each further Ctrl-C just printed another KeyboardInterrupt while the
+# orphan kept animating).
 _ACTIVE_PROGRESS: list[ConsoleProgress] = []
 
 
@@ -829,11 +1124,11 @@ def _finish_progress_turns() -> None:
     """Stop every active :class:`ConsoleProgress` spinner — the end-of-line backstop.
 
     Called (in a ``finally``) by :meth:`JazConsole.runcode` and :func:`_run_source`, the
-    two places a console turn ends — normally *or* by exception. On the normal path the
-    spinner is already stopped (LLMQueryExit / REPLExecEnter / InvokeExit), so this is a
-    cheap no-op; on the exceptional path (KeyboardInterrupt, LLM error) it is the ONLY
-    thing standing between the user and an orphaned spinner thread drawing over their
-    prompt (see ``_ACTIVE_PROGRESS``).
+    two places a console turn ends — normally *or* by exception. In almost every case the
+    spinner is already stopped (the ``*Exit`` events fire on every path since #892, the
+    abnormal arms included), so this is a cheap no-op; it remains the one stop that does
+    not depend on the exit-emit itself surviving (a Ctrl-C landing during the emit, a
+    swallowed hook error — see ``_ACTIVE_PROGRESS``).
     """
     for progress in list(_ACTIVE_PROGRESS):
         progress.finish_turn()
@@ -873,16 +1168,16 @@ class ConsoleProgress(Hook):
        started by this hook does not carry the exec's context, so even a write through the
        proxy from that thread would fall through to the host sink.
 
-    Spinner lifecycle (the one subtle bit): ``LLMQueryExit`` is NOT guaranteed to fire — an
-    ``Abort`` at ``LLMQueryEnter`` or an exception from the LLM call skips it (see
-    ``span_llm_query`` in the dispatcher). So stopping the spinner has *backstops*:
+    Spinner lifecycle (the one subtle bit): ``LLMQueryExit`` fires on every path once the
+    query span opened — an ``Abort`` at ``LLMQueryEnter`` closes it ``Aborted``, and an
+    exception from the LLM call (Ctrl-C included) closes it with a ``Failed`` outcome
+    (the #892 abnormal arm) — but the exit handlers are hook
+    code the dispatcher may be unwinding past (their errors are swallowed on the guarded
+    close), so stopping the spinner keeps *backstops*:
     ``REPLExecEnter``, ``InvokeExit``, and ``teardown()`` all stop it — plus the decisive
     one, :func:`_finish_progress_turns`, which the console runs in a ``finally`` after
-    every line. That last one is not optional: when the user Ctrl-C's a running invoke,
-    the ``KeyboardInterrupt`` aborts it with NO exit event at all (invoke/query spans only
-    fire exits after ``complete()``), and ``teardown()`` only runs at *session* end — so
-    without the per-line backstop the spinner thread outlived the interrupted invoke and
-    kept overdrawing the prompt. ``_stop_spinner`` joins the thread *before* clearing the
+    every line, and which remains the guarantee the others only approximate.
+    ``_stop_spinner`` joins the thread *before* clearing the
     line so a late frame can never interleave with subsequent output. Hook exceptions are
     swallowed by the dispatcher, so a UI bug here degrades to a logged error rather than
     killing the invoke.
@@ -1024,7 +1319,9 @@ class ConsoleProgress(Hook):
     def on_repl_exec_enter(self, event: REPLExecEnter) -> list[Effect]:
         if not self._enabled:
             return []
-        self._stop_spinner()  # backstop: LLMQueryExit may not have fired (abort/error)
+        # Defensive stop: LLMQueryExit fires on every path now (#892), but its handler can
+        # be skipped if the exit-emit itself failed (guarded-close errors are swallowed).
+        self._stop_spinner()
         self._exec_started[(event.invoke_id, event.iteration)] = time.monotonic()
         indent = "  " * (event.depth - 1)
         prefix = f"[{event.iteration}] "
@@ -1043,6 +1340,8 @@ class ConsoleProgress(Hook):
         return []
 
     def on_repl_exec_exit(self, event: REPLExecExit) -> list[Effect]:
+        from jaz.hooks.events.base import Completed
+
         if not self._enabled:
             return []
         self._stop_spinner()  # defensive: exec runs no spinner of its own; clears a leak
@@ -1051,8 +1350,12 @@ class ConsoleProgress(Hook):
         # `exception` via getattr: ExecResult is a union and the `Return` member has no
         # `exception` field (a return IS a clean success). Continue-with-exception is a
         # recoverable error the agent will iterate on — still shown as ✗ so the user sees
-        # that the action failed.
-        ok = getattr(event.exec_result, "exception", None) is None
+        # that the action failed. A non-completed exit (#892: the span unwound before a
+        # result existed) is likewise a ✗ — the timing pop and spinner stop above are
+        # cleanup and run on every outcome.
+        ok = isinstance(event.outcome, Completed) and (
+            getattr(event.outcome.result, "exception", None) is None
+        )
         mark = "\033[92m✓\033[0m" if ok else "\033[91m✗\033[0m"
         indent = "  " * (event.depth - 1)
         self._out.write(f"{indent}{mark}\033[2m{elapsed}\033[0m\n")
@@ -1061,7 +1364,9 @@ class ConsoleProgress(Hook):
 
     def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:
         if self._enabled:
-            self._stop_spinner()  # backstop, e.g. an abort between query enter and exec
+            # Defensive stop: normally a no-op (LLMQueryExit fires on every path, #892);
+            # covers only a failed exit-emit, whose guarded-close errors are swallowed.
+            self._stop_spinner()
         return []
 
     # -- turn/scope lifecycle ------------------------------------------------
@@ -1069,8 +1374,9 @@ class ConsoleProgress(Hook):
         """End-of-console-line cleanup: stop the spinner, drop per-turn timing state.
 
         Called via :func:`_finish_progress_turns` after every console line. This is the
-        only stop path that is *guaranteed* to run when an invoke dies exceptionally
-        (Ctrl-C, LLM error) — no hook event fires in that case; see the class docstring.
+        stop path that is *guaranteed* to run when an invoke dies exceptionally
+        (Ctrl-C, LLM error) — the abnormal-arm exit events (#892) usually also fire and
+        stop it, but this backstop does not depend on them; see the class docstring.
         """
         self._stop_spinner()
         self._exec_started.clear()
@@ -1110,6 +1416,74 @@ def _as_tstring_literal(text: str) -> str:
     """
     body = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f't"{body}"'
+
+
+# Recovery guidance appended after the SyntaxError. Deliberately free of the t-string
+# mechanism: the ``invoke(t"...")`` rewrite is an implementation detail an iJAZ user never
+# sees, so the message names only what they typed (a brace) and how to fix it (#713 review).
+_BRACE_RECOVERY = (
+    "Double a literal brace as '{{' or '}}', or write '{expr}' to interpolate a value."
+)
+
+
+def _tstring_brace_error(text: str) -> tuple[str, int] | None:
+    """Return ``(message, index)`` if ``text`` won't form a valid ``t"..."`` body, else ``None``.
+
+    ``message`` is a concise ``SyntaxError`` description naming the fault (``"unpaired '{'"``,
+    ``"unpaired '}'"``, or ``"empty '{}'"`` — whichever applies); ``index`` is the 0-based
+    offset of the offending brace, for the caret.
+
+    The console lowers a prompt into ``invoke(t"<text>")`` (see :func:`_as_tstring_literal`),
+    so braces are t-string interpolation syntax. A lone or empty brace — natural when talking
+    *about* code, which is the console's whole purpose — makes the synthesized literal a
+    ``SyntaxError``. Detect that here (empty ``{}``; an unmatched ``{`` or ``}``) so ``push``
+    can raise a clean, mechanism-free ``SyntaxError`` instead of the raw traceback the
+    synthesized t-string would throw (#547).
+
+    Conservative by design: it flags only the ``SyntaxError`` shapes and never a well-formed
+    ``{expr}`` interpolation (that is a *semantic* surprise — binding an unintended input —
+    not a syntax error; see the module docstring). ``{{``/``}}`` escapes and nested braces in
+    an interpolation (``{x:>{w}}``, ``{d['k']}``) are handled, so a valid prompt is very
+    unlikely to trip it.
+
+    Two known gaps, both acceptable for a pre-compile *diagnostic* (the raw t-string error is
+    the fallback, never a crash): the depth scan does not skip string literals inside an
+    interpolation, so a literal brace inside a quoted string (``{d['}']}``, valid under PEP
+    701 in 3.12+) can false-positive; and an empty expression *with* a format spec (``{:>10}``)
+    is a real ``SyntaxError`` we let through, since the empty-brace check only fires on a
+    genuinely empty ``{}``. Both are rare enough not to warrant a full interpolation tokenizer.
+    """
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "}":
+            # A `}` reached at the top level (interpolations are consumed by the `{` branch
+            # below) is a lone closer unless it's the ``}}`` literal escape — SyntaxError.
+            if i + 1 < n and text[i + 1] == "}":
+                i += 2
+                continue
+            return "unpaired '}'", i
+        if ch == "{":
+            if i + 1 < n and text[i + 1] == "{":
+                i += 2  # ``{{`` literal escape
+                continue
+            # A single ``{`` opens an interpolation; scan to its matching ``}``, depth-counted
+            # so nested braces inside the expression / format spec don't confuse the match.
+            depth, j = 1, i + 1
+            while j < n and depth:
+                if text[j] == "{":
+                    depth += 1
+                elif text[j] == "}":
+                    depth -= 1
+                j += 1
+            if depth:
+                return "unpaired '{'", i  # unmatched ``{``
+            if text[i + 1 : j - 1].strip() == "":
+                return "empty '{}'", i  # empty ``{}``
+            i = j
+            continue
+        i += 1
+    return None
 
 
 def _prompt_source(text: str, target: str | None, return_type: str | None) -> str:
@@ -1229,7 +1603,8 @@ def _empty_body_hint(kind: str) -> str:
         return "?: nothing to inspect — use `?<expr>`, e.g. `?doc`"
     if kind == "settings":
         return (
-            "%: describe the settings change — e.g. `% allow the agent to import numpy`"
+            "%: say what you need from jaz — e.g. `% allow the agent to import numpy` "
+            "or `% why did my invoke time out?`"
         )
     return ">: empty prompt — put your request after `>`, e.g. `> summarize {doc}`"
 
@@ -1255,8 +1630,24 @@ class JazConsole(code.InteractiveConsole):
     ``python file.py``; the interactive loop ignores it and stays shell-forgiving.
     """
 
-    def __init__(self, locals: dict[str, Any] | None = None) -> None:
-        super().__init__(locals=locals)
+    def __init__(
+        self, locals: dict[str, Any] | None = None, filename: str = "<stdin>"
+    ) -> None:
+        # filename defaults to "<stdin>", overriding InteractiveConsole's own "<console>", so
+        # every error this console prints — genuine SyntaxError, runtime traceback, and the
+        # synthesized brace diagnostic below — names the source exactly as the real `python`
+        # REPL does (which uses "<stdin>" for both interactive and piped input). The banner
+        # sells this as "a real Python REPL", so anything a plain REPL shows should show up
+        # identically; "<console>" was a `code` module divergence, not the REPL convention.
+        # (#713 review.) A `.jaz` *file* passes its path instead, so its tracebacks name the
+        # file the way `python file.py` does rather than "<stdin>" (see _run_file).
+        #
+        # Known limitation: line numbers stay *statement*-relative (each pushed statement
+        # compiles as line 1), so a file traceback names the right file but not the right line
+        # — the line-by-line sugar preprocessor collapses multi-line prompts/blocks into one
+        # synthesized statement, so a file-absolute offset isn't recoverable here. Pre-existing
+        # (the "<stdin>" path already showed line 1); the filename is the recoverable half.
+        super().__init__(locals=locals, filename=filename)
         # (target, return_type, accumulated_text) while continuing a `\`-terminated prompt.
         self._cont: tuple[str | None, str | None, str] | None = None
         # Accumulated lines while inside a bare-`>` prompt block (None = not in a block).
@@ -1308,6 +1699,51 @@ class JazConsole(code.InteractiveConsole):
         finally:
             _finish_progress_turns()
 
+    def _push_prompt(
+        self,
+        text: str,
+        target: str | None,
+        rtype: str | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """Lower one prompt to ``invoke(t"...")`` and push it — but if its braces would make
+        the synthesized t-string a ``SyntaxError``, report that as a clean ``SyntaxError``
+        instead of the raw traceback (#547). Centralized so every prompt path (bare-``>``
+        block, ``\\`` continuation, single line, ``flush``) gets the same diagnostic."""
+        fault = _tstring_brace_error(text)
+        if fault is not None:
+            self._report_brace_syntaxerror(*fault, text)
+            return False
+        return super().push(_prompt_source(text, target, rtype), *args, **kwargs)
+
+    def _report_brace_syntaxerror(self, message: str, index: int, text: str) -> None:
+        """Render a lone/empty brace as a normal REPL ``SyntaxError``, then the recovery
+        guidance — the friendly diagnostic of #547, reshaped per #713 review to *be* a
+        SyntaxError rather than a bespoke ``jaz console:`` line.
+
+        Routed through :meth:`showsyntaxerror` (not a hand-built string) so it renders exactly
+        like any other REPL syntax error — a ``File "…"`` header naming ``self.filename``
+        (``<stdin>`` for stdin/interactive, the script path for a ``.jaz`` file), source line,
+        caret — under the same filename a genuine error would use, and so the override sets
+        ``errored``, letting a ``.jaz`` script fail fast like ``python file.py`` does on a real
+        ``SyntaxError``. ``index`` is an offset into the whole (possibly multi-line) prompt, so
+        resolve it to a 1-based line/column for the caret."""
+        line_start = text.rfind("\n", 0, index) + 1
+        line_end = text.find("\n", index)
+        line_end = len(text) if line_end == -1 else line_end
+        lineno = text.count("\n", 0, index) + 1
+        col = index - line_start + 1
+        # showsyntaxerror reads sys.exc_info(), so raise-then-catch to give it a live
+        # exception; pass self.filename so it matches every other error this console prints.
+        try:
+            raise SyntaxError(
+                message, (self.filename, lineno, col, text[line_start:line_end])
+            )
+        except SyntaxError:
+            self.showsyntaxerror(self.filename)
+        self.write(_BRACE_RECOVERY + "\n")
+
     def push(self, line: str, *args: Any, **kwargs: Any) -> bool:  # type: ignore[override]
         # If the stdlib console is mid multi-line *Python* statement (e.g. inside a `def`),
         # never re-interpret its continuation lines as sugar — forward them untouched.
@@ -1319,7 +1755,7 @@ class JazConsole(code.InteractiveConsole):
             if line.strip() == "":
                 text = "\n".join(self._block)
                 self._block = None
-                return super().push(_prompt_source(text, None, None), *args, **kwargs)
+                return self._push_prompt(text, None, None, *args, **kwargs)
             self._block.append(line)
             return True
 
@@ -1331,7 +1767,7 @@ class JazConsole(code.InteractiveConsole):
                 return True
             self._cont = None
             full = text + "\n" + line
-            return super().push(_prompt_source(full, target, rtype), *args, **kwargs)
+            return self._push_prompt(full, target, rtype, *args, **kwargs)
 
         # Classify the line with the shared single-line rules; `push` only adds the
         # continuation/block state on top (the classification itself lives in `_parse_sigil`).
@@ -1351,7 +1787,7 @@ class JazConsole(code.InteractiveConsole):
                 return False
             return super().push(f"jprint({text})", *args, **kwargs)
 
-        # `% request` — settings helper. Like `?`, no continuation/block form: the request
+        # `% request` — jaz helper. Like `?`, no continuation/block form: the request
         # is single-line prose passed verbatim (a trailing `\` stays part of the text
         # rather than opening a continuation), and a lone `%` is unambiguously a typo.
         if kind == "settings":
@@ -1370,7 +1806,7 @@ class JazConsole(code.InteractiveConsole):
             self._cont = (target, rtype, text[:-1])
             return True
 
-        return super().push(_prompt_source(text, target, rtype), *args, **kwargs)
+        return self._push_prompt(text, target, rtype, *args, **kwargs)
 
     def flush(self) -> bool:
         """Finalize a prompt left buffered at end-of-input; return ``False`` if none.
@@ -1392,18 +1828,156 @@ class JazConsole(code.InteractiveConsole):
         if self._block is not None:
             text = "\n".join(self._block)
             self._block = None
-            return super().push(_prompt_source(text, None, None))
+            return self._push_prompt(text, None, None)
         if self._cont is not None:
             target, rtype, text = self._cont
             self._cont = None
-            return super().push(_prompt_source(text, target, rtype))
+            return self._push_prompt(text, target, rtype)
         return False
 
 
 # ---------------------------------------------------------------------------
 # CLI / entry point
 # ---------------------------------------------------------------------------
-_HISTORY_FILE = os.path.expanduser("~/.jaz_repl_history")
+#: Console history lives beside the settings and credentials files, in ``~/.jaz/``.
+_HISTORY_FILENAME = "history"
+
+# The pre-``~/.jaz/`` location ``~/.jaz_repl_history`` is intentionally NOT migrated:
+# on first run after upgrading, history simply starts empty and the old dotfile is left
+# untouched next to the new directory. We deliberately don't rename-on-first-use (a silent
+# write to $HOME, and it would need a rule for when both files exist) or read the old path
+# as a permanent fallback (dead code that lives forever). The one-time loss of shell
+# history is cheap enough to accept; this comment stands in for a banner/release note so
+# the loss is documented rather than silent.
+
+
+def _history_file() -> str:
+    """Path of the readline history file, creating ``~/.jaz`` if needed."""
+    # Resolved per call, not as a module constant, because `config_dir()` reads
+    # JAZ_CONFIG_DIR at call time — a constant computed at import would freeze whatever the
+    # environment looked like when `jaz.console` was first imported, which in the test suite
+    # is before any fixture has redirected it.
+    return str(ensure_config_dir() / _HISTORY_FILENAME)
+
+
+#: Where to send a user whose provider tag matched nothing close enough to suggest. Naming the
+#: canonical list beats printing an arbitrary slice of ~150 tags into a terminal.
+_PROVIDER_LIST_URL = "https://docs.litellm.ai/docs/providers"
+
+
+def set_credential(provider: str, api_key: str | None = None) -> None:
+    """Store an API key for ``provider`` so later jaz sessions can use it.
+
+    Writes ``~/.jaz/credentials.json`` (mode ``0o600``); see :mod:`jaz.credentials`. The
+    key takes effect from the next agent run — no restart needed.
+
+    Called with one argument it prompts for the key without echoing it::
+
+        >>> set_credential("openai")
+        API key for openai: <not shown>
+        Stored openai api_key in /home/you/.jaz/credentials.json
+
+    Passing ``api_key`` directly is supported for scripts, but avoid it at an interactive
+    prompt: the line is saved to the console's history file in plain text.
+    """
+    # Prompting is the DEFAULT (rather than requiring the key as an argument) specifically
+    # because of that history file. The console persists every typed line to
+    # ~/.jaz/history via readline's atexit hook, so `set_credential("openai", "sk-...")`
+    # writes the secret to a plaintext file the user will never think to clean — the exact
+    # accident this feature exists to prevent. `getpass` keeps the key off the screen AND
+    # out of the history, since it reads from the tty rather than through readline.
+    #
+    # A non-tty stdin is rejected instead of falling through to getpass's stdin fallback:
+    # in a piped script (`cat setup.jaz | jaz`) getpass would silently swallow the NEXT
+    # LINE OF THE SCRIPT as the key and store it. Failing loudly is the only safe reading.
+    #
+    # Reaching for the underscore-private `_set_credential` is deliberate, not a layering slip:
+    # the store's published surface is read-only, and this console binding is the ONE sanctioned
+    # writer (see the rule beside `"credentials"` in `jaz/__init__.py:__all__` — library code
+    # reads ambient credentials, only the CLI writes them). That privacy is convention, not
+    # enforcement: no warning fires on `jaz.credentials._set_credential`, because `credentials`
+    # is public and PEP 562 `__getattr__` cannot intercept a name the module actually defines.
+    # The underscore carries the same weight here as everywhere else in the package.
+    from jaz.credentials import _set_credential as _store_credential
+
+    # Reject an unknown provider tag BEFORE prompting/storing. Without this a typo
+    # (`set_credential("opeani")`) prompts, stores, and prints "Stored opeani api_key in …"
+    # — reporting success — and the user then hits "OpenAI API key not found" on every run
+    # afterwards with nothing connecting the two. For a one-per-machine setup step a
+    # silent-success-that-does-nothing is the worst failure mode, so it fails here instead.
+    # Checked before the prompt so a typo never costs a getpass round-trip whose result is
+    # thrown away.
+    #
+    # EXECUTIVE CALL (user, 2026-08-15) — the valid set is EXACTLY the upstream API providers,
+    # taken from LiteLLM, and deliberately NOT unioned with `registered_llm_tags()`. A credential
+    # is keyed by the vendor a request is authenticated against, which is never a JAZ backend tag:
+    # `resolve_credential` is only ever called with `"openai"`, `"anthropic"`, or the provider
+    # LiteLLM routed to. `litellm`/`rlm`/`sglang` are backend tags, so accepting them let
+    # `set_credential("litellm", …)` report success and then do nothing forever — the exact
+    # silent-success-that-does-nothing this guard exists to prevent, and a very plausible thing
+    # for a default-backend user to type.
+    #
+    # The cost, accepted knowingly: a custom `@register_llm` backend that resolves a credential
+    # under its OWN tag can no longer have that key stored from the console. It is still readable
+    # (`resolve_credential` is public) — the file just has to be edited by hand. Weighed against
+    # every user of the default backend being able to store an inert key, that is the better trade.
+    #
+    # Importing litellm costs ~2 s; acceptable for a once-per-machine setup call, and it is why
+    # this import is inside the function rather than at module scope.
+    from jaz.llm._litellm import _litellm
+
+    # No `getattr` defaults on either lookup. A default here would not be defensive, it would be
+    # a silent re-run of the bug this guard was just fixed for: if LiteLLM renames `provider_list`
+    # or stops using an enum, falling back to `()` would reject every real provider with nothing
+    # to say why. Better to fail loudly at the one call site.
+    #
+    # `models_by_provider` is unioned in because it is not a subset: it carries five legacy tags
+    # (`aleph_alpha`, `anyscale`, `azure_anthropic`, `llamagate`, `palm`) that `provider_list`
+    # dropped. The set is meant to be everything LiteLLM will route, so a superset is the safe
+    # direction — a tag we accept but LiteLLM never asks for is an unread file entry, whereas one
+    # we reject is a user blocked from storing a key that would have worked.
+    #
+    # Elements are unwrapped with an explicit `isinstance` rather than `getattr(p, "value", p)`
+    # because LiteLLM's own type for `provider_list` is `list[str] | list[LlmProviders]` — both
+    # shapes are declared, so this handles a real union instead of papering over a surprise. A
+    # `getattr` default would additionally turn any *third* shape into its repr, seeding the set
+    # with garbage tags that then reject the real ones.
+    litellm = _litellm()
+    known = {
+        p.value if isinstance(p, Enum) else p for p in litellm.provider_list
+    } | set(litellm.models_by_provider)
+    if provider not in known:
+        # A near-miss is the whole point of the message: an alphabetical slice of ~150 providers
+        # can never contain `"openai"` for a `"opeani"` typo, so listing one is useless for the
+        # case this message exists for.
+        #
+        # Matched on the case-folded tag because `get_close_matches` is case-sensitive and every
+        # known tag is lowercase, so `"OpenAI"` would otherwise score no match at all — the one
+        # near-miss most likely to come from a human typing a vendor's brand capitalisation.
+        # Suggested rather than silently accepted: the tag is the storage key, so normalising it
+        # behind the user's back would store under a name they did not choose.
+        suggestions = difflib.get_close_matches(provider.lower(), sorted(known), n=3)
+        hint = (
+            f" Did you mean {' or '.join(repr(s) for s in suggestions)}?"
+            if suggestions
+            else f" See {_PROVIDER_LIST_URL} for the {len(known)} known providers."
+        )
+        raise ValueError(f"Unknown provider {provider!r}.{hint}")
+
+    if api_key is None:
+        if not sys.stdin.isatty():
+            raise ValueError(
+                "Cannot prompt for a key with stdin redirected. Pass it explicitly: "
+                f"set_credential({provider!r}, api_key=...)"
+            )
+        api_key = getpass.getpass(f"API key for {provider}: ")
+
+    location = _store_credential(provider, api_key)
+    # Confirm with the location, never the value — echoing a key someone just took care not
+    # to display would defeat the prompt, and the console's output is what gets screen-shared.
+    # `location` is a printable string rather than a Path so an OS-keyring backend (#1076)
+    # can name a keychain here without changing this call site.
+    print(f"Stored {provider} api_key in {location}")
 
 
 def build_namespace() -> dict[str, Any]:
@@ -1422,6 +1996,8 @@ def build_namespace() -> dict[str, Any]:
     tracing example hit). Exposing it keeps the contract in one place rather than duplicated
     across callers that will drift.
 
+    ``set_credential`` is also bound, so a key can be stored from inside the session.
+
     No hooks are placed in the namespace by default (req 5 — no external-service deps out
     of the box). The tracing example layers hooks on top via ``examples/interactive_repl.py``.
     """
@@ -1433,6 +2009,13 @@ def build_namespace() -> dict[str, Any]:
         # Dunder-ish name on purpose: it is rewrite plumbing (like `_`/`__builtins__`),
         # not a name users are meant to call; the user-facing spelling is the `%` sigil.
         "__jaz_settings__": jaz_settings,
+        # Bound under a plain name (no sigil) deliberately. Storing a key is a rare,
+        # one-per-machine setup step, not a per-turn action, so it does not earn one of the
+        # few legal-Python-shadowing characters the sugar can claim — and unlike the sigils
+        # it needs no rewrite, being an ordinary call the user can also make from a script.
+        # Unlike the four names above it is a convenience rather than a sugar dependency:
+        # dropping it breaks nothing the console rewrites.
+        "set_credential": set_credential,
     }
 
 
@@ -1450,13 +2033,24 @@ def _apply_user_settings() -> str | None:
     the returned message (which names the file and the fix) and exits non-zero — you repair the
     file in a text editor. (A future console helper-agent that can repair it in-session is #1070.)
     """
-    # `load_user_settings` raises (path + recovery hint) on unreadable/invalid-JSON/non-object;
-    # `build_config`/`configure` raise on a value the schema rejects. Both become a returned
-    # message rather than a traceback — a broken settings file is a user error, not a jaz bug.
+    # `load_user_settings` raises (path + recovery hint) on unreadable/invalid-JSON/non-object and
+    # on a blocked key (llm.base_url/api_key); `build_config`/`configure` raise on a value the
+    # schema rejects. Both become a returned message rather than a traceback — a broken settings
+    # file is a user error, not a jaz bug.
+    #
+    # A sandbox-loosening key is NOT fatal: `load_user_settings` emits it as a UserWarning (allowed
+    # but flagged, per #1047). Capture it here and print to stderr as a non-fatal notice rather than
+    # letting Python's default warning filter decide whether the user ever sees it — the whole point
+    # is that loosening the sandbox is never silent, and this is the interactive session where the
+    # agent's output lands.
     try:
-        partials = load_user_settings()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            partials = load_user_settings()
     except ValueError as exc:
         return str(exc)
+    for entry in caught:
+        print(f"jaz: warning: {entry.message}", file=sys.stderr)
     if not partials:
         return None
     try:
@@ -1485,11 +2079,15 @@ def _apply_config(args: argparse.Namespace) -> None:
     if args.model is not None:
         # Through the boundary: `--model` is authored data (a string a user typed), and config
         # takes only built components.
+        #
+        # `--model` names only the model; it rides the config's default backend — litellm, v1's
+        # sole backend — rather than naming one, so `--model openai/gpt-5-mini`. A future
+        # `--backend` flag would feed the backend slot.
         llm = build_config({"llm": {"model": args.model}})["llm"]
-        # Validated at startup rather than at the first request. The model id is sent verbatim,
-        # so a `provider/`-prefixed value — the spelling every aggregator uses, and the one a
-        # user is most likely to try — is an error; surfacing it here makes it a flag error the
-        # user can fix immediately instead of a failure several turns into a session.
+        # Validated at startup rather than at the first request: `get_model` rejects an empty id,
+        # and the backend's `validate_model` rejects an id it would not send verbatim. For the
+        # litellm backend the `provider/` prefix IS the routing key, so a prefixed id is expected
+        # here — the opposite of the built-in backends, which rejected it.
         llm.validate_model(llm.get_model())
         jaz.configure(llm=llm)
 
@@ -1558,8 +2156,11 @@ def _run_source(source: str, namespace: dict[str, Any]) -> int:
     so the result is printed and ``_`` is bound exactly as in the interactive console.
     Returns 0 on success, 1 if execution raised.
     """
+    # filename="<string>" to match `python -c` (which only ``-c``/one-shot reaches — see
+    # _run_oneshot), so a traceback from a one-shot turn names its source the way a plain
+    # `python -c` would, not with a jaz-internal "<jaz>" (#713 review).
     try:
-        exec(compile(source, "<jaz>", "single"), namespace)
+        exec(compile(source, "<string>", "single"), namespace)
     except SystemExit:
         raise
     except KeyboardInterrupt:
@@ -1611,8 +2212,15 @@ def _run_oneshot(text: str, namespace: dict[str, Any]) -> int:
     return _run_source(source, namespace)
 
 
-def _run_script_source(contents: str, namespace: dict[str, Any]) -> int:
+def _run_script_source(
+    contents: str, namespace: dict[str, Any], filename: str = "<stdin>"
+) -> int:
     """Feed multi-line *script* text through the console preprocessor line-by-line, then flush.
+
+    ``filename`` names the source in tracebacks: the default ``"<stdin>"`` suits piped stdin
+    (matching ``cat x | python``), while :func:`_run_file` passes the script's path so a
+    ``.jaz`` file reports like ``python file.py`` (line numbers stay statement-relative — see
+    :class:`JazConsole`).
 
     Shared by :func:`_run_file` (a ``.jaz`` path) and the piped-stdin branch of :func:`main`
     so the two are identical: ``cat script.jaz | jaz`` behaves exactly like ``jaz script.jaz``
@@ -1637,7 +2245,7 @@ def _run_script_source(contents: str, namespace: dict[str, Any]) -> int:
     end — was considered and rejected: running lines *after* a failed one is exactly the
     surprise (acting on a half-broken state) that ``python file.py`` avoids by stopping.
     """
-    console = JazConsole(locals=namespace)
+    console = JazConsole(locals=namespace, filename=filename)
     for line in contents.splitlines():
         console.push(line)
         if console.errored:
@@ -1664,7 +2272,9 @@ def _run_file(path: str, namespace: dict[str, Any]) -> int:
     except OSError as exc:
         print(f"jaz: cannot open {path!r}: {exc}", file=sys.stderr)
         return 1
-    return _run_script_source(contents, namespace)
+    # Pass `path` as the traceback filename (as typed on the command line, like `python
+    # file.py`) so a file error names the file, not the piped-stdin default "<stdin>".
+    return _run_script_source(contents, namespace, filename=path)
 
 
 def _interactive(namespace: dict[str, Any]) -> int:
@@ -1683,24 +2293,35 @@ def _interactive(namespace: dict[str, Any]) -> int:
         "  > summarize {doc}            ask the agent (binds `doc` as input)\n"
         "  n: int <- how many words?    capture a typed result\n"
         "  ?doc                         show what the agent sees for `doc`\n"
-        "  % allow numpy imports        ask for a settings change (confirmed before running)\n"
+        "  % allow numpy imports        ask the jaz helper — questions are answered,\n"
+        "  % why did that time out?     changes are confirmed before running\n"
         "  <any Python>                 runs as normal Python\n"
+        "\n"
+        "  set_credential('openai')     save an API key for future sessions (prompts)\n"
         "\n"
         "jaz, invoke and jprint are pre-imported. Type exit() or Ctrl-D to quit."
     )
 
     # readline may be unavailable (e.g. on some Windows setups); the console still works.
+    # OSError joins it now that the history file lives in a directory we have to create:
+    # a read-only or full HOME must cost the user their history, not their console. The old
+    # path wrote straight into an existing HOME and so had nothing to fail at this point.
     try:
         import readline
 
+        history_file = _history_file()
         try:
-            readline.read_history_file(_HISTORY_FILE)
+            readline.read_history_file(history_file)
         except FileNotFoundError:
             pass
         readline.set_history_length(1000)
-        atexit.register(readline.write_history_file, _HISTORY_FILE)
+        atexit.register(readline.write_history_file, history_file)
         readline.parse_and_bind("tab: complete")
     except ImportError:  # pragma: no cover - platform dependent
+        pass
+    # OSError is exercised by test_an_unwritable_home_costs_history_not_the_console,
+    # so it stays un-pragma'd; only the platform-dependent ImportError is uncovered.
+    except OSError:
         pass
 
     JazConsole(locals=namespace).interact(banner=banner, exitmsg="Goodbye!")
@@ -1737,8 +2358,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         help=(
-            "Model id, exactly as the backend's own docs write it (e.g. gpt-5-mini). "
-            "Sets llm.model."
+            "Model id as a LiteLLM route, provider-prefixed (e.g. openai/gpt-5-mini, "
+            "anthropic/claude-sonnet-5). Sets llm.model on the default litellm backend."
         ),
     )
     parser.add_argument(

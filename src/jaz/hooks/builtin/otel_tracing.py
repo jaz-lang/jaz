@@ -1,6 +1,6 @@
-"""Generic OpenTelemetry tracing hook for Jaz hook events.
+"""Generic OpenTelemetry tracing hook for JAZ hook events.
 
-This hook translates Jaz execution events into OpenTelemetry spans and exports
+This hook translates JAZ execution events into OpenTelemetry spans and exports
 them via OTLP HTTP. Backend-specific hooks (e.g., Jaeger, Langfuse) should
 compose this hook with backend-specific defaults.
 """
@@ -109,12 +109,40 @@ class OTelTracing(Hook):
         if include_trace_fields:
             span.set_attribute("langfuse.trace.output", text)
 
+    def _end_span_abnormal(self, span: Span, event: Any) -> None:
+        """Close ``span`` for a non-completed ``*Exit`` (an ``Aborted``/``Failed`` outcome).
+
+        The #892 payoff: the span context managers now fire the exit events on the
+        exceptional path too (bottom-up as the exception unwinds), so this hook closes its
+        OTel spans at their natural point, in order, with ERROR status and the terminating
+        exception — instead of leaking them to ``teardown()`` with inflated, out-of-order
+        durations. ``teardown()`` is retained as the backstop for the machinery gaps the
+        design doc documents (a failure during the exit-emit itself).
+        """
+        outcome = event.outcome
+        span.set_status(Status(StatusCode.ERROR))
+        # The variant IS the status; its class name (lowercased) is the serialized form.
+        span.set_attribute("jaz.span_outcome", type(outcome).__name__.lower())
+        span.set_attribute("error.type", type(outcome.exception).__name__)
+        # summarize_exception, not str(): multiple aborts at one boundary group into an
+        # ExceptionGroup by law, and str() on a group renders only a sub-exception count,
+        # dropping every child's text — on exactly the failure arms this attribute exists
+        # for. Matches the jaz.exception result attributes below.
+        span.set_attribute(
+            "error.message", self._truncate(summarize_exception(outcome.exception))
+        )
+        span.end()
+
     def on_any(self, event: Event) -> list:
         from jaz.hooks.events import (
+            Completed,
             InvokeEnter,
             InvokeExit,
+            InvokeSend,
             LLMQueryEnter,
             LLMQueryExit,
+            LLMQueryRetry,
+            LLMQuerySend,
             REPLExecEnter,
             REPLExecExit,
         )
@@ -123,6 +151,35 @@ class OTelTracing(Hook):
         invoke_roots = self._get_invoke_roots()
 
         match event:
+            # Non-completed arms first (#892 outcome union): close the interval with
+            # ERROR + the exception rather than matching the Completed payload arms below.
+            # See _end_span_abnormal.
+            case LLMQueryExit(invoke_id=invoke_id) if not isinstance(
+                event.outcome, Completed
+            ):
+                span = spans.pop((invoke_id, "llm_query"), None)
+                if span:
+                    self._end_span_abnormal(span, event)
+
+            case REPLExecExit(invoke_id=invoke_id) if not isinstance(
+                event.outcome, Completed
+            ):
+                span = spans.pop((invoke_id, "repl_iteration"), None)
+                if span:
+                    self._end_span_abnormal(span, event)
+
+            case InvokeExit(invoke_id=invoke_id) if not isinstance(
+                event.outcome, Completed
+            ):
+                # No orphan sweep on this arm (nor anywhere): every opened child span
+                # closes at its OWN exit event now — the abort carve-out that skipped
+                # LLMQueryExit is gone, and abnormal unwinds fire the child exits
+                # bottom-up before this one. teardown() remains the backstop for the
+                # machinery gaps the design doc documents.
+                span = spans.pop(invoke_id, None)
+                invoke_roots.pop(invoke_id, None)
+                if span:
+                    self._end_span_abnormal(span, event)
             case InvokeEnter(
                 invoke_id=invoke_id,
                 parent_invoke_id=parent_invoke_id,
@@ -144,11 +201,11 @@ class OTelTracing(Hook):
                     # is omitted entirely when no scope is active (the common case) to avoid noise.
                     "jaz.inputs": str(dict(inputs)),
                     # The governance active for this invoke: each active hook serialized via
-                    # to_dict() at this edge (`event.hooks` carries the LIVE set, #727), incl. this
+                    # rendered at this edge (`event.hooks` carries the LIVE set, #727), incl. this
                     # tracer. Emitted UNCONDITIONALLY (unlike `jaz.scope` above, omitted-when-empty):
                     # the active-hook set is the governance record — always worth pinning on the
                     # span, and never empty for an event this tracer observes (the tracer is in it).
-                    "jaz.hooks": str([h.to_dict() for h in event.hooks]),
+                    "jaz.hooks": str(list(event.hooks)),
                 }
                 if event.scope:
                     attributes["jaz.scope"] = str(dict(event.scope))
@@ -169,7 +226,38 @@ class OTelTracing(Hook):
                 invoke_roots[invoke_id] = is_root_invoke
                 spans[invoke_id] = span
 
-            case InvokeExit(invoke_id=invoke_id, result=result):
+            case InvokeSend(
+                invoke_id=invoke_id,
+                inputs=inputs,
+                added_inputs=added_inputs,
+                dropped_inputs=dropped_inputs,
+            ):
+                # Re-stamp the invoke span's inputs with the COMMITTED set (post
+                # AddInputs/DropInputs) — the enter-time stamp above is the proposal,
+                # which misses hook-injected inputs (the input-side #906 pattern, e.g.
+                # ultrahorizon's per-child `env`; ATIFTrace made the same Enter→Send
+                # move). The enter stamp is kept as the early value for spans whose
+                # Send never fires (an enter-time abort). Hook-added/dropped names are
+                # recorded only when hooks edited the set, mirroring ATIF's
+                # hook_added_inputs/hook_dropped_inputs provenance split.
+                span = spans.get(invoke_id)
+                if span:
+                    span.set_attribute("jaz.inputs", str(dict(inputs)))
+                    if added_inputs:
+                        span.set_attribute(
+                            "jaz.hook_added_inputs", str(sorted(added_inputs))
+                        )
+                    if dropped_inputs:
+                        span.set_attribute(
+                            "jaz.hook_dropped_inputs", str(sorted(dropped_inputs))
+                        )
+                    self._set_input_attributes(
+                        span,
+                        dict(inputs),
+                        include_trace_fields=invoke_roots.get(invoke_id, False),
+                    )
+
+            case InvokeExit(invoke_id=invoke_id, outcome=Completed(result=result)):
                 span = spans.pop(invoke_id, None)
                 if span:
                     from jaz.repl.types import (
@@ -225,25 +313,11 @@ class OTelTracing(Hook):
                                 f"{type(result).__name__}"
                             )
 
-                    # Abort carve-out (#481): a loop/budget hard-stop fires ``LLMQueryEnter``
-                    # but — by design — no ``LLMQueryExit`` (the query never happened), so the
-                    # aborted turn's per-turn child span is never closed on its own. End any
-                    # orphaned children of this invoke here, *before* the invoke span, so they
-                    # close in-order with a bounded duration instead of leaking (out of order,
-                    # inflated) to ``teardown()``. A normal turn already popped its child at
-                    # ``LLMQueryExit`` / ``REPLExecExit``, so this is a no-op there. This is the
-                    # observer-side handling of the enter/exit pairing carve-out documented in
-                    # hooks/README.md — an observer that pairs a resource on ``LLMQuery`` must
-                    # clean up at ``InvokeExit`` because an abort skips the exit.
-                    for child_key in (
-                        (invoke_id, "llm_query"),
-                        (invoke_id, "repl_iteration"),
-                    ):
-                        child = spans.pop(child_key, None)
-                        if child is not None:
-                            child.set_attribute("jaz.aborted", True)
-                            child.set_status(Status(StatusCode.ERROR))
-                            child.end()
+                    # No orphan sweep here anymore: the enter/send-abort carve-out died
+                    # with the abort-propagation model (span_event_lifecycle.md, final
+                    # stage) — an aborted query now fires its own LLMQueryExit(Aborted),
+                    # closed by the abnormal arm above, so a completing invoke can have
+                    # no dangling per-turn children.
                     span.end()
 
             case REPLExecEnter(
@@ -268,7 +342,7 @@ class OTelTracing(Hook):
                 self._set_input_attributes(span, code, include_trace_fields=False)
                 spans[(invoke_id, "repl_iteration")] = span
 
-            case REPLExecExit(invoke_id=invoke_id, exec_result=result):
+            case REPLExecExit(invoke_id=invoke_id, outcome=Completed(result=result)):
                 span = spans.pop((invoke_id, "repl_iteration"), None)
                 if span:
                     from jaz.repl.types import (
@@ -330,9 +404,9 @@ class OTelTracing(Hook):
                             # ``ERROR: <exc>`` fallback did, and is the same duplication that was
                             # removed from the invoke-level RAISE arm).
                             #
-                            # Note the overlap this does NOT try to remove: a *parse-failure*
-                            # Continue deliberately carries the rendered error as its ``output``
-                            # (see ``_parse_error_result``), so both attributes legitimately hold
+                            # Note the overlap this does NOT try to remove: a did-not-execute
+                            # Continue (e.g. a REPL timeout-pragma error) deliberately carries the
+                            # rendered error as its ``output``, so both attributes legitimately hold
                             # that text — ``output`` is what the agent saw, ``exception`` is the
                             # structured metadata beside it.
                             if output_text:
@@ -363,32 +437,24 @@ class OTelTracing(Hook):
 
             case LLMQueryEnter(
                 invoke_id=invoke_id,
-                messages=messages,
                 model=model,
                 iteration=iteration,
                 depth=depth,
             ):
+                # The span opens here (Enter is when the interval starts), but the
+                # message-derived generation labels are stamped at LLMQuerySend below: the
+                # committed post-edit list is what the model is actually shown, so labelling
+                # from Enter's pre-edit proposal would record messages a compaction dropped
+                # or miss ones a hook added (#906's observation rule for inputs).
                 attributes: dict[str, Any] = {
                     "jaz.span_type": "llm_query",
                     "jaz.invoke_id": invoke_id,
                     "jaz.model": model,
-                    "jaz.message_count": len(messages),
                     "langfuse.observation.type": "generation",
                     "langfuse.generation.model": model,
+                    "jaz.iteration": iteration,
+                    "jaz.depth": depth,
                 }
-                # Best-effort positional tail labels: length-guarded and role-checked, so
-                # a buffer that a persistent message edit shrank/reordered can only change
-                # *which* message is labelled (trace metadata), never crash this hook.
-                if messages:
-                    if len(messages) >= 2 and messages[-2]["role"] == "user":
-                        attributes["jaz.last_last_message"] = self._truncate(
-                            self._format_message(messages[-2])
-                        )
-                    last_message = self._truncate(self._format_message(messages[-1]))
-                    attributes["jaz.last_message"] = last_message
-                attributes["jaz.iteration"] = iteration
-                attributes["jaz.depth"] = depth
-
                 parent_span = spans.get((invoke_id, "repl_iteration")) or spans.get(
                     invoke_id
                 )
@@ -397,15 +463,61 @@ class OTelTracing(Hook):
                     attributes=attributes,
                     context=(set_span_in_context(parent_span) if parent_span else None),
                 )
-                if messages:
+                spans[(invoke_id, "llm_query")] = span
+
+            case LLMQuerySend(invoke_id=invoke_id, messages=messages):
+                # Label the open generation span from the COMMITTED message list — exactly
+                # what is handed to the result producer (and what a Send-time supplier saw).
+                span = spans.get((invoke_id, "llm_query"))
+                if span and messages:
+                    span.set_attribute("jaz.message_count", len(messages))
+                    # Positional tail labels are exact here: this list is final for the
+                    # query, so no length/role hedging against in-flight edits is needed —
+                    # only the role check that decides whether the second-to-last message
+                    # is a user turn worth labelling.
+                    if len(messages) >= 2 and messages[-2]["role"] == "user":
+                        span.set_attribute(
+                            "jaz.last_last_message",
+                            self._truncate(self._format_message(messages[-2])),
+                        )
+                    span.set_attribute(
+                        "jaz.last_message",
+                        self._truncate(self._format_message(messages[-1])),
+                    )
                     self._set_input_attributes(
                         span,
                         self._format_message(messages[-1]),
                         include_trace_fields=False,
                     )
-                spans[(invoke_id, "llm_query")] = span
 
-            case LLMQueryExit(invoke_id=invoke_id, response=response):
+            case LLMQueryRetry(
+                invoke_id=invoke_id,
+                attempt_number=attempt_number,
+                exception=exception,
+                wait_seconds=wait_seconds,
+            ):
+                # Recorded as a span event (OTel's native shape for a point-in-time
+                # occurrence inside an interval) on the open generation span, so a call
+                # that failed and retried leaves its failed attempts, errors, and backoff
+                # in the trace — previously only the loggers observed this event and the
+                # trace showed one clean call however many attempts it took.
+                span = spans.get((invoke_id, "llm_query"))
+                if span:
+                    span.add_event(
+                        "llm_retry",
+                        {
+                            "attempt_number": attempt_number,
+                            "error.type": type(exception).__name__,
+                            "error.message": self._truncate(
+                                summarize_exception(exception)
+                            ),
+                            "wait_seconds": wait_seconds,
+                        },
+                    )
+
+            # Matching the Completed variant both narrows and unwraps the payload — the
+            # non-completed arms matched above.
+            case LLMQueryExit(invoke_id=invoke_id, outcome=Completed(result=response)):
                 content = response.content
                 span = spans.pop((invoke_id, "llm_query"), None)
                 if span:
@@ -420,8 +532,8 @@ class OTelTracing(Hook):
                         span.set_attribute(
                             "jaz.completion_tokens", response.completion_tokens
                         )
-                    if response.cost is not None:
-                        span.set_attribute("jaz.cost_usd", response.cost)
+                    if response.cost_usd is not None:
+                        span.set_attribute("jaz.cost_usd", response.cost_usd)
                     span.set_status(Status(StatusCode.OK))
                     span.end()
 
@@ -435,14 +547,17 @@ class OTelTracing(Hook):
         invoke_roots = self._get_invoke_roots()
         for span_key in list(spans.keys()):
             span = spans.pop(span_key)
-            if exc_type is not None:
+            if exc_type is not None and exc is not None:
                 span.set_status(Status(StatusCode.ERROR))
                 span.set_attribute("error.type", exc_type.__name__)
-                span.set_attribute("error.message", str(exc))
+                # Same group-expanding rendering as _end_span_abnormal — one exception
+                # format across every failure surface of this hook.
+                summary = summarize_exception(exc)
+                span.set_attribute("error.message", self._truncate(summary))
                 if isinstance(span_key, str):
                     self._set_output_attributes(
                         span,
-                        f"{exc_type.__name__}: {exc}",
+                        summary,
                         include_trace_fields=invoke_roots.get(span_key, False),
                     )
             span.end()
@@ -455,6 +570,6 @@ class OTelTracing(Hook):
 #: Deprecated alias for the pre-rename spelling — see the rationale block in
 #: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
 #: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_every_renamed_hook_has_an_alias``). This hook is absent from every ``__all__``,
+#: (``test_legacy_hook_names_still_importable``). This hook is absent from every ``__all__``,
 #: so that deep-path import is the only way it was ever reachable.
 OTelTracingHook = OTelTracing

@@ -1,8 +1,8 @@
 """LLM backend registration.
 
-A decorator-based registry for :class:`~jaz.providers.llm.LLM` implementations, mirroring the
+A decorator-based registry for :class:`BaseLLM` implementations, mirroring the
 REPL registry (see :mod:`jaz.repl.registry`). Registering is what lets *authored data* — an
-eval YAML, a settings file — name the backend as ``llm={"tag": "mybackend", ...}``, which
+eval YAML, a settings file — name the backend as ``llm={"backend": "mybackend", ...}``, which
 :func:`~jaz.instantiate.build_config` compiles into an instance. Code that already has the
 instance passes it straight to ``configure`` and needs no tag.
 """
@@ -11,12 +11,12 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .llm import LLM
+    from .llm import BaseLLM
 
 
 # Global mapping from backend tags to LLM classes. One namespace, one lookup: a tag names
 # exactly one class, and `LLM_REGISTRY[tag].from_dict(params)` is the whole instantiation path.
-LLM_REGISTRY: dict[str, type["LLM"]] = {}
+LLM_REGISTRY: dict[str, type["BaseLLM"]] = {}
 
 # Backends whose module is imported only on first use, because their dependency is optional
 # (RLM needs the `rlm` package, which importing jaz must not require). Materialized into
@@ -40,7 +40,7 @@ def registered_llm_tags() -> frozenset[str]:
     return frozenset(LLM_REGISTRY) | frozenset(_LAZY_LLM_MODULES)
 
 
-def resolve_llm(tag: str) -> "type[LLM] | None":
+def resolve_llm(tag: str) -> "type[BaseLLM] | None":
     """The class registered under ``tag``, importing an optional backend's module on demand.
 
     ``None`` when the tag names no backend. An optional backend whose dependency is missing
@@ -72,56 +72,56 @@ def resolve_llm(tag: str) -> "type[LLM] | None":
 
 
 def register_llm(name: str):
-    """Decorator registering an :class:`LLM` subclass under the tag ``name``.
+    """Decorator registering a :class:`BaseLLM` subclass under the tag ``name``.
 
     Args:
         name: The backend tag (e.g. ``"openai"``, ``"mybackend"``). Must match
             ``[a-zA-Z0-9_]+``. It is also the model-string prefix this backend *rejects*: the
             model id is sent verbatim, so ``mybackend/some-model`` is an error naming
-            ``some-model`` as the fix — see :meth:`~jaz.providers.llm.LLM.validate_model`.
+            ``some-model`` as the fix — see :meth:`~BaseLLM.validate_model`.
 
     Returns:
-        A decorator that registers the ``LLM`` subclass and returns it.
+        A decorator that registers the ``BaseLLM`` subclass and returns it.
 
     Example::
 
         import os
-        from jaz.providers import LLM, register_llm
+        from jaz.llm import BaseLLM, register_llm
 
         @register_llm("mybackend")
-        class MyLLM(LLM):
+        class MyLLM(BaseLLM):
             def __init__(self, base_url: str | None = None, **retry):
                 super().__init__(**retry)
                 self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
 
             def complete(self, model, messages, **kwargs): ...
 
-        # Nameable in authored data as {"tag": "mybackend", "base_url": ...} — `base_url`
+        # Nameable in authored data as {"backend": "mybackend", "base_url": ...} — `base_url`
         # reaches `__init__` because it is declared there. In code, just
         # `jaz.configure(llm=MyBackend(base_url=...))`.
 
     Raises:
         ValueError: If ``name`` is malformed or already registered.
-        TypeError: If the decorated class is not an ``LLM`` subclass.
+        TypeError: If the decorated class is not a ``BaseLLM`` subclass.
     """
     if not LLM_TAG_RE.match(name):
         raise ValueError(
             f"Invalid LLM tag: {name!r}. LLM tags must match the regex [a-zA-Z0-9_]+"
         )
 
-    def decorator[C: type["LLM"]](llm_class: C) -> C:
+    def decorator[C: type["BaseLLM"]](llm_class: C) -> C:
         """Register the LLM class in the global registry."""
         # Imported here to avoid a circular dependency with llm.py, which imports nothing from
         # this module (the registry knows about backends; backends do not know about it).
-        from .llm import LLM
+        from .llm import BaseLLM
 
-        if not issubclass(llm_class, LLM):
-            raise TypeError(f"LLM class {llm_class.__name__} must inherit from LLM")
+        if not issubclass(llm_class, BaseLLM):
+            raise TypeError(f"LLM class {llm_class.__name__} must inherit from BaseLLM")
         if name in LLM_REGISTRY:
             raise ValueError(
                 f"LLM tag {name!r} is already registered "
-                f"({LLM_REGISTRY[name].__name__}). Reconfigure a built-in backend by "
-                "constructing it — jaz.configure(llm=OpenAILLM(...)) — instead of "
+                f"({LLM_REGISTRY[name].__name__}). Reconfigure a registered backend by "
+                "constructing it — jaz.configure(llm=LiteLLM(...)) — instead of "
                 "re-registering."
             )
         LLM_REGISTRY[name] = llm_class

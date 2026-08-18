@@ -9,6 +9,8 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
+from jaz.tokens import TurnRecord
+
 # Type alias for OpenAI-style message format (replaces AllMessageValues)
 MessageDict = dict[str, Any]
 
@@ -26,11 +28,17 @@ class Usage:
     `extra` carries provider-specific fields that aren't part of the
     normalized shape (e.g. OpenAI `reasoning_tokens`, Anthropic
     `cache_creation` 5m/1h sub-buckets, `service_tier`).
+
+    There is no `total_tokens`: sum `prompt_tokens` and `completion_tokens`.
     """
+
+    # `total_tokens` was dropped along with `LLMResponse.total_tokens` (see the comment
+    # there). `finalize` was its only reader, so keeping it here — even though OpenAI does
+    # send one on the wire — would have left a field that every backend has to populate and
+    # nothing consumes.
 
     prompt_tokens: int
     completion_tokens: int
-    total_tokens: int
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
@@ -64,18 +72,19 @@ class CompletionResponse:
     usage: Usage | None = None
     model: str = ""
     id: str = ""
+    tokens: TurnRecord | None = None  # per-turn token record; None for text backends
 
 
 def declared_init_keys(cls: type) -> frozenset[str]:
     """The named (introspectable) parameters of ``cls.__init__``, excluding ``self``.
 
-    Backs :meth:`jaz.repl.base.REPL.construction_keys`, so a component classifies authored keys by the
+    Backs :meth:`BaseREPL.construction_keys`, so a component classifies authored keys by the
     same rule.
 
     Walks the MRO and unions each class's own declared parameters, because the common
     forwarding idiom (``def __init__(self, ..., **retry): super().__init__(**retry)``)
     hides the base's parameters behind a ``**kwargs`` that cannot be introspected. Without
-    the walk, settings declared on a base class — such as ``LLM``'s ``retry_*``
+    the walk, settings declared on a base class — such as ``BaseLLM``'s ``retry_*``
     fields — would be invisible on every subclass that forwards them.
 
     ``*args``/``**kwargs`` are themselves never reported: a class whose settings exist
@@ -95,7 +104,7 @@ def declared_init_keys(cls: type) -> frozenset[str]:
     return frozenset(keys)
 
 
-# The `Provider` ABC that used to live here was merged into `LLM` (see `jaz.providers.llm`):
+# The `Provider` ABC that used to live here was merged into `BaseLLM` (see `jaz.llm.llm`):
 # one class per backend now owns the HTTP call, retry, cost accounting and model metadata,
 # instead of splitting them across a client and a provider that only ever paired with each
 # other. This module keeps the wire-shaped types both halves already shared.

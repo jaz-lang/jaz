@@ -11,7 +11,7 @@ When a provider introduces a field where summation is wrong — e.g. vLLM
 ``promptTokensDetails`` is a list keyed by modality — register a
 custom rule at provider module import time::
 
-    from jaz.providers.extras_merge import register_extra_merge_rule
+    from jaz.llm.extras_merge import register_extra_merge_rule
 
     register_extra_merge_rule("prompt_token_ids", list.__add__)
 

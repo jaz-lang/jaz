@@ -1,6 +1,6 @@
-"""Workflow replay hook that materializes Jaz execution as executable Python programs.
+"""Workflow replay hook that materializes JAZ execution as executable Python programs.
 
-This hook captures the execution trace of a Jaz workflow and transforms it into
+This hook captures the execution trace of a JAZ workflow and transforms it into
 a structured Python package with:
 - Hierarchical directory structure mirroring the call graph
 - Executable programs with error handling logic
@@ -22,6 +22,7 @@ from jaz.hooks.events import (
     REPLExecEnter,
     REPLExecExit,
 )
+from jaz.hooks.events.base import Completed
 from jaz.repl.types import Continue, ExecResult
 
 # Global counter for naming invocations (shared across all contexts)
@@ -183,7 +184,7 @@ class WorkflowReplay(Hook):
                     task_name=task_name,
                     # Full bound namespace: explicit inputs ∪ resolved scope (disjoint; #727 split
                     # them into separate InvokeEnter fields). Unlike the observability hooks
-                    # (atif_trace / conversation_history / loggers / otel_tracing), which record the
+                    # (atif_trace / loggers / otel_tracing), which record the
                     # two as SEPARATE provenance channels, WorkflowReplay is a *codegen* hook: it
                     # lowers this namespace into the replay function's PARAMETERS and reconstructs it
                     # in the __main__ call. Replay reproduces the namespace the agent saw, so it needs
@@ -215,7 +216,11 @@ class WorkflowReplay(Hook):
                 program_file = self._get_program_file(ctx)
                 self._write_function_header(ctx, program_file)
 
-            case LLMQueryExit(invoke_id=invoke_id, response=response):
+            # Abnormal-arm guards (#892): only completed spans carry a payload to record —
+            # a failed turn writes no replay record (matching the pre-outcome-union
+            # behavior, where these events did not fire at all on a failure). Matching
+            # the Completed variant both narrows and unwraps the payload.
+            case LLMQueryExit(invoke_id=invoke_id, outcome=Completed(result=response)):
                 # Stash this turn's LLM response; the record is written at REPLExecExit
                 # (below), where code + exec_result also become available.
                 ctx = self.contexts.get(invoke_id)
@@ -228,7 +233,9 @@ class WorkflowReplay(Hook):
                 if ctx:
                     ctx._pending_code = code
 
-            case REPLExecExit(invoke_id=invoke_id, iteration=i, exec_result=result):
+            case REPLExecExit(
+                invoke_id=invoke_id, iteration=i, outcome=Completed(result=result)
+            ):
                 # Assemble + write this turn's record now that all three parts are known
                 # (response from the LLMQueryExit above, code from REPLExecEnter, result
                 # here). REPLExec only fires on the runnable-code branch, so a parse-failure
@@ -251,7 +258,11 @@ class WorkflowReplay(Hook):
                 self._write_iteration_to_file(ctx, repl_iteration)
 
             case InvokeExit(invoke_id=invoke_id):
-                # Get context from dict
+                # Fires on EVERY outcome arm (#892 outcome union) — deliberately not
+                # narrowed to Completed: an aborted/failed invoke's partial workflow is
+                # still finalized and written, which is the useful artifact when
+                # debugging exactly those runs (nothing in the outcome payload is read
+                # here, so no narrowing is needed).
                 ctx = self.contexts.get(invoke_id)
                 if not ctx:
                     return []
@@ -531,22 +542,31 @@ class WorkflowReplay(Hook):
             # If parsing fails, return original code
             return source_code
 
-        # Transformer to replace jaz.invoke calls
+        # Transformer to replace sub-invoke calls
         class InvokeReplacer(ast.NodeTransformer):
             def visit_Call(self, node: ast.Call) -> ast.AST:
-                # Check if this is a jaz.invoke() call
-                is_jaz_invoke = False
+                # Match the bare `invoke(...)` the framework binds today AND the legacy
+                # `jaz.invoke(...)`, so a recorded workflow from before the namespace was
+                # dropped — or one produced by a host that binds its own `jaz` namespace —
+                # still replays. Missing a call here does not fail loudly: the rewritten code
+                # would simply run a REAL sub-invoke instead of returning the recorded value,
+                # silently turning a replay into a live run. Hence both forms.
+                is_invoke = False
 
-                # Match: jaz.invoke(...)
+                # Match: invoke(...)
+                if isinstance(node.func, ast.Name) and node.func.id == "invoke":
+                    is_invoke = True
+
+                # Match: jaz.invoke(...) (legacy)
                 if isinstance(node.func, ast.Attribute):
                     if (
                         node.func.attr == "invoke"
                         and isinstance(node.func.value, ast.Name)
                         and node.func.value.id == "jaz"
                     ):
-                        is_jaz_invoke = True
+                        is_invoke = True
 
-                if is_jaz_invoke:
+                if is_invoke:
                     # Replace with: _get_next_invoke_fn()(**data_inputs)
                     #
                     # The recorded workflow already captures the original return value, so we
@@ -611,5 +631,5 @@ class WorkflowReplay(Hook):
 #: Deprecated alias for the pre-rename spelling — see the rationale block in
 #: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
 #: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_every_renamed_hook_has_an_alias``).
+#: (``test_legacy_hook_names_still_importable``).
 WorkflowReplayHook = WorkflowReplay

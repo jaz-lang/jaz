@@ -1,3 +1,8 @@
 {% if output_truncated %}
-*Note:* Printed output was truncated; the magic variable `__repl_history__[{{ iteration - 1 }}].repl_output` holds the string with the full output and you can inspect it by applying string operations such as searching and slicing.
+{# `[-1]`, not an index derived from the iteration number: the entry for THIS turn was appended
+   (agent._finalize_iteration) before this advice renders, so `[-1]` is it. Iterations are 0-based
+   and history holds one entry per iteration, so `[{{ iteration }}]` would name the same entry —
+   but `[-1]` says "the turn you are reading about" directly, and stays correct without the reader
+   having to know the base or trust the one-entry-per-iteration invariant (#719). #}
+*Note:* Printed output was truncated; the magic variable `__history__[-1].repl_output` holds the string with the full output and you can inspect it by applying string operations such as searching and slicing.
 {% endif %}

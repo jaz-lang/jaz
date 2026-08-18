@@ -4,7 +4,7 @@ from jaz.hooks.builtin.otel_tracing import OTelTracing
 
 
 class JaegerTracing(OTelTracing):
-    """Hook preset for exporting Jaz traces to Jaeger.
+    """Hook preset for exporting JAZ traces to Jaeger.
 
     Args:
         endpoint: OTLP HTTP endpoint URL.
@@ -30,5 +30,5 @@ class JaegerTracing(OTelTracing):
 #: Deprecated alias for the pre-rename spelling — see the rationale block in
 #: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
 #: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_every_renamed_hook_has_an_alias``).
+#: (``test_legacy_hook_names_still_importable``).
 JaegerTracingHook = JaegerTracing

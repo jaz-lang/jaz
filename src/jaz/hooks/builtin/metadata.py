@@ -5,7 +5,7 @@ blackboard (see ``hooks/blackboard.py``). It is deliberately **generic** — it 
 whatever keys you hand it, rather than being one hook per key (a ``TaskName`` /
 ``Label`` class per datum would fight the blackboard's "generic, declared, validated
 keys" design). The first such key is ``task_name`` (consumed by
-``WorkflowReplay`` / tracing / ``ConversationHistory``).
+``WorkflowReplay`` / tracing / ``ATIFTrace``).
 
 Per-call vs ambient
 -------------------
@@ -20,7 +20,7 @@ Because seeding reads *active* hooks, ``MetaData`` works on both activation path
 Agent-facing note: the synthesized agent-facing ``invoke`` exposes ``*local_hooks`` too
 (#545), so an agent can label its own sub-invokes by passing ``MetaData(task_name=...)``
 positionally, provided the host passed ``MetaData`` in as an input (it is no longer bound
-under ``jaz.*``) and ``allow_config_hooks_in_subinvoke`` is set.
+under ``jaz.*``).
 
 Validation note: seeding a key no active hook declares in ``blackboard_consumes`` is a
 lint — it logs a **warning** (see ``HookDispatcher._warn_orphan_keys``), not an error, so

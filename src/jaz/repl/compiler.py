@@ -127,7 +127,7 @@ class PrintLastExprTransformer(ast.NodeTransformer):
 # whole-source (a violation anywhere in the tree is policed even if that line never runs),
 # and — since these raise out of secure_compile, caught by the REPL's exec handler — the
 # violation surfaces as a recoverable error the agent can react to, exactly like the former
-# hooks' ModifyResult. The compiler enforces the sandbox on every exec, but it is NOT
+# hooks' ModifyExecResult. The compiler enforces the sandbox on every exec, but it is NOT
 # un-strippable by the agent: ``repl_configs`` is an ordinary config key, so a host that hands the
 # agent a config-override surface (e.g. passing ``jaz.ConfigOverride`` in as an input)
 # opts into letting the agent reconfigure this sandbox for its sub-invokes.
@@ -199,9 +199,12 @@ class ImportPolicyChecker(ast.NodeVisitor):
       * ``locals()["__builtins__"][...]`` — at REPL top level ``locals()`` is the same dict.
       * ``vars()["__builtins__"][...]`` — no-arg ``vars()`` returns the caller namespace unpoliced
         (``vars(obj)`` *is* policed by the secure wrapper).
-      * frame/generator introspection — ``(x for x in []).gi_frame.f_builtins["__import__"]("x")``;
-        ``gi_frame``/``f_builtins``/``f_globals`` are non-dunder, so ``["*", "!__*"]`` does not block
-        them. ``getattr`` reaches them with a computed name the static attr checker can't see.
+      * frame/generator introspection — ``(x for x in []).gi_frame.f_builtins["__import__"]("x")``.
+        Closed by the shipped default since #827: ``gi_frame``/``f_builtins``/``f_globals`` are
+        non-dunder and so were allowed by the bare ``["*", "!__*"]``, but
+        ``DEFAULT_ALLOWED_ATTRIBUTES`` now denies them by name, and the computed-name route
+        (``getattr(gen, "gi_" + "frame")``) is refused by the runtime backstop. Reopens if a host
+        widens the allow-list.
       * ``str.format`` — ``"{0.__globals__[__builtins__]}".format(fn)`` does attribute+index traversal
         inside a runtime format string, invisible to both the static ``AllowedAttributesChecker`` and
         the runtime ``getattr`` wrapper (C-level getattr). Given any *Python* function in scope (e.g. a
@@ -250,22 +253,50 @@ class AllowedAttributesChecker(ast.NodeVisitor):
     """Reject any ``ast.Attribute`` access whose name is not in the ``allowed_attributes`` allow-list.
 
     ``allowed_attributes`` is a gitignore-style glob allow-list matched against the accessed
-    attribute name. The secure-by-default value is ``["*", "!__*"]`` — allow every attribute
-    *except* double-underscore-prefixed ones (gitignore negation), which is exactly the old
-    ``forbidden_attributes=["__*"]`` denylist inverted. ``["*"]`` allows everything (incl. dunders);
+    attribute name. The secure-by-default value is ``DEFAULT_ALLOWED_ATTRIBUTES`` — allow every
+    attribute *except* double-underscore-prefixed ones (gitignore negation) and the frame-bearing
+    interpreter surface. ``["*"]`` allows everything (incl. dunders);
     ``[]`` forbids all attribute access. This is the allow-only counterpart of the former
     ``ForbiddenAttributesChecker`` — the whole sandbox is now allow-lists (imports/attributes/files),
-    no denylists."""
+    no denylists.
 
-    def __init__(self, allowed_attributes: Sequence[str]) -> None:
+    ``allowed_write_attributes`` is the same kind of list applied to *binding* contexts
+    (``obj.x = ...``, ``del obj.x``) instead of reads; it defaults to ``allowed_attributes``, i.e. no
+    split unless a caller asks for one."""
+
+    # The two lists exist so the shipped default can re-admit `__init__`/`__name__`/`__qualname__`
+    # for reads (`super().__init__(...)` is ordinary Python) without making them settable — see
+    # DEFAULT_ALLOWED_WRITE_ATTRIBUTES for why the write side is worth denying separately. `n.ctx`
+    # was previously ignored entirely, which is what made the read-only audit of those three names
+    # wrong: the same spec drove `obj.attr = ...`.
+
+    def __init__(
+        self,
+        allowed_attributes: Sequence[str],
+        allowed_write_attributes: Sequence[str] | None = None,
+    ) -> None:
         self._spec = compile_allowlist(allowed_attributes)
+        self._write_spec = (
+            self._spec
+            if allowed_write_attributes is None
+            else compile_allowlist(allowed_write_attributes)
+        )
+
+    def _rejected(self, node: ast.Attribute) -> bool:
+        # ast.Store / ast.Del are the binding contexts; everything else (Load) is a read.
+        spec = (
+            self._write_spec
+            if isinstance(node.ctx, ast.Store | ast.Del)
+            else self._spec
+        )
+        return not is_allowed(spec, node.attr)
 
     def visit(self, node: ast.AST) -> None:
         found = sorted(
             {
                 n.attr
                 for n in ast.walk(node)
-                if isinstance(n, ast.Attribute) and not is_allowed(self._spec, n.attr)
+                if isinstance(n, ast.Attribute) and self._rejected(n)
             }
         )
         if found:
@@ -295,6 +326,7 @@ def secure_compile(
     allow_top_level_await: bool = False,
     allowed_imports: Sequence[str] = ("*",),
     allowed_attributes: Sequence[str] = ("*",),
+    allowed_write_attributes: Sequence[str] | None = None,
     cookie_jar: CookieJar | None = None,
     tree: ast.AST | None = None,
 ):
@@ -318,6 +350,10 @@ def secure_compile(
     config key → ``[]``), and **every** REPL call site passes those explicit effective values — so
     agent code is never compiled under the permissive default. The permissiveness is confined to
     direct, non-agent callers.
+
+    ``allowed_write_attributes`` policies binding contexts (``obj.x = ...``, ``del obj.x``)
+    separately from reads; ``None`` (the default) applies ``allowed_attributes`` to both, so a
+    caller that does not care about the distinction sees no change.
     """
     if tree is None:
         tree = ast.parse(src, filename=filename, mode=mode)
@@ -343,7 +379,9 @@ def secure_compile(
     # denylists, no "unrestricted" state. `["*"]` ⇒ allow all; `[]` ⇒ forbid all. Always run
     # (an empty allow-list is meaningful: deny-all); they precede PrintLastExprTransformer.
     policies.append(ImportPolicyChecker(allowed_imports))
-    policies.append(AllowedAttributesChecker(allowed_attributes))
+    policies.append(
+        AllowedAttributesChecker(allowed_attributes, allowed_write_attributes)
+    )
     # The native-return/raise sentinels are no longer protected from a bare `except:` by a compile
     # *ban* (the old RejectBareExceptChecker / reject_bare_except). Instead the REPL's
     # _ExceptGuardTransformer makes bare `except:` safe and force-guards the finish sentinel, using

@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from ..credentials import resolve_credential
 from .base import Choice, CompletionResponse, Message, MessageDict, Usage
 from .exceptions import (
     APIError,
@@ -27,8 +28,7 @@ from .exceptions import (
     UnsupportedParamsError,
     is_content_policy_violation,
 )
-from .llm import LLM, LLMResponse
-from .registry import register_llm
+from .llm import BaseLLM, LLMResponse
 
 # https://platform.openai.com/docs/api-reference/chat/create
 OPENAI_API_BASE = "https://api.openai.com/v1"
@@ -42,13 +42,23 @@ if not logger.handlers:
     logger.addHandler(_fh)
 
 
-@register_llm("openai")
-class OpenAILLM(LLM):
+# Dormant for v1: LiteLLM is the sole registered backend
+# (design/design_features/litellm_sole_backend_v1.md, #1082). This class stays in-tree and
+# importable — `OpenAILLM(...)` still works if constructed directly — but carries no
+# `@register_llm` tag, so `backend: openai` no longer resolves; reach OpenAI via `openai/…` on the
+# litellm backend. Revive the built-in (for the deferred lean-core split) by restoring the
+# `@register_llm("openai")` decorator (the class stays exported from `llm/__init__.py`).
+class OpenAILLM(BaseLLM):
     """The OpenAI chat-completions backend.
 
-    Reads ``OPENAI_API_KEY`` from the environment when no ``api_key`` is configured, so a
-    recorded config never has to carry the key.
+    Resolves its key from ``api_key``, else the ``OPENAI_API_KEY`` environment variable,
+    else the stored credential for ``"openai"`` in ``~/.jaz/credentials.json``.
     """
+
+    # Resolving the key at construction (see `__init__`) is what keeps it off a serialized
+    # config: `LLM.from_dict` rebuilds the backend from its authored params, and the key is
+    # read from the environment or the credentials store at that point — never carried in
+    # config, so it cannot leak into a persisted config record.
 
     def __init__(
         self,
@@ -61,7 +71,15 @@ class OpenAILLM(LLM):
         # `declared_init_keys`'s MRO walk despite the **kwargs, because they are declared on
         # `LLM.__init__` itself — which is what keeps `declared_init_keys` correct here.
         super().__init__(**retry)
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        # The stored credential is the LAST resort, below the environment variable: an
+        # exported key is the one-off override for a single run, while the stored file is the
+        # persistent baseline. Resolution happens here, at construction, rather than per
+        # request: `Agent.__init__` builds a fresh client per invoke, so a key stored mid-
+        # session is picked up by the next invoke without a restart, and the request path
+        # stays free of file I/O.
+        self.api_key = (
+            api_key or os.environ.get("OPENAI_API_KEY") or resolve_credential("openai")
+        )
         self.base_url = (
             base_url or os.environ.get("OPENAI_API_BASE") or OPENAI_API_BASE
         ).rstrip("/")
@@ -93,7 +111,8 @@ class OpenAILLM(LLM):
     ) -> CompletionResponse:
         if not self.api_key:
             raise AuthenticationError(
-                "OpenAI API key not found. Set OPENAI_API_KEY environment variable.",
+                "OpenAI API key not found. Set the OPENAI_API_KEY environment variable, "
+                "or store one from the jaz console with set_credential('openai').",
                 llm_provider="openai",
             )
 
@@ -182,7 +201,8 @@ class OpenAILLM(LLM):
     ) -> CompletionResponse:
         if not self.api_key:
             raise AuthenticationError(
-                "OpenAI API key not found. Set OPENAI_API_KEY environment variable.",
+                "OpenAI API key not found. Set the OPENAI_API_KEY environment variable, "
+                "or store one from the jaz console with set_credential('openai').",
                 llm_provider="openai",
             )
 
@@ -370,7 +390,6 @@ class OpenAILLM(LLM):
             usage = Usage(
                 prompt_tokens=usage_data.get("prompt_tokens", 0),
                 completion_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("total_tokens", 0),
                 cache_read_input_tokens=prompt_details.get("cached_tokens", 0),
                 extra=extra,
             )

@@ -9,22 +9,33 @@ straight through the ``allowed_attributes`` allow-list. These wrappers re-check 
 likewise misses computed names.
 
 ``allowed_attributes`` is a gitignore-style glob allow-list (see :mod:`.._glob_allowlist`): a name
-is permitted iff it matches. The secure default ``["*", "!__*"]`` allows every attribute except
-dunder-prefixed ones — the allow-only inverse of the old ``forbidden_attributes=["__*"]`` denylist.
+is permitted iff it matches. The secure default (``DEFAULT_ALLOWED_ATTRIBUTES``) allows every
+attribute except dunder-prefixed ones and the frame-bearing interpreter surface.
 
 Scope and limits — these backstops are **defense-in-depth, not a security boundary**; genuinely
 untrusted code needs OS/process isolation. They close the *builtin* ``getattr``-family routes but do
-**not** make the dunder policy airtight:
-1. The default allow-list is *dunder-scoped*, so the entire **non-dunder introspection surface is
-   un-policed** by both the static checker and these backstops — ``gi_frame``/``cr_frame``/``ag_frame``
-   (generators/coroutines), ``tb_frame``/``tb_next`` (tracebacks), ``f_globals``/``f_builtins``/
-   ``f_back``/``f_code`` (frames) are ordinary (non-dunder) names, so ``["*", "!__*"]`` *allows* them.
-   A real-module frame's ``f_globals["__builtins__"]`` is the real builtins table → reaches and calls
-   real ``eval``. Closing it would mean denylisting those names — the whack-a-mole the allow-list
-   design avoids — so it is deliberately left open.
-2. ``"{0.__globals__}".format(fn)`` reaches attributes at the C level via ``PyObject_GetAttr``
+**not** make the attribute policy airtight:
+1. ``"{0.__globals__}".format(fn)`` reaches attributes at the C level via ``PyObject_GetAttr``
    without ever calling the wrapped ``getattr`` (a known, un-closeable CPython vector; read-only).
+   This applies to the frame surface too: ``"{0.gi_frame}".format(gen)`` still *stringifies* a frame
+   the allow-list denies. It cannot hand back a callable, so the escape-to-execution stays closed,
+   but do not read the frame denials as making frames unobservable.
+2. **A name allow-list cannot police what an allowed name returns.** Any module object reachable
+   through an ordinary (non-dunder, non-frame) attribute of an object handed into the sandbox is a
+   full bypass of every axis — if an input ``h`` holds ``h.os``, then ``h.os.system(...)`` runs, no
+   import and no denied attribute involved. What a host passes in ``inputs`` is part of the sandbox
+   boundary, and nothing here can check it.
+3. A host that widens the allow-list (``["*"]``, or one that re-admits ``f_globals``/``gi_frame``)
+   reopens the escapes the default closes; these wrappers enforce the policy they are given, they do
+   not add one of their own.
 """
+# Limitation 1 used to read "the entire non-dunder introspection surface is un-policed ... so it is
+# deliberately left open": `["*", "!__*"]` allowed `gi_frame`/`f_back`/`f_globals`, and a frame walk
+# reached the real builtins table and the real `eval`. That is no longer true — the default now
+# denies the walkable frame surface by name (`_DENIED_FRAME_ATTRIBUTES` in `python_repl`, closing
+# #827), which is why the whack-a-mole objection was overruled: the names are enumerable and a
+# drift test re-derives them from the running interpreter. The inert scalars on those same objects
+# (`f_lineno`, `tb_lineno`, ...) stay allowed — they hand back nothing to walk.
 
 from __future__ import annotations
 

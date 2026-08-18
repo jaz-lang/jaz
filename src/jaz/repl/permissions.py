@@ -187,8 +187,15 @@ class REPLPermissionPolicy:
     # Attribute allow-list (gitignore globs) for the runtime getattr/hasattr/setattr/delattr/vars
     # backstops. Mirrors `allowed_attributes` / the static AllowedAttributesChecker. `[]` (default)
     # denies all attribute access; `["*"]` allows everything (the wrappers then no-op); the REPL's
-    # secure default is `["*", "!__*"]` (allow all except dunders).
+    # secure default is `DEFAULT_ALLOWED_ATTRIBUTES` (allow all except dunders and the frame-bearing
+    # interpreter surface).
     allowed_attributes: Sequence[str] = field(default_factory=tuple)
+    # The same allow-list applied to `setattr`/`delattr` only. `None` means "no split" — the read
+    # list governs writes too, which is the behaviour every caller had before the axes were
+    # separated. The REPL's secure default DOES split (see DEFAULT_ALLOWED_WRITE_ATTRIBUTES): the
+    # three dunders it re-admits are readable but not settable, so a re-admission made for
+    # `super().__init__(...)` cannot be turned into `type(host).__init__ = agent_fn`.
+    allowed_write_attributes: Sequence[str] | None = None
 
 
 def build_allowed_builtins(
@@ -223,9 +230,15 @@ def build_allowed_builtins(
     # of getattr/hasattr/setattr/delattr/vars, which the static checker cannot see. No-ops (the real
     # builtins) when the allow-list is trivially allow-all (`["*"]`/`["**"]`).
     patterns = policy.allowed_attributes
+    # `vars` reads, so it rides the read list; `setattr`/`delattr` bind, so they ride the write one.
+    write_patterns = (
+        patterns
+        if policy.allowed_write_attributes is None
+        else policy.allowed_write_attributes
+    )
     allowed_builtins["getattr"] = make_secure_getattr(patterns)
     allowed_builtins["hasattr"] = make_secure_hasattr(patterns)
-    allowed_builtins["setattr"] = make_secure_setattr(patterns)
-    allowed_builtins["delattr"] = make_secure_delattr(patterns)
+    allowed_builtins["setattr"] = make_secure_setattr(write_patterns)
+    allowed_builtins["delattr"] = make_secure_delattr(write_patterns)
     allowed_builtins["vars"] = make_secure_vars(patterns)
     return allowed_builtins

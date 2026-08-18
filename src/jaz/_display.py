@@ -14,7 +14,7 @@ separate from value-attached descriptions (see :mod:`jaz.descriptions`):
 ``jaz.Display(value, text)`` wraps a value for a single call: ``text`` may be a
 ``str`` (render that), ``None`` (hide the input from the prompt header), or a
 ``Callable[[object], str]`` (compute the text lazily). The directive plugs into the
-same ``__jaz_get__`` / ``__jaz_description__`` protocol as ``jaz.Library``: the REPL
+same ``__jaz_get__`` / ``__jaz_description__`` protocol as ``jaz.library.Library``: the REPL
 binds ``__jaz_get__()`` (the real ``value``), and the prompt builder reads its
 description via the normal :func:`jaz.get_description` lookup — so there is a single
 substitution path for every metadata wrapper, not a parallel one for :class:`Display`.
@@ -66,8 +66,8 @@ class Display:
 
     Construct it inline as an input::
 
-        jaz.invoke(task=prompt, context=jaz.Display(context, None))   # hide it
-        jaz.invoke(task=prompt, table=jaz.Display(table, "Q1 sales")) # relabel it
+        invoke(task=prompt, context=jaz.Display(context, None))   # hide it
+        invoke(task=prompt, table=jaz.Display(table, "Q1 sales")) # relabel it
 
     ``text`` may be:
 

@@ -1,21 +1,22 @@
 """HookDispatcher orchestrates hooks and composes their effects into execution contexts."""
 
-import json
 import logging
 from contextlib import contextmanager
-from dataclasses import fields, is_dataclass
-from typing import TYPE_CHECKING, Any, ClassVar
-from weakref import WeakValueDictionary
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn
 
 from jaz.exceptions import (
-    AbortError,
     BlackboardSeedError,
+    BlackboardWriteConflictError,
+    FatalError,
     HookActivationError,
-    OverrideConflictError,
+    InvalidEffectError,
+    LLMResponseConflictError,
     REPLInputConflictError,
     SandboxKeyError,
     _JazInternalError,
 )
+from jaz.repl.types import Raise, Return
 
 from .base import Event
 from .blackboard import Blackboard
@@ -31,62 +32,55 @@ from .effects import (
     DropMessages,
     DropVariables,
     Effect,
-    ModifyResult,
-    OverrideResponse,
-    OverrideResult,
+    ModifyExecResult,
+    SupplyExecResult,
+    SupplyLLMResponse,
+    _combine_exceptions,
+    _resolve_edit_index,
     resolve_modify_results,
-    resolve_override_results,
+    resolve_supply_results,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from jaz.config import Config
+    from jaz.llm import MessageDict
 from .events import (
+    InvokeComplete,
+    InvokeCompleteContext,
     InvokeContext,
     InvokeEnter,
     InvokeExit,
-    InvokeExitContext,
+    InvokeSend,
+    InvokeSendContext,
     InvokeSpan,
+    LLMQueryComplete,
+    LLMQueryCompleteContext,
     LLMQueryContext,
     LLMQueryEnter,
     LLMQueryExit,
     LLMQueryRetry,
     LLMQueryRetryContext,
+    LLMQuerySend,
+    LLMQuerySendContext,
     LLMQuerySpan,
+    MessageAddRecord,
+    MessageDropRecord,
+    REPLExecComplete,
+    REPLExecCompleteContext,
     REPLExecContext,
     REPLExecEnter,
     REPLExecExit,
-    REPLExecExitContext,
+    REPLExecSend,
+    REPLExecSendContext,
     REPLExecSpan,
+    ResolvedMessageEdits,
 )
+from .events.base import Aborted, Completed, Failed
+from .events.llm_query import MessageEdits
 
 logger = logging.getLogger(__name__)
-
-
-# Old -> current ``qualified_name`` for renamed hook classes.
-#
-# ``Hook.to_dict`` stamps ``qualified_name`` into artifacts that OUTLIVE the code that
-# wrote them: ATIF traces (the proposed canonical replay/cost-reconstruction format,
-# #813), conversation-history records, OTel span attributes, and the log lines
-# ``WorkflowReplay`` parses back (#712). Renaming a hook class therefore orphans
-# every run recorded before the rename — ``from_dict`` raises "Unknown hook", and any
-# tooling that matches the string just silently finds nothing.
-#
-# Cost of keeping an entry is one dict line; cost of omitting one is unreadable history.
-# Add an entry whenever a hook class is renamed.
-_LEGACY_HOOK_QUALNAMES: dict[str, str] = {
-    "jaz.hooks.builtin.iteration_limit.IterationLimitHook": "jaz.hooks.builtin.iteration_limit.IterationLimit",
-    "jaz.hooks.builtin.budget_forcing.BudgetForcingHook": "jaz.hooks.builtin.budget_forcing.BudgetForcing",
-    "jaz.hooks.builtin.compaction.CompactionHook": "jaz.hooks.builtin.compaction.Compaction",
-    "jaz.hooks.builtin.context_window.ContextWindowHook": "jaz.hooks.builtin.context_window.ContextWindow",
-    "jaz.hooks.builtin.conversation_history.ConversationHistoryHook": "jaz.hooks.builtin.conversation_history.ConversationHistory",
-    "jaz.hooks.builtin.replay.ReplayHook": "jaz.hooks.builtin.replay.Replay",
-    "jaz.hooks.builtin.workflow_replay.WorkflowReplayHook": "jaz.hooks.builtin.workflow_replay.WorkflowReplay",
-    "jaz.hooks.builtin.sliding_window.SlidingWindowHook": "jaz.hooks.builtin.sliding_window.SlidingWindow",
-    "jaz.hooks.builtin.atif_trace.ATIFTraceHook": "jaz.hooks.builtin.atif_trace.ATIFTrace",
-    "jaz.hooks.builtin.otel_tracing.OTelTracingHook": "jaz.hooks.builtin.otel_tracing.OTelTracing",
-    "jaz.hooks.builtin.jaeger_tracing.JaegerTracingHook": "jaz.hooks.builtin.jaeger_tracing.JaegerTracing",
-    "jaz.hooks.builtin.langfuse_tracing.LangfuseTracingHook": "jaz.hooks.builtin.langfuse_tracing.LangfuseTracing",
-}
 
 
 def _coalesce_add(
@@ -140,49 +134,18 @@ def _values_conflict(existing: object, incoming: object) -> bool:
         return True
 
 
-def _is_json_safe(value: object) -> bool:
-    """Whether ``value`` survives ``json.dumps`` — the bar for a serialized hook param.
-
-    Used by the generic dataclass ``to_dict`` to decide, per field, whether a value can be
-    recorded as-is. A field that isn't JSON-safe and has no ``metadata["to_dict"]`` encoder is
-    omitted (and round-trips to its constructor default) rather than crashing serialization.
-
-    This is a *predicate*, NOT a transform: ``to_dict`` records the original Python value, not
-    ``json.dumps(value)``. So ``Hook.to_dict``/``Hook.from_dict`` are dict↔object (no JSON *string*
-    on either side — that boundary, ``json.dumps``/``json.loads``, belongs to whoever persists the
-    dict), and ``from_dict(to_dict(h))`` in memory is exactly symmetric: a value is stored and read
-    back as the same object (e.g. a tuple stays a tuple). The one caveat is inherent to JSON, not an
-    asymmetry here: a value that is json-safe but not a native JSON *type* (a tuple, an int-keyed
-    dict) is retyped by a round-trip *through a JSON string* (tuple→list, int keys→str) — so a
-    persisted round-trip can differ from the in-memory one. No built-in hook field hits this (all
-    scalars); a field needing exact persisted round-trip should declare a ``metadata`` encoder/
-    decoder pair, which controls both directions.
-    """
-    try:
-        json.dumps(value)
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
-def _log_incomplete_span(exceptional: bool, *, debug_msg: str, error_msg: str) -> None:
-    """Log a span that closed without ``complete()``, at the level its cause warrants.
+def _log_incomplete_span(error_msg: str) -> None:
+    """Log the loud ERROR for a span whose body exited *cleanly* without ``complete()``.
 
     Shared by all three ``span_*`` context managers so a fourth span can't grow its own
-    hand-rolled copy of this debug-vs-error split (each still passes its own messages).
-
-    An *exceptional* exit — the span body unwound on an in-flight exception (LLM/provider
-    failure, ``KeyboardInterrupt``) — is expected, not a bug: the caller never had a result
-    to ``complete()`` with, so the loud "you must call complete()" text points at the wrong
-    culprit (observed live: Ctrl-C in the interactive console printed it mid-interrupt). It
-    is logged at debug and the propagating exception is left to be the real signal. A
-    *clean* exit that simply forgot to ``complete()`` is the genuine programming error and
-    stays at error.
+    hand-rolled copy (each still passes its own message). This is the genuine
+    forgot-to-``complete()`` programming error — an early ``return``/``break`` out of the
+    ``with`` body that skipped the unconditional trailing ``complete()`` — and it stays a
+    loud tripwire; synthesizing a close would mask the bug. An *exceptional* unwind never
+    reaches here: the span CMs' abnormal arm closes the span with a ``Failed``/``Aborted``
+    outcome instead (the former debug arm of this helper, deleted as unreachable).
     """
-    if exceptional:
-        logger.debug(debug_msg)
-    else:
-        logger.error(error_msg)
+    logger.error(error_msg)
 
 
 class Hook:
@@ -190,13 +153,16 @@ class Hook:
 
     Every event has a handler named after it (:class:`LLMQueryEnter` → ``on_llm_query_enter``).
     A handler observes the event and returns a list of effects; returning effects is the only
-    way a hook influences the run, and which effects are honored depends on the event — each
-    event class documents its own set. A cross-cutting observer (logging, tracing) overrides
+    way a hook influences the run, and which effects are accepted depends on the event — each
+    event class documents its own set, and an effect outside it raises
+    :class:`~jaz.exceptions.InvalidEffectError` rather than being silently dropped. A
+    cross-cutting observer (logging, tracing) overrides
     ``on_any`` instead, which runs *in addition to* the matched typed handler, so the two
     compose.
 
     There are two ways to activate a hook, and **they differ in whether nested invokes see
     it.** A hook activated either way must not be activated the other way at the same time.
+    (Snippets below assume ``from jaz import invoke``.)
 
     ``with`` — propagating::
 
@@ -227,18 +193,19 @@ class Hook:
             invoke(...)
 
     Examples:
+        from jaz import invoke
         from jaz.hooks import Hook
         from jaz.hooks.effects import Abort, Effect
         from jaz.hooks.events import LLMQueryEnter
 
         class StopAfterFiftyTurns(Hook):
             def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
-                if event.iteration > 50:
+                if event.iteration >= 50:  # iterations are 0-based
                     return [Abort(error=RuntimeError("Limit exceeded"))]
                 return []
 
         with StopAfterFiftyTurns():
-            result = invoke(ReturnType(str), task="task")
+            result = invoke(task="task")
     """
 
     # Maintainers: ``hooks/README.md`` is the contributor guide — design philosophy, the
@@ -257,27 +224,6 @@ class Hook:
     # that were never in this API. Restore the link once that page is rewritten; until then it
     # would send readers somewhere strictly worse than this docstring.
 
-    # Auto-populated registry of every Hook subclass, keyed by fully-qualified name for
-    # reconstruction by :meth:`from_dict` (#727 follow-up). ``__init_subclass__`` records each class.
-    # The registry is only ever *matched* against a serialized ``qualified_name`` — it NEVER imports
-    # by name (arbitrary import-by-name is a footgun), so a class must already be imported to be
-    # resolvable. Built-in hooks are covered because importing ``jaz.hooks`` imports
-    # ``jaz.hooks.builtin`` (which imports all of them); a custom hook is resolvable once its module
-    # has been imported. Resolution is by qualified name ONLY — the short ``class`` name that
-    # ``to_dict`` also emits is an informational label, not a reconstruction key (every dict this
-    # code produces carries ``qualified_name``, so there is no short-name fallback to maintain).
-    #
-    # A ``WeakValueDictionary`` so a subclass that is no longer referenced elsewhere (one defined
-    # inside a function or a test) is evicted when garbage-collected rather than pinned for the life
-    # of the process; module-level hook classes are held alive by their module and stay registered.
-    _registry_by_qualname: ClassVar["WeakValueDictionary[str, type[Hook]]"] = (
-        WeakValueDictionary()
-    )
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        Hook._registry_by_qualname[f"{cls.__module__}.{cls.__qualname__}"] = cls
-
     def _dispatch_event(self, event: Event) -> list[Effect]:
         """The framework event router: dispatch an event to its typed ``on_<event>``
         handler (the override points below).
@@ -289,7 +235,7 @@ class Hook:
         ``isinstance``/``match`` boilerplate and no "remember to ``return []``" footgun.
 
         For a genuinely *cross-cutting* observer that treats every event uniformly (loggers,
-        tracing), override :meth:`on_any` instead: the dispatcher calls it *in addition to*
+        tracing), override :meth:`~Hook.on_any` instead: the dispatcher calls it *in addition to*
         the matched typed handler, so it composes with — rather than replaces — the
         per-event dispatch, and a hook may use both.
 
@@ -298,14 +244,26 @@ class Hook:
         match event:
             case InvokeEnter():
                 return self.on_invoke_enter(event)
+            case InvokeSend():
+                return self.on_invoke_send(event)
+            case InvokeComplete():
+                return self.on_invoke_complete(event)
             case InvokeExit():
                 return self.on_invoke_exit(event)
             case REPLExecEnter():
                 return self.on_repl_exec_enter(event)
+            case REPLExecSend():
+                return self.on_repl_exec_send(event)
+            case REPLExecComplete():
+                return self.on_repl_exec_complete(event)
             case REPLExecExit():
                 return self.on_repl_exec_exit(event)
             case LLMQueryEnter():
                 return self.on_llm_query_enter(event)
+            case LLMQuerySend():
+                return self.on_llm_query_send(event)
+            case LLMQueryComplete():
+                return self.on_llm_query_complete(event)
             case LLMQueryExit():
                 return self.on_llm_query_exit(event)
             case LLMQueryRetry():
@@ -333,24 +291,48 @@ class Hook:
         """An invoke is starting, before any LLM query. Default no-op."""
         return []
 
+    def on_invoke_send(self, event: InvokeSend) -> list[Effect]:
+        """An invoke's input set has committed (post add/drop). Default no-op."""
+        return []
+
+    def on_invoke_complete(self, event: InvokeComplete) -> list[Effect]:
+        """An invoke's raw terminal result exists (transform boundary). Default no-op."""
+        return []
+
     def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:
-        """An invoke has finished (terminal result produced). Default no-op."""
+        """An invoke's span has closed (see ``event.outcome``). Default no-op."""
         return []
 
     def on_repl_exec_enter(self, event: REPLExecEnter) -> list[Effect]:
         """REPL code is about to execute (parsed code available). Default no-op."""
         return []
 
+    def on_repl_exec_send(self, event: REPLExecSend) -> list[Effect]:
+        """An execution's input has committed (namespace deltas applied). Default no-op."""
+        return []
+
+    def on_repl_exec_complete(self, event: REPLExecComplete) -> list[Effect]:
+        """An execution's raw result exists (transform boundary). Default no-op."""
+        return []
+
     def on_repl_exec_exit(self, event: REPLExecExit) -> list[Effect]:
-        """REPL code has executed (result available, at effect composition). Default no-op."""
+        """A REPL execution's span has closed (see ``event.outcome``). Default no-op."""
         return []
 
     def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
         """An LLM query is about to be issued. Default no-op."""
         return []
 
+    def on_llm_query_send(self, event: LLMQuerySend) -> list[Effect]:
+        """A query's input has committed (the post-edit shown list). Default no-op."""
+        return []
+
+    def on_llm_query_complete(self, event: LLMQueryComplete) -> list[Effect]:
+        """A query's raw response exists (response control boundary). Default no-op."""
+        return []
+
     def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
-        """An LLM query has returned. Default no-op."""
+        """An LLM query's span has closed (see ``event.outcome``). Default no-op."""
         return []
 
     def on_llm_query_retry(self, event: LLMQueryRetry) -> list[Effect]:
@@ -387,6 +369,49 @@ class Hook:
     #: intent and drives producer-side linting — it does not require a producer to exist.
     blackboard_consumes: ClassVar[dict[str, str]] = {}
 
+    # Static write-authority declarations (see ``HookDispatcher._reject_declared_write_conflicts``).
+    # Each of the effects below is *slot-scoped* with a single authority per slot: the turn for
+    # ``SupplyLLMResponse``, the key/name for the others. Two active hooks declaring the same slot
+    # is an irresolvable, order-dependent authority conflict, so it is rejected at seed time (before
+    # the first ``InvokeEnter``) rather than mid-run. These are OPT-IN and default-empty: a hook that
+    # writes a slot WITHOUT declaring it is not seen by the seed-time check but is still caught
+    # dynamically by the same conflict error at composition time.
+    #
+    # The seed-time predicate is deliberately STRICTER than the runtime one, not merely earlier. At
+    # runtime, two writes to one slot with *identical values* COALESCE and only *divergent* values
+    # conflict (``_coalesce_add`` / ``_values_conflict`` for AddInputs/AddVariables, the same-key
+    # coalesce in ``blackboard.py`` for BlackboardWrite, the ``supplied != response_effect`` guard
+    # for SupplyLLMResponse). This check instead rejects any two *declarers* of a slot regardless of
+    # value — a coalescing duplicate is still two authorities for one slot, which under "one
+    # authority per slot" is a config smell worth surfacing (the same executive call made for two
+    # identical ``Replay``s: a pointless duplicate should fail loudly, not silently coalesce). So the
+    # runtime check remains the looser backstop for an UNDECLARED write, while a DECLARED
+    # identical-value pair is intentionally rejected here even though runtime would have coalesced
+    # it. Consequence for a defensive author: adding a declaration to a composition that previously
+    # coalesced turns it into a seed error. (Same-slot always rejects — there is no
+    # reducer/accumulator carve-out in this design.)
+
+    #: Whether this hook may emit :class:`~jaz.hooks.effects.SupplyLLMResponse` (claim authorship
+    #: of the model's turn). ``SupplyLLMResponse`` is a *sole-authority* effect — one response per
+    #: turn — so two active hooks both declaring this are rejected at activation with
+    #: :class:`~jaz.exceptions.LLMResponseConflictError`.
+    supplies_llm_response: ClassVar[bool] = False
+
+    #: Input keys this hook may bind via :class:`~jaz.hooks.effects.AddInputs`. Two active hooks
+    #: declaring the same key are rejected at activation with
+    #: :class:`~jaz.exceptions.REPLInputConflictError`.
+    adds_inputs: ClassVar[frozenset[str]] = frozenset()
+
+    #: REPL namespace names this hook may bind via :class:`~jaz.hooks.effects.AddVariables`. Two
+    #: active hooks declaring the same name are rejected at activation with
+    #: :class:`~jaz.exceptions.REPLInputConflictError`.
+    adds_variables: ClassVar[frozenset[str]] = frozenset()
+
+    #: Blackboard keys this hook may write via :class:`~jaz.hooks.effects.BlackboardWrite`. Two
+    #: active hooks declaring the same key are rejected at activation with
+    #: :class:`~jaz.exceptions.BlackboardWriteConflictError`.
+    writes_blackboard: ClassVar[frozenset[str]] = frozenset()
+
     def blackboard_seed(self) -> dict[str, object]:
         """Return this hook's contribution to the blackboard's generation 0.
 
@@ -400,166 +425,25 @@ class Hook:
         """
         return {}
 
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize this hook to a JSON-safe identity + parameters dict.
-
-        Named ``to_dict`` (a plain hook→dict serializer, like ``InvokeNode.to_dict``) — this is
-        **not** related to Python's *descriptor protocol*.
-        Two uses:
-
-        - **Observability**: the observability hooks serialize each active hook via this at their
-          own edge (at :class:`InvokeEnter`) to record *what governance applied here* into their
-          trace. ``Event.hooks`` itself carries the LIVE hook objects, not pre-serialized dicts,
-          so serialization happens at the log boundary — here — not on the event field.
-        - **Round-trip partner**: the serialized form is what :meth:`from_dict` reconstructs, by
-          matching ``class`` (or ``qualified_name``) against the subclass registry (never imports
-          ``qualified_name`` — import-by-name is a footgun). ``Config.baseline_hooks`` was the live
-          caller of that reconstruction until #959 removed it; see :meth:`from_dict` for why the
-          round-trip is kept regardless.
-
-        Returns ``{"class": <short name>, "qualified_name": <module.qualname>, "params": {...}}``.
-        ``class`` is the reconstruction key (kept short for back-compat with existing serialized
-        configs); ``qualified_name`` disambiguates same-named hooks across modules.
-
-        **Params are derived automatically for a hook that is a dataclass** — the common,
-        boilerplate-free path (a hook opts in simply by being ``@dataclass(eq=False)``). Each
-        ``init`` field is recorded: a field with a ``metadata["to_dict"]`` encoder is passed through
-        it (a ``None`` result *omits* the key — how a non-round-trippable value falls back to its
-        default, e.g. a callable ``must_exit_warning``); an unadorned JSON-safe value is recorded
-        as-is; a non-JSON-safe value with no encoder is omitted (it will round-trip to its
-        constructor default). ``field(init=False)`` runtime state is skipped. A *non-dataclass* hook
-        falls back to :meth:`_to_dict_params` (the explicit escape hatch, still supported).
-
-        Recomputed on every call — deliberately **NOT** memoized. The dict is a pure function of the
-        construction params only *if* those params are never mutated after ``__init__``, which the
-        base does not enforce (nothing freezes ``self.max_iterations`` etc.); a cache would go
-        silently stale the moment a caller mutated a param. It is cheap and no longer on any hot path
-        — ``Event.hooks`` is the live set stamped as a plain reference tuple, so only the
-        :class:`InvokeEnter`-time observability consumers call this.
-        """
-        params = (
-            self._dataclass_params() if is_dataclass(self) else self._to_dict_params()
-        )
-        return {
-            "class": type(self).__name__,
-            "qualified_name": f"{type(self).__module__}.{type(self).__qualname__}",
-            "params": params,
-        }
-
-    def _dataclass_params(self) -> dict[str, Any]:
-        """Derive serialized params from this hook's dataclass fields (see :meth:`to_dict`)."""
-        params: dict[str, Any] = {}
-        for f in fields(self):  # type: ignore[arg-type]  # guarded by is_dataclass at the call site
-            if not f.init:
-                continue  # field(init=False) = runtime state, not a construction param
-            value = getattr(self, f.name)
-            encoder = f.metadata.get("to_dict")
-            if encoder is not None:
-                encoded = encoder(value)
-                if encoded is None:
-                    continue  # encoder signals "omit" (value not round-trippable → default)
-                params[f.name] = encoded
-            elif _is_json_safe(value):
-                params[f.name] = value
-            else:
-                # No encoder and not JSON-safe: omit rather than crash. It round-trips to the
-                # field's constructor default. A hook that needs the value preserved declares a
-                # ``metadata={"to_dict": ..., "from_dict": ...}`` encoder pair on the field.
-                logger.debug(
-                    "Hook %s: omitting non-JSON-safe field %r from to_dict() (no encoder)",
-                    type(self).__name__,
-                    f.name,
-                )
-        return params
-
-    def _to_dict_params(self) -> dict[str, Any]:
-        """Escape-hatch params for a NON-dataclass hook's :meth:`to_dict` (default: none).
-
-        Only consulted when the hook is not a dataclass (a dataclass derives its params from fields
-        automatically). Override to declare the constructor arguments worth recording — JSON-safe
-        values only, and only *frozen* params (not mutable runtime state). Prefer making the hook a
-        ``@dataclass(eq=False)`` instead, which gets this for free.
-        """
-        return {}
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Hook":
-        """Reconstruct a hook from its :meth:`to_dict` form.
-
-        Resolves ``d["qualified_name"]`` against the subclass registry — the class must already be
-        imported (never imported by name). ``qualified_name`` is required (every dict :meth:`to_dict`
-        produces carries it; the short ``class`` name is informational only). Reads the params from
-        ``d["params"]`` (a missing ``params`` is treated as no params). For a dataclass target, each
-        field's ``metadata["from_dict"]`` decoder is applied to its param before construction (the
-        symmetric partner of the ``to_dict`` encoder — e.g. ``must_exit_warning``). Then
-        ``target(**params)`` builds the instance.
-
-        Raises ``ValueError`` for a missing/unknown ``qualified_name`` or params the constructor
-        rejects.
-
-        **No in-tree caller — kept deliberately.** The only call site was ``Config._validate``'s
-        ``baseline_hooks`` branch, deleted when that field was removed. Even before then the
-        branch was unreachable in practice: the eval harness unconditionally overwrote
-        ``kwargs["baseline_hooks"]`` with freshly-constructed :class:`Hook` instances before
-        ``jaz.configure()``, so validation always took the ``isinstance(entry, Hook)`` path
-        and never the serialized-dict one.
-
-        Maintainer's call (2026-07-27), recorded because it is not recoverable from the code:
-        **``from_dict`` stays for exactly as long as ``to_dict`` exists.** The two are one
-        contract, not two functions — ``to_dict`` writes hook identity + params into artifacts
-        that outlive the process (ATIF traces, conversation-history records, OTel span
-        attributes, replayed log lines), and a serialization format nothing can read back is a
-        write-only format. The alternative considered and rejected was deleting it as dead code
-        under the YAGNI pass that removed ``max_repl_invoke_calls`` and ``baseline_hooks``: that
-        would strand every already-written trace and quietly convert ``to_dict`` from a
-        round-trippable record into a debug string. So: if ``to_dict`` is ever dropped, drop this
-        with it; while ``to_dict`` lives, "no callers" is not grounds for removal. The same
-        reasoning is why :data:`_LEGACY_HOOK_QUALNAMES` exists — a rename must not orphan
-        artifacts this method is meant to be able to read.
-        """
-        name = d.get("class")
-        target = cls._resolve_registered(name, d.get("qualified_name"))
-        params = dict(d.get("params", {}))
-        if is_dataclass(target):
-            field_meta = {f.name: f.metadata for f in fields(target)}
-            for key in list(params):
-                meta = field_meta.get(key)
-                decoder = meta.get("from_dict") if meta is not None else None
-                if decoder is not None:
-                    params[key] = decoder(params[key])
-        try:
-            return target(**params)
-        except TypeError as e:
-            raise ValueError(f"Invalid params for hook {name!r}: {e}") from e
-
-    @classmethod
-    def _resolve_registered(
-        cls, name: str | None, qualified_name: str | None
-    ) -> type["Hook"]:
-        """Map a serialized ``qualified_name`` to a registered subclass (no import).
-
-        ``name`` (the short ``class``) is used only for clearer error messages.
-        """
-        if qualified_name is None:
-            raise ValueError(
-                f"serialized hook dict (class {name!r}) is missing 'qualified_name', which is "
-                f"required to reconstruct it."
-            )
-        target = Hook._registry_by_qualname.get(qualified_name)
-        if target is None:
-            # Renamed since the trace was written? `to_dict` stamps the class name into
-            # durable artifacts (ATIF traces, conversation-history records, OTel span
-            # attributes, log lines), so a rename silently orphans every run recorded
-            # before it. Consulting the alias map keeps old runs reconstructible; add an
-            # entry here whenever a hook class is renamed.
-            renamed = _LEGACY_HOOK_QUALNAMES.get(qualified_name)
-            if renamed is not None:
-                target = Hook._registry_by_qualname.get(renamed)
-        if target is None:
-            raise ValueError(
-                f"Unknown hook {qualified_name!r}. Is its module imported?"
-            )
-        return target
+    def __repr__(self) -> str:
+        """``ClassName()`` — override to show the configuration this hook applies."""
+        # Overriding the object default is not cosmetic. Observability consumers render the
+        # active hook set with `repr()`, and `object.__repr__` embeds the instance's memory
+        # address, so the default would stamp `<...BudgetPool object at 0x10331f380>` into every
+        # trace, log line and span attribute — noise that also differs run to run, defeating any
+        # diff of two traces. The bare class name is stable and says the one thing every hook can
+        # say honestly; a hook whose configuration is worth recording says more by overriding.
+        #
+        # Known loss against the serialized record this replaced: it carried a `qualified_name`,
+        # so two hooks with the same class name from different modules — a user's own
+        # `Compaction`, or one subclassed inside a test — were distinguishable in a trace and are
+        # not now. Deliberate: module-qualifying every hook would make every built-in's string
+        # longer for a collision that is rare, and a hook that expects to collide can qualify
+        # itself in its own override. Reach for that before concluding a trace is lying to you.
+        #
+        # A dataclass hook needs nothing: @dataclass generates its own __repr__ on the subclass,
+        # which wins over this by MRO and already lists the fields.
+        return f"{type(self).__name__}()"
 
     def setup(self) -> None:  # noqa: B027 - optional override point, intentionally a no-op default
         """Acquire resources for this hook (open files, start providers, ...).
@@ -646,13 +530,15 @@ class HookDispatcher:
     2. Emitting events to active hooks
     3. Collecting effects from all hooks
     4. Composing effects into a typed ExecutionContext with explicit rules
-    5. Resolving supply/transform/terminate effects (OverrideResult / ModifyResult / Abort) at REPL execution
+    5. Resolving supply/transform/abort effects (SupplyExecResult / ModifyExecResult / Abort) at REPL execution
     6. Managing span lifecycle for enter/exit event pairs
 
     Design principles:
     - Hooks are called in registration order (first registered, first called)
     - Composition rules are explicit and documented
-    - Invalid effects for an event are ignored with a warning
+    - An effect returned at an event that does not accept it raises
+      :class:`~jaz.exceptions.InvalidEffectError` (out-of-stage effects are hook bugs
+      and fail loudly, never silently no-op)
     - Each event type has a specific ExecutionContext type
 
     Two channels of hooks
@@ -753,8 +639,6 @@ class HookDispatcher:
       `_invoke()` still constructs its own Agent + dispatcher, so isolation
       holds. The only shared state across the parallel children would be
       the propagating contextvar, which is the desired behavior.
-
-    TODO: Add setting to change how dispatcher handles invalid effects (warn vs. error)
     """
 
     def __init__(self, local_hooks: tuple["Hook", ...] = ()) -> None:
@@ -774,6 +658,17 @@ class HookDispatcher:
         # Orphan keys already warned about this invoke — lint each at most once (writes
         # recur per generation; seeds run once). Per-invoke, since the dispatcher is.
         self._warned_orphan_keys: set[str] = set()
+        # The exception objects THIS dispatcher's span CMs raised while resolving an
+        # ``Abort`` effect, recorded by identity. This is the abort-classification record
+        # (see ``_unwind_outcome``): the dispatcher is per-invoke state (Agent constructs
+        # one per invoke), so "is this unwinding exception my own invoke's abort?" is a
+        # plain identity test against this list — no global registry, no exception
+        # wrapping/marking that would perturb the propagating object. On the shared
+        # ``get_dispatcher()`` singleton the record spans whatever spans are opened on it;
+        # that singleton is test/README-only surface (see the class docstring's
+        # "Limitation worth knowing"). Bounded in practice: an invoke resolves at most a
+        # handful of aborts before it ends, and the list dies with the dispatcher.
+        self._own_abort_exceptions: list[BaseException] = []
 
     def _active_hooks(self) -> list[Hook]:
         """The hooks active for an invoke, in dispatch order (baseline, then
@@ -797,6 +692,72 @@ class HookDispatcher:
         local = list(self._local_hooks)
         return propagating + local
 
+    def _reject_declared_write_conflicts(self, active: list[Hook]) -> None:
+        """Reject, before the first :class:`InvokeEnter`, two active hooks that statically declare
+        writing the same sole-authority slot.
+
+        Each of ``SupplyLLMResponse`` / ``AddInputs`` / ``AddVariables`` / ``BlackboardWrite`` has a
+        single authority per slot — the turn for the response, the key/name for the others — so two
+        hooks declaring the same slot is an irresolvable, order-dependent conflict, surfaced here at
+        turn 0 instead of mid-run. Keyed on the hooks' static declarations
+        (``supplies_llm_response`` / ``adds_inputs`` / ``adds_variables`` / ``writes_blackboard``);
+        a hook that writes a slot WITHOUT declaring it is invisible here and is still caught
+        dynamically by the *same* conflict error at composition time. This is deliberately
+        *stricter* than the runtime check, not merely earlier: runtime coalesces two writes carrying
+        identical values and conflicts only on divergent ones, whereas this rejects any two declarers
+        of a slot regardless of value (see the class-level note on ``Hook.supplies_llm_response`` for
+        why). Raised errors reuse the runtime conflict types, so ``except REPLInputConflictError``
+        (etc.) catches both the early and the late form.
+        """
+        # SupplyLLMResponse — one sole authority for the whole turn (no key).
+        responders = [type(h).__name__ for h in active if h.supplies_llm_response]
+        if len(responders) > 1:
+            raise LLMResponseConflictError(
+                f"{len(responders)} active hooks ({', '.join(responders)}) each declare they may "
+                "supply the LLM response (supplies_llm_response=True). SupplyLLMResponse is a "
+                "sole-authority effect — at most one hook may author the model's turn — so this is "
+                "rejected at activation. Activate only one."
+            )
+        # Key-scoped effects — one authority per key/name.
+        self._reject_key_authority_collision(
+            active, "adds_inputs", REPLInputConflictError, "AddInputs input key"
+        )
+        self._reject_key_authority_collision(
+            active,
+            "adds_variables",
+            REPLInputConflictError,
+            "AddVariables namespace name",
+        )
+        self._reject_key_authority_collision(
+            active,
+            "writes_blackboard",
+            BlackboardWriteConflictError,
+            "BlackboardWrite key",
+        )
+
+    @staticmethod
+    def _reject_key_authority_collision(
+        active: list[Hook],
+        attr: str,
+        error_cls: type[Exception],
+        label: str,
+    ) -> None:
+        """Raise ``error_cls`` if two active hooks declare (via the class attr ``attr``) writing the
+        same slot. Two instances of one class declaring the same key still collide — they are two
+        authorities for one slot — which is why the message lists class names, not identities."""
+        declarers_by_slot: dict[str, list[str]] = {}
+        for hook in active:
+            for slot in getattr(hook, attr):
+                declarers_by_slot.setdefault(slot, []).append(type(hook).__name__)
+        for slot, declarers in declarers_by_slot.items():
+            if len(declarers) > 1:
+                raise error_cls(
+                    f"{len(declarers)} active hooks ({', '.join(declarers)}) each declare (via "
+                    f"{attr}) that they write the same {label} {slot!r}. This is a sole-authority "
+                    "slot — at most one hook may write it — so it is rejected at activation. "
+                    "Have one hook own the slot, or activate only one."
+                )
+
     def seed_blackboard(
         self, config: "Config", caller_metadata: dict[str, object] | None = None
     ) -> Blackboard:
@@ -818,6 +779,8 @@ class HookDispatcher:
         in :meth:`emit`.
         """
         active = self._active_hooks()
+        # Reject statically-declared write-authority collisions before the first InvokeEnter.
+        self._reject_declared_write_conflicts(active)
         accepted = {k for h in active for k in h.blackboard_consumes}
         # Snapshot so emit() lints writes against the same consumes set (see __init__).
         self._accepted_keys = accepted
@@ -898,6 +861,12 @@ class HookDispatcher:
             *after* the loop — so they are invisible to this event's reads and
             surface to the next event (the next generation). This is what keeps
             producer/consumer hooks order-independent.
+
+        Timestamp stamping:
+            ``event.timestamp`` is set here to the emission time, immediately before
+            the hook loop — a pre-set value (a hand-built event's construction-time
+            default included) is overwritten, so a direct ``emit()`` caller must not
+            expect its own stamp to survive.
         """
         # Stamp the invoke's live board onto the event (overriding its empty default)
         # so reads during this event see the current generation. Event is frozen (hooks must
@@ -906,15 +875,20 @@ class HookDispatcher:
         if self._blackboard is not None:
             object.__setattr__(event, "blackboard", self._blackboard)
 
+        # Stamp the emission time — the one timing field every event carries (see
+        # Event.timestamp: emission, not construction, so the stamp is taken here, the
+        # single place every event passes through immediately before the hook loop).
+        object.__setattr__(event, "timestamp", datetime.now(UTC))
+
         effects: list[Effect] = []
         blackboard_writes: list[tuple[str, object]] = []
 
         active = self._active_hooks()
         # Stamp the LIVE active hook set (dispatch order) onto the event so hooks in the loop below —
         # and any observability consumer — can see the governance active at this event (Event.hooks).
-        # The actual Hook instances (#727), not serialized dicts: Event.hooks is the effect system's
-        # view of the active set; consumers that log it call Hook.to_dict() at their edge. Keeping it
-        # a plain reference tuple means no per-event serialization on this hot path. object.__setattr__
+        # The actual Hook instances (#727), not rendered strings: Event.hooks is the effect system's
+        # view of the active set; consumers that log it call ``repr()`` at their edge. Keeping it
+        # a plain reference tuple means no per-event rendering on this hot path. object.__setattr__
         # because Event is frozen (see the blackboard stamp above).
         object.__setattr__(event, "hooks", tuple(active))
         for hook in active:
@@ -946,8 +920,8 @@ class HookDispatcher:
                 # baseline-vs-non-baseline split (baseline hooks used to fail loud); with
                 # the default baseline empty (#465) that rationale is gone.
                 #
-                # EXECUTIVE CALL (user, 2026-07-30): **raising is not an abort channel.** An
-                # `AbortError` from a hook handler is caught here like any other exception and
+                # EXECUTIVE CALL (user, 2026-07-30): **raising is not an abort channel.** A
+                # `FatalError` from a hook handler is caught here like any other exception and
                 # logged, NOT propagated. The point of the hook system is to contain side
                 # effects in a small, finite, composable effect set rather than admitting
                 # arbitrary code or side effects; letting a hook author reach for `raise` to
@@ -956,14 +930,14 @@ class HookDispatcher:
                 # `Abort(error=...)` is the supported way, and it is strictly better behaved:
                 # it composes with other effects, and it resolves to a terminal `Raise`
                 # *through* the span, so `span.complete()` runs and `InvokeExit` still fires
-                # (a raise propagates around both — see the AbortError docstring).
+                # (a raise propagates around both — see the FatalError docstring).
                 #
                 # Trade-off, deliberately accepted (Option B on #562): a governance hook
                 # whose _dispatch_event has a *bug* — raising a plain Exception instead of
                 # terminating via an effect — is swallowed here, silently disabling its
                 # enforcement, rather than failing loud.
                 # TODO(#612): make log-vs-propagate for uncaught hook exceptions configurable.
-                if isinstance(e, AbortError):
+                if isinstance(e, FatalError):
                     # Distinct message: without it, a hook author who used the (now
                     # unsupported) raise channel sees only a generic "raised exception" line
                     # and no hint that the abort was dropped or what to use instead.
@@ -1010,24 +984,24 @@ class HookDispatcher:
 
     # Context composition helpers (shared across context types)
 
-    def _warn_invalid_repl_result_effects(self, effects: list[Effect]) -> None:
-        """Warn that the exec-result effects (OverrideResult / ModifyResult) are not valid
-        here.
+    @staticmethod
+    def _reject_invalid_effect(effect: Effect, event_name: str, valid: str) -> NoReturn:
+        """Raise :class:`InvalidEffectError` for an effect returned at a stage that does not
+        accept it.
 
-        ``OverrideResult`` is valid only at ``REPLExecEnter`` (supply a result) and
-        ``ModifyResult`` only at ``REPLExecExit`` (transform the result). ``Abort`` is
-        deliberately NOT warned: termination is valid at every live event (it is collected,
-        not ignored, at LLMQueryEnter). Called from ``_compose_llm_query`` to catch a hook
-        that emits a result-scoped effect at the LLM-query boundary, where no execution
-        result exists to supply or transform.
+        One shared raise site so every ``_compose_*`` rejects out-of-stage effect kinds with
+        the same loud contract (this replaced a warn-and-ignore patchwork, plus one composer
+        that silently dropped — the final stage of span_event_lifecycle.md: a stale hook
+        must fail its first run, not silently no-op). ``BlackboardWrite`` never reaches
+        composition — ``emit()`` partitions it out and applies it at the generational
+        barrier — so it stays valid everywhere without a carve-out here.
         """
-        for effect in effects:
-            if isinstance(effect, OverrideResult | ModifyResult):
-                logger.warning(
-                    f"{type(effect).__name__} is not valid for this event (OverrideResult at "
-                    "REPLExecEnter, ModifyResult at REPLExecExit; use Abort to terminate "
-                    "anywhere), ignoring"
-                )
+        raise InvalidEffectError(
+            f"{type(effect).__name__} is not a valid effect at {event_name} "
+            f"(effects accepted there: {valid}). Supplies compose at the *Send events, "
+            "transforms at the *Complete events, and Abort at every control event; the "
+            "*Exit events are observation-only and accept no effects."
+        )
 
     # Context-specific composition methods
 
@@ -1035,13 +1009,15 @@ class HookDispatcher:
         """Compose effects for REPL execution *enter* events.
 
         Composition rules:
-        - OverrideResult (supply a result) / Abort (terminate): collected to (possibly)
-          short-circuit execution (see resolve_override_results)
+        - Abort (abort): exceptions collected into ``abort_errors``; ``span_repl_exec``
+          raises the combined exception (the span closes ``Aborted``).
         - AddVariables (bind namespace names): unioned into ``added_variables`` via the shared
           conflict-error rule (identical coalesces, divergent raises); ``__builtins__`` refused.
         - DropVariables (drop namespace names): unioned into ``dropped_variables``
           (order-independent, like DropMessages). ``__builtins__`` — the compiler sandbox
           (#688/#690) — is refused, so a stray drop can't reopen it.
+        - Any other effect raises ``InvalidEffectError`` — notably ``SupplyExecResult``,
+          which composes at ``REPLExecSend`` (a supplier must see the committed input).
 
         ``AddInputs``/``DropInputs`` are **not** collected here — they are ``InvokeEnter``-only
         (#481): inputs are per-invoke setup, applied once before the prompt renders. The per-turn
@@ -1052,9 +1028,6 @@ class HookDispatcher:
         # Apply REPL-specific effects
         for effect in effects:
             match effect:
-                case OverrideResult() as override:
-                    ctx.override_effects.append(override)
-
                 case Abort(error=error):
                     ctx.abort_errors.append(error)
 
@@ -1089,87 +1062,133 @@ class HookDispatcher:
                     if allow_missing:
                         ctx.dropped_variables_allow_missing |= names
 
-                case ModifyResult():
-                    logger.warning(
-                        "ModifyResult is not valid at REPLExecEnter (it transforms an "
-                        "existing result; use OverrideResult to supply one), ignoring"
+                case _:
+                    self._reject_invalid_effect(
+                        effect, "REPLExecEnter", "Abort, AddVariables, DropVariables"
                     )
 
         return ctx
 
-    def _compose_repl_exec_exit(self, effects: list[Effect]) -> REPLExecExitContext:
-        """Compose effects for REPL execution *exit* events.
+    def _compose_repl_exec_send(self, effects: list[Effect]) -> REPLExecSendContext:
+        """Compose effects for REPL execution *send* events — the supply boundary.
 
         Composition rules:
-        - ModifyResult (transform the result) / Abort (terminate): collected to (possibly)
-          override the execution result (see resolve_modify_results)
-        - All other effects are invalid at exit and ignored with a warning
+        - SupplyExecResult (supply a result for the committed input): collected to
+          (possibly) short-circuit execution (see resolve_supply_results).
+        - Abort: collected; ``span_repl_exec`` raises the combined exception (the span
+          closes ``Aborted``), superseding any supply.
+        - Any other effect raises ``InvalidEffectError``.
         """
-        ctx = REPLExecExitContext()
+        ctx = REPLExecSendContext()
 
         for effect in effects:
             match effect:
-                case ModifyResult() as modify:
-                    ctx.modify_effects.append(modify)
+                case SupplyExecResult() as supplied:
+                    ctx.supply_effects.append(supplied)
 
                 case Abort(error=error):
                     ctx.abort_errors.append(error)
 
                 case _:
-                    logger.warning(
-                        f"{type(effect).__name__} not valid for REPLExecExit, ignoring"
+                    self._reject_invalid_effect(
+                        effect, "REPLExecSend", "SupplyExecResult, Abort"
                     )
 
         return ctx
 
-    def _compose_invoke_exit(self, effects: list[Effect]) -> InvokeExitContext:
-        """Compose effects for invoke *exit* events (#568).
+    def _compose_repl_exec_complete(
+        self, effects: list[Effect]
+    ) -> REPLExecCompleteContext:
+        """Compose effects for REPL execution *complete* events — the transform boundary.
 
-        Symmetric with ``_compose_repl_exec_exit``: collect ``ModifyResult`` (transform the
-        terminal result) / ``Abort`` (terminate); every other effect is invalid at this boundary
-        and ignored with a warning. Resolved against the terminal result in ``span_invoke`` via
-        ``resolve_modify_results`` — this is what lets ``ReturnType`` / ``ValidateReturn`` downgrade
-        a wrong-typed / invalid final ``Return`` to a ``Raise`` (the backstop for another hook's
-        ``REPLExecExit`` override reinstating a ``Return``).
+        Composition rules:
+        - ModifyExecResult (transform the result): collected to (possibly) override the
+          execution result (see resolve_modify_results).
+        - Abort: collected; ``span_repl_exec`` raises the combined exception (the span
+          closes ``Aborted``), superseding any transform.
+        - Any other effect raises ``InvalidEffectError``.
         """
-        ctx = InvokeExitContext()
+        ctx = REPLExecCompleteContext()
 
         for effect in effects:
             match effect:
-                case ModifyResult() as modify:
+                case ModifyExecResult() as modify:
                     ctx.modify_effects.append(modify)
 
                 case Abort(error=error):
                     ctx.abort_errors.append(error)
 
                 case _:
-                    logger.warning(
-                        f"{type(effect).__name__} not valid for InvokeExit, ignoring"
+                    self._reject_invalid_effect(
+                        effect, "REPLExecComplete", "ModifyExecResult, Abort"
+                    )
+
+        return ctx
+
+    def _compose_invoke_send(self, effects: list[Effect]) -> InvokeSendContext:
+        """Compose effects for invoke *send* events.
+
+        Composition rules:
+        - Abort (abort): exceptions collected into ``abort_errors``; ``span_invoke``'s send
+          emitter raises the combined exception (the span closes ``Aborted``). No invoke
+          supplier effect exists, so abort is the only control kind here.
+        - Any other effect raises ``InvalidEffectError``.
+        """
+        ctx = InvokeSendContext()
+
+        for effect in effects:
+            match effect:
+                case Abort(error=error):
+                    ctx.abort_errors.append(error)
+
+                case _:
+                    self._reject_invalid_effect(effect, "InvokeSend", "Abort")
+
+        return ctx
+
+    def _compose_invoke_complete(self, effects: list[Effect]) -> InvokeCompleteContext:
+        """Compose effects for invoke *complete* events (#568).
+
+        Symmetric with ``_compose_repl_exec_complete``: collect ``ModifyExecResult`` (transform
+        the terminal result) / ``Abort`` (abort — ``span_invoke`` raises the combined
+        exception and the span closes ``Aborted``); any other effect raises
+        ``InvalidEffectError``. Resolved against the terminal result in
+        ``span_invoke`` via ``resolve_modify_results`` — this is what lets ``ReturnType`` /
+        ``ValidateReturn`` downgrade a wrong-typed / invalid final ``Return`` to a ``Raise`` (the
+        backstop for another hook's ``REPLExecComplete`` override reinstating a ``Return``).
+        """
+        ctx = InvokeCompleteContext()
+
+        for effect in effects:
+            match effect:
+                case ModifyExecResult() as modify:
+                    ctx.modify_effects.append(modify)
+
+                case Abort(error=error):
+                    ctx.abort_errors.append(error)
+
+                case _:
+                    self._reject_invalid_effect(
+                        effect, "InvokeComplete", "ModifyExecResult, Abort"
                     )
 
         return ctx
 
     def _compose_llm_query(self, effects: list[Effect]) -> LLMQueryContext:
-        """Compose effects for LLM query events.
+        """Compose effects for LLM query *enter* events.
 
         Composition rules:
-        - Abort: exceptions collected into ``abort_errors`` — this is the always-present
-          per-turn point where loop/budget hard-stops terminate the invoke; resolved to a
-          ``Raise`` in ``span_llm_query`` (before the LLM call).
+        - Abort: exceptions collected into ``abort_errors`` — this is the
+          always-present per-turn point where loop/budget hard-stops terminate the invoke;
+          ``span_llm_query`` raises the combined exception (the span closes ``Aborted``,
+          before the LLM call).
         - DropMessages: indices are unioned (order-independent)
-        - OverrideResponse: order-independent — identical overrides compose to
-          one; two distinct overrides raise OverrideConflictError (rather than
-          resolving the conflict by hook/with-nesting order)
+        - AddMessages: accumulated (within-slot order resolved by the fold)
+        - Any other effect raises ``InvalidEffectError`` — notably ``SupplyLLMResponse``,
+          which composes at ``LLMQuerySend`` (a supplier must see the committed post-edit
+          list).
         """
-        from jaz._llm_client import LLMResponse
-
         ctx = LLMQueryContext()
-
-        self._warn_invalid_repl_result_effects(effects)
-
-        # Track the winning override effect so a later one can be compared for
-        # equality — the resolution must not depend on arrival order.
-        override_effect: OverrideResponse | None = None
 
         for effect in effects:
             match effect:
@@ -1187,25 +1206,59 @@ class HookDispatcher:
                         edits.persistent_adds if persistent else edits.transient_adds
                     )
                     bucket.append(add)
-                case OverrideResponse() as override:
-                    if override_effect is not None and override != override_effect:
-                        raise OverrideConflictError(
-                            "Multiple conflicting OverrideResponse effects for "
-                            "the same LLM query. Override composition is "
-                            "order-independent: distinct overrides cannot be "
+                case _:
+                    self._reject_invalid_effect(
+                        effect, "LLMQueryEnter", "Abort, DropMessages, AddMessages"
+                    )
+
+        return ctx
+
+    def _compose_llm_query_send(self, effects: list[Effect]) -> LLMQuerySendContext:
+        """Compose effects for LLM query *send* events — the supply boundary.
+
+        Composition rules:
+        - SupplyLLMResponse: order-independent — identical overrides compose to
+          one; two distinct overrides raise LLMResponseConflictError (rather than
+          resolving the conflict by hook/with-nesting order)
+        - Abort: exceptions collected into ``abort_errors``; ``span_llm_query``'s send
+          emitter raises the combined exception (the committed-input veto — the span closes
+          ``Aborted``).
+        - Any other effect raises ``InvalidEffectError``.
+        """
+        from jaz._llm_client import LLMResponse
+
+        ctx = LLMQuerySendContext()
+
+        # Track the winning supply effect so a later one can be compared for
+        # equality — the resolution must not depend on arrival order.
+        response_effect: SupplyLLMResponse | None = None
+
+        for effect in effects:
+            match effect:
+                case Abort(error=error):
+                    ctx.abort_errors.append(error)
+                case SupplyLLMResponse() as supplied:
+                    if response_effect is not None and supplied != response_effect:
+                        raise LLMResponseConflictError(
+                            "Multiple conflicting SupplyLLMResponse effects for "
+                            "the same LLM query. Supply composition is "
+                            "order-independent: distinct supplied responses cannot be "
                             "resolved without relying on hook registration / "
-                            "with-nesting order. Ensure only one hook overrides a "
-                            "given query, or have them produce identical overrides."
+                            "with-nesting order. Ensure only one hook supplies a "
+                            "given query, or have them produce identical responses."
                         )
-                    if override_effect is None:
-                        override_effect = override
-                        ctx.override_response = LLMResponse(
-                            content=override.content,
-                            prompt_tokens=override.prompt_tokens,
-                            completion_tokens=override.completion_tokens,
-                            total_tokens=override.total_tokens,
-                            cost=override.cost,
+                    if response_effect is None:
+                        response_effect = supplied
+                        ctx.supplied_response = LLMResponse(
+                            content=supplied.content,
+                            prompt_tokens=supplied.prompt_tokens,
+                            completion_tokens=supplied.completion_tokens,
+                            cost_usd=supplied.cost_usd,
                         )
+                case _:
+                    self._reject_invalid_effect(
+                        effect, "LLMQuerySend", "SupplyLLMResponse, Abort"
+                    )
 
         return ctx
 
@@ -1213,9 +1266,10 @@ class HookDispatcher:
         """Compose effects for invoke enter events.
 
         Composition rules:
-        - Abort: exceptions collected into ``abort_errors`` to (possibly) terminate the whole
-          invoke before its first iteration (resolved to a ``Raise`` in ``span_invoke``).
-          The result-scoped effects (OverrideResult / ModifyResult) are not valid here — an
+        - Abort: exceptions collected into ``abort_errors`` to (possibly) abort the
+          whole invoke before its first iteration (``span_invoke`` raises the combined
+          exception; the span closes ``Aborted``).
+          The result-scoped effects (SupplyExecResult / ModifyExecResult) are not valid here — an
           invoke has no execution result to supply or transform; ``Finish`` (a graceful
           Return-terminate) is deliberately excluded (#481, YAGNI: no built-in forces a
           Return; governance hooks Abort or push the agent to return via AddMessages).
@@ -1227,7 +1281,9 @@ class HookDispatcher:
           added and dropped resolves to the *add* — and a drop-then-add of a caller input is a
           replacement rather than a collision.
         - DisableRecursion: idempotent OR into ``recursion_disabled`` — any emitter suppresses
-          this invoke's ``jaz.invoke`` tool (primitive binds ``jaz_library=None``).
+          this invoke's ``invoke`` tool (primitive binds ``invoke_tool=None``).
+        - Any other effect raises ``InvalidEffectError`` (this composer used to drop them
+          silently — the worst variant of the pre-loud-rejection patchwork).
         """
         ctx = InvokeContext()
 
@@ -1256,23 +1312,204 @@ class HookDispatcher:
                 case DisableRecursion():
                     ctx.recursion_disabled = True
 
+                case _:
+                    self._reject_invalid_effect(
+                        effect,
+                        "InvokeEnter",
+                        "Abort, AddInputs, DropInputs, DisableRecursion",
+                    )
+
         return ctx
 
     def _compose_llm_query_retry(self, effects: list[Effect]) -> LLMQueryRetryContext:
         """Compose effects for LLM retry events.
 
         This is a read-only context - LLM retries are informational.
-        No effects are allowed.
+        Any effect raises ``InvalidEffectError``.
         """
         ctx = LLMQueryRetryContext()
 
-        # Warn about invalid effects
         for effect in effects:
-            logger.warning(
-                f"{type(effect).__name__} not valid for LLMQueryRetry, ignoring"
-            )
+            self._reject_invalid_effect(effect, "LLMQueryRetry", "none (observational)")
 
         return ctx
+
+    def _compose_llm_query_complete(
+        self, effects: list[Effect]
+    ) -> LLMQueryCompleteContext:
+        """Compose effects for LLM query *complete* events.
+
+        Composition rules:
+        - Abort (abort): exceptions collected into ``abort_errors``; ``span_llm_query``
+          raises the combined exception once the complete event has been dispatched (the
+          span closes ``Aborted``).
+        - Any other effect raises ``InvalidEffectError``. (No response-modify effect
+          exists yet — see the comment on ``LLMQueryComplete``.)
+        """
+        # Why abort is the one control kind that survives here: see `LLMQueryCompleteContext`.
+        ctx = LLMQueryCompleteContext()
+
+        for effect in effects:
+            match effect:
+                case Abort(error=error):
+                    ctx.abort_errors.append(error)
+
+                case _:
+                    self._reject_invalid_effect(effect, "LLMQueryComplete", "Abort")
+
+        return ctx
+
+    # Send / abnormal-close plumbing shared by the span context managers
+
+    @staticmethod
+    def _resolve_message_edits(
+        snapshot: "Sequence[MessageDict]", edits: MessageEdits
+    ) -> ResolvedMessageEdits:
+        """Resolve a query's composed edits into self-contained records against the
+        enter-time ``snapshot``.
+
+        The resolver lives HERE, not on the record dataclasses: the events package must
+        not import from the effects layer (cycle hazard — see events/invoke.py's
+        ``InvokeCompleteContext.modify_effects`` comment), and the dispatcher is the one place
+        that holds both the snapshot and the raw edits at emission time. Resolving once and
+        shipping records (rather than bare indices) is what spares every edit-consuming
+        observer its own snapshot-and-index-math machinery (span_event_lifecycle.md,
+        Defect 5). Reuses ``_resolve_edit_index`` — the same resolver
+        ``apply_message_edits`` folds with — so the records agree with the buffer by
+        construction; the agent folds the same indices over an identical-content list
+        *before* Send fires, so resolution here cannot be the first to see an
+        out-of-range index. ("Identical content", not "the same object": the enter
+        event's ``messages`` is an immutable enter-time snapshot of the buffer — the
+        tuple coercion is what guarantees no hook can desync it from the agent's fold
+        between Enter and Send.)
+        """
+        n = len(snapshot)
+        # Distinct raw indices can name one message (-1 and n-1): dedupe by resolved
+        # position, persistent winning — matching the buffer, where one persistent drop
+        # removes the message for good.
+        persistent_by_position: dict[int, bool] = {}
+        for raw in edits.all_drops:
+            position = _resolve_edit_index(raw, n, upper=n - 1, kind="DropMessages")
+            persistent_by_position[position] = persistent_by_position.get(
+                position, False
+            ) or (raw in edits.persistent_drops)
+        drops = [
+            MessageDropRecord(message=snapshot[position], persistent=persistent)
+            for position, persistent in sorted(persistent_by_position.items())
+        ]
+        adds = [
+            MessageAddRecord(
+                # Uncopied — the record's __post_init__ tuple-coerces (owns the severing).
+                messages=add.messages,
+                position=_resolve_edit_index(
+                    add.index if add.index is not None else n,
+                    n,
+                    upper=n,
+                    kind="AddMessages",
+                ),
+                persistent=add.persistent,
+            )
+            for add in edits.all_adds
+        ]
+        return ResolvedMessageEdits(drops=drops, adds=adds)
+
+    @staticmethod
+    def _reject_observation_only_effects(effects: list[Effect], event: Event) -> None:
+        """Raise ``InvalidEffectError`` for any effect returned at an observation-only
+        emission.
+
+        The ``*Exit`` events accept NO effects on any arm: the outcome they carry is
+        already final (the transform boundary is ``*Complete``, the supply boundary
+        ``*Send``), so an effect here can only be a stale or buggy hook — rejected loudly
+        (this upgraded the stage-1 interim ignore-with-debug-log guard of
+        span_event_lifecycle.md). On the happy path the raise propagates and fails the
+        invoke; on the guarded closes (unwind / ahead of an abort's own raise) it is caught
+        and logged by ``_emit_guarded_exit``, because nothing there may replace the
+        exception that must win. ``BlackboardWrite`` never reaches this check — ``emit()``
+        partitions it out — so observation-time board writes stay legal.
+        """
+        if effects:
+            kinds = ", ".join(type(e).__name__ for e in effects)
+            raise InvalidEffectError(
+                f"{len(effects)} effect(s) ({kinds}) were returned at "
+                f"{type(event).__name__}, which is observation-only: the outcome is "
+                "already final, so no effect is valid at any *Exit event. Supplies "
+                "compose at the *Send events, transforms at the *Complete events, and "
+                "Abort at every control event."
+            )
+
+    def _emit_guarded_exit(self, exit_event: Event) -> None:
+        """Emit a span's ``*Exit`` on a path where an exception must win the unwind.
+
+        Used for the abnormal close (the span body unwound — ``Failed``/``Aborted``) and
+        for the ``Aborted`` close the CM emits just before raising an abort's carried
+        exception. Composes nothing: returned effects go through the loud
+        observation-only rejection, but here the raise is *caught and logged* — the close
+        runs while the span's real exception unwinds (or immediately before the CM raises
+        it), and nothing on that path may replace it. (Per-hook exceptions are already
+        caught inside ``emit``; this catch covers the dispatcher's own machinery and the
+        rejection itself.)
+        """
+        try:
+            self._reject_observation_only_effects(self.emit(exit_event), exit_event)
+        except Exception:
+            logger.error(
+                "Emitting %s on the span's guarded close failed; the span's own "
+                "exception continues to propagate.",
+                type(exit_event).__name__,
+                exc_info=True,
+            )
+
+    def _record_own_abort(self, abort_errors: list[Exception]) -> BaseException:
+        """Combine a stage's composed ``Abort`` exceptions and record the result as THIS
+        invoke's own abort.
+
+        Multiple aborts at one stage keep the grouping law the legacy resolution had
+        (``ExceptionGroup``; a single abort raises its exception bare). The returned object
+        is recorded by identity on ``_own_abort_exceptions`` so ``_unwind_outcome`` can
+        classify the raise as this invoke's own control plane speaking — the same object
+        the span CM is about to raise, unwrapped, so the caller/parent receives the carried
+        exception exactly (NOT wrapped in FatalError: wrapping would promote every child
+        budget-stop into a tree-wide kill; how far the stop travels belongs to the carried
+        exception's own category, see the ``Abort`` effect docstring).
+        """
+        # ExceptionGroup's message is agent-facing; keep it generic (see _combine_exceptions).
+        exc = _combine_exceptions(list(abort_errors), "Multiple errors occurred")
+        self._own_abort_exceptions.append(exc)
+        return exc
+
+    def _unwind_outcome(self, exc: BaseException) -> Aborted | Failed:
+        """Classify a span's non-completed close: ``Aborted`` iff ``exc`` is THIS invoke's
+        own resolved abort (by identity), else ``Failed``.
+
+        This is the ONLY place :class:`Aborted` is constructed, and the rule is
+        **control-plane association** (user decision, final — it supersedes the archived
+        design doc's category-based rule; review of the implementation plan sharpened
+        this): a span closes ``Aborted`` iff its OWN invoke's hook control plane issued the
+        ``Abort`` effect — the stage CM that resolved it closes ``Aborted`` directly, and
+        the same invoke's enclosing spans (the invoke span, when its inner query/exec span
+        aborted) match the recorded exception by identity on the unwind, because the effect
+        is named ``Abort``-the-*invoke*: it is this invoke's control plane speaking,
+        whichever stage it composed at. EVERY other non-completion is ``Failed``: a
+        ``FatalError`` unwinding from below, a child invoke's propagated abort-carried
+        exception (a foreign control plane's decision — the enclosing invoke's spans close
+        ``Failed`` with it), ``KeyboardInterrupt``, provider errors, machinery bugs.
+
+        Why association and not exception category: intent is unknowable at the escalation
+        channel — ``Abort(error=...)`` carries governance stops (a budget ceiling) and
+        breakage reports (a tool's ``FatalError``) alike, which is the same muddiness that
+        renamed the category to ``FatalError`` (a property claim, not an intent claim).
+        .NET draws exactly this line: an ``OperationCanceledException`` moves a task to
+        ``Canceled`` ONLY when its token matches the task's own ``CancellationToken``;
+        the same exception with a foreign token means ``Faulted``. Escalation scope —
+        ``FatalError`` being unrenderable/uncontainable by agents, the authorship boundary
+        — is an ORTHOGONAL axis to this outcome: an ``Aborted`` invoke may carry a
+        containable ``BudgetExhaustedError`` or an uncontainable ``FatalError``; the
+        outcome says whose stop it was, the category says how far it travels.
+        """
+        if any(exc is recorded for recorded in self._own_abort_exceptions):
+            return Aborted(exc)
+        return Failed(exc)
 
     # Span-based context managers for enter/exit event pairs
 
@@ -1283,90 +1520,165 @@ class HookDispatcher:
         Usage:
             enter_event = REPLExecEnter(...)
             with dispatcher.span_repl_exec(enter_event) as span:
-                if span.enter_override is not None:
-                    exec_result = span.enter_override  # hook supplied a result
+                # ...apply span.ctx namespace deltas...
+                span.send()  # REPLExecSend: suppliers compose here (an Abort raises)
+                if span.supplied is not None:
+                    exec_result = span.supplied  # a hook supplied the result
                 else:
                     exec_result = repl.exec(...)
                 span.complete(exec_result=exec_result)
-            # exit-time ModifyResult / Abort is applied here:
+            # REPLExecComplete-composed ModifyExecResult is applied here:
             exec_result = span.get_final_exec_result()
 
-        The span must be completed before exiting, or an error is raised.
+        The span must be completed before exiting cleanly — a body that skips
+        ``complete()`` trips a loud ERROR log and fires no exit (the
+        ``_log_incomplete_span`` tripwire; synthesizing a close would mask the bug).
 
-        Layering of enter-time supply and exit-time transform (both intentional):
-          1. When `enter_override` (an OverrideResult supply, or an Abort) short-circuits
-             execution, `REPLExecExit` still fires with that override as `exec_result`.
-             Observability hooks therefore record an outcome for code that never ran — they
-             care about what happened from the agent's perspective, not whether `repl.exec`
-             was called.
-          2. Exit-time `ModifyResult`s compose on top of whatever result the enter branch
-             produced, and an exit `Abort` escalates any prior result to a terminal `Raise`.
-             This is the composition rule that lets `BudgetForcing` transform a `Return`
-             into a `Continue` at exit, and it deliberately does not check the origin of the
-             prior result. The origin-agnostic rule cuts both ways: because the result *kind*
-             is decided by the effects present at *this* (exit) boundary, an exit
-             `ModifyResult(Continue(...))` composed onto an enter terminal (`Return` /
-             `Raise`) *downgrades* it to a recoverable `Continue` — the exit boundary's own
-             effects are the last word (see `resolve_modify_results`).
+        An ``Abort`` composed at any of this span's control stages raises its carried
+        exception out of the ``with`` statement (from ``span.send()`` for a Send-time one),
+        after the span closes with an ``Aborted`` outcome — there is no result for the
+        loop to read on that path.
+
+        Layering of Send-time supply and Complete-time transform (both intentional):
+          1. When `supplied` (a Send-composed SupplyExecResult supply)
+             short-circuits execution, `REPLExecComplete` and `REPLExecExit` still fire with
+             that result. Observability hooks therefore record an outcome for code that
+             never ran — they care about what happened from the agent's perspective, not
+             whether `repl.exec` was called (a supplied result is a result).
+          2. Complete-time `ModifyExecResult`s compose on top of whatever result the
+             producer made. This is the composition rule that lets `BudgetForcing`
+             transform a `Return` into a `Continue`, and it deliberately does not check the
+             origin of the prior result. The origin-agnostic rule cuts both ways: because
+             the result *kind* is decided by the effects present at *this* (transform)
+             boundary, a `ModifyExecResult(Continue(...))` composed onto a supplied terminal
+             (`Return` / `Raise`) *downgrades* it to a recoverable `Continue` — the
+             transform boundary's own effects are the last word (see
+             `resolve_modify_results`). An Abort is exempt from that rule by construction:
+             it raises before the fold, so no transform can revoke it.
         """
-        # Fire enter event and compose context
+        # Fire the enter event. No CM-side timing: every event carries its own
+        # emission ``timestamp`` (stamped in emit()); intervals are consumer arithmetic.
         effects = self.emit(enter_event)
-        ctx = self._compose_repl_exec(effects)
+        # The try opens IMMEDIATELY after the enter-emit returns (close-then-propagate,
+        # #892): once any observer has opened its span, an exception anywhere — including
+        # enter-effect COMPOSITION raising a deliberate conflict error — must close the
+        # span (Exit fires on the abnormal arm below) and then propagate. Composition
+        # errors are never absorbed: catching-and-logging them (the way emit() guards a
+        # buggy hook) would silently void the conflict contract; the fix is closing the
+        # span on the way out, never swallowing the exception.
+        span: REPLExecSpan | None = None
+        # True once this CM has emitted the span's Exit — set by _abort (Aborted arm) and
+        # by the normal close — so the abnormal arm below can't double-close.
+        closed = False
 
-        # Create span
-        span = REPLExecSpan(ctx=ctx)
+        def _exit_event(outcome: Completed | Aborted | Failed) -> REPLExecExit:
+            return REPLExecExit(
+                config=enter_event.config,
+                invoke_id=enter_event.invoke_id,
+                iteration=enter_event.iteration,
+                depth=enter_event.depth,
+                outcome=outcome,
+            )
 
-        # Enter-time OverrideResult (supply) / Abort short-circuit execution: no result has
-        # been produced yet, so the supply names THE result outright (no original to fold).
-        span.enter_override = resolve_override_results(
-            override_effects=ctx.override_effects,
-            abort_errors=ctx.abort_errors,
-        )
+        def _abort(abort_errors: list[Exception]) -> NoReturn:
+            # A composed Abort at any of this span's control stages (Enter/Send/Complete):
+            # close the span Aborted, then raise the carried exception — the abort
+            # propagates instead of being laundered into a terminal Raise result, so no
+            # downstream transform boundary exists at which another hook could revoke it
+            # (span_event_lifecycle.md Defect 3, closed structurally). The guarded
+            # emission-then-raise ordering is what distinguishes this close from the
+            # generic abnormal arm below, which stays Failed.
+            nonlocal closed
+            exc = self._record_own_abort(abort_errors)
+            closed = True
+            self._emit_guarded_exit(_exit_event(self._unwind_outcome(exc)))
+            raise exc
 
-        exceptional_exit = False
         try:
-            yield span
-        except BaseException:
-            # Body unwound on an in-flight exception — see _log_incomplete_span for why
-            # this stays quiet rather than logging the forgot-to-complete error.
-            exceptional_exit = True
-            raise
-        finally:
-            # Ensure span was completed
-            if not span.is_completed():
-                _log_incomplete_span(
-                    exceptional_exit,
-                    debug_msg=(
-                        f"REPLExec span for execution {enter_event.iteration} exited "
-                        "on an in-flight exception before completion — no REPLExecExit fires."
-                    ),
-                    error_msg=(
-                        f"REPLExec span for execution {enter_event.iteration} was not "
-                        "completed. You must call span.complete(exec_result=...) before exiting."
-                    ),
+            ctx = self._compose_repl_exec(effects)
+            if ctx.abort_errors:
+                _abort(ctx.abort_errors)
+            span = REPLExecSpan(ctx=ctx)
+
+            def _emit_send() -> None:
+                # REPLExecSend payload is fully known here (code from the enter event,
+                # namespace deltas from composition); the loop just marks the commit point.
+                send_event = REPLExecSend(
+                    config=enter_event.config,
+                    invoke_id=enter_event.invoke_id,
+                    depth=enter_event.depth,
+                    iteration=enter_event.iteration,
+                    code=enter_event.code,
+                    # Passed uncopied on purpose: the event's __post_init__ owns the
+                    # severing (copy) and freezing (proxy/frozenset) — a call-site copy
+                    # here would be a second, redundant one. Same at InvokeSend.
+                    added_variables=ctx.added_variables,
+                    dropped_variables=ctx.dropped_variables,
                 )
-                # Don't return - let exceptions propagate
+                send_ctx = self._compose_repl_exec_send(self.emit(send_event))
+                # Termination trumps supply: a Send-time Abort raises out of span.send()
+                # before any supplied result is even resolved.
+                if send_ctx.abort_errors:
+                    _abort(send_ctx.abort_errors)
+                # Send is the supply boundary: a supply names THE result outright (no
+                # original to fold); pure supply — aborts never launder in here anymore.
+                assert span is not None
+                span.supplied = resolve_supply_results(
+                    supply_effects=send_ctx.supply_effects,
+                )
+
+            span._emit_send = _emit_send
+            yield span
+
+            # ---- Normal close (the body finished cleanly) ----
+            if not span.is_completed():
+                # The forgot-to-complete programming error — loud ERROR tripwire, no exit.
+                _log_incomplete_span(
+                    f"REPLExec span for execution {enter_event.iteration} was not "
+                    "completed. You must call span.complete(exec_result=...) before exiting."
+                )
             else:
                 original = span.get_exec_result()
-                # Fire exit event only if span was completed
-                exit_event = REPLExecExit(
+                # Transform boundary first: REPLExecComplete fires with the RAW result and
+                # its ModifyExecResult effects compose into the final one; an Abort here
+                # supersedes the fold and raises (the span closes Aborted).
+                complete_event = REPLExecComplete(
                     config=enter_event.config,
                     invoke_id=enter_event.invoke_id,
                     iteration=enter_event.iteration,
                     exec_result=original,
                     depth=enter_event.depth,
                 )
-                exit_effects = self.emit(exit_event)
-                exit_ctx = self._compose_repl_exec_exit(exit_effects)
-                # Exit-time ModifyResult transforms the actual result (original kept if none).
-                override = resolve_modify_results(
-                    modify_effects=exit_ctx.modify_effects,
-                    abort_errors=exit_ctx.abort_errors,
+                complete_ctx = self._compose_repl_exec_complete(
+                    self.emit(complete_event)
+                )
+                if complete_ctx.abort_errors:
+                    _abort(complete_ctx.abort_errors)
+                transformed = resolve_modify_results(
+                    modify_effects=complete_ctx.modify_effects,
                     original=original,
                 )
-                span.set_final_exec_result(
-                    override if override is not None else original
-                )
+                final = transformed if transformed is not None else original
+                span.set_final_exec_result(final)
+                # Exit carries the POST-transform result (#906 fixed by the Complete→Exit
+                # ordering): observers of the close finally record what the turn actually
+                # produced, not composition's input. Observation-only — returned effects
+                # are rejected loudly. `closed` is set before the emit so a raise from the
+                # emission (or the rejection itself) propagates without a double-close.
+                exit_event = _exit_event(Completed(final))
+                closed = True
+                self._reject_observation_only_effects(self.emit(exit_event), exit_event)
+        except BaseException as exc:
+            # Abnormal close (#892): the span opened, so it must close exactly once, here,
+            # with the true outcome — then the exception propagates untouched. `closed`
+            # means this CM already emitted the exit (an Aborted close whose raise is now
+            # passing through, or a failure after the Completed exit fired).
+            # _unwind_outcome classifies: Aborted iff the exception is this invoke's own
+            # resolved abort (e.g. raised by the LLM-query span's CM and unwinding through
+            # the loop); every other unwind is Failed.
+            if not closed:
+                self._emit_guarded_exit(_exit_event(self._unwind_outcome(exc)))
+            raise
 
     @contextmanager
     def span_llm_query(self, enter_event: LLMQueryEnter):
@@ -1375,78 +1687,141 @@ class HookDispatcher:
         Usage:
             enter_event = LLMQueryEnter(...)
             with dispatcher.span_llm_query(enter_event) as span:
-                if span.abort is not None:
-                    return span.abort          # Abort @ LLMQueryEnter: terminate the invoke
-                response = llm.query(messages, **base_config)
-                span.complete(
-                    response_content=response,
-                    prompt_tokens=...,
-                    completion_tokens=...,
-                    cost=...
-                )
+                span.send(shown_messages)      # LLMQuerySend: suppliers compose here
+                if span.supplied_response is not None:
+                    response = span.supplied_response
+                else:
+                    response = llm.query(shown_messages, **base_config)
+                span.complete(response=response)
+            return result
 
-        :class:`LLMQueryEnter` is the always-present per-turn boundary, so :class:`Abort` is honored
-        here (the loop/budget hard-stops). When a hook aborts, ``span.abort`` is a terminal
-        :class:`Raise` and the caller must return it *without* querying or completing the span: an
-        aborted query never happened, so **no :class:`LLMQueryExit` fires** (mirroring the loop
-        pseudocode, where ``if q.abort: return`` short-circuits before the exit event).
+        :class:`LLMQueryEnter` is the always-present per-turn boundary, so :class:`Abort`
+        is honored here (the loop/budget hard-stops). An abort at any of this span's
+        control stages raises its carried exception: from the ``with`` statement itself for
+        an enter-time one (before the query), from ``span.send(...)`` for the
+        committed-input veto, and from the block's close for a :class:`LLMQueryComplete`
+        one — in every case the span closes first with an ``Aborted`` outcome on
+        :class:`LLMQueryExit` (every opened span closes, on every path).
+
+        A Complete-time abort does *not* un-do the query — it completed, was paid for, and
+        its ``LLMQueryComplete`` fired and was observed by every hook. What the abort stops
+        is everything downstream: the raise propagates before the caller reads the result,
+        so the agent never acts on the response and the code the model proposed is not
+        executed.
         """
-        # Fire enter event and compose context
+        # Fire the enter event. No CM-side timing: every event carries its own
+        # emission ``timestamp`` (stamped in emit()); intervals are consumer arithmetic.
         effects = self.emit(enter_event)
-        ctx = self._compose_llm_query(effects)
+        # The try opens IMMEDIATELY after the enter-emit (close-then-propagate, #892): an
+        # enter-composition conflict error must close the span, never be absorbed — see
+        # span_repl_exec for the full rationale.
+        span: LLMQuerySpan | None = None
+        # True once this CM has emitted the span's Exit (see span_repl_exec).
+        closed = False
 
-        # Create span
-        span = LLMQuerySpan(ctx=ctx)
+        def _exit_event(outcome: Aborted | Failed) -> LLMQueryExit:
+            return LLMQueryExit(
+                config=enter_event.config,
+                invoke_id=enter_event.invoke_id,
+                model=enter_event.model,
+                iteration=enter_event.iteration,
+                depth=enter_event.depth,
+                outcome=outcome,
+            )
 
-        # Abort @ LLMQueryEnter resolves to a terminal Raise (no Continue/Return here, so
-        # original=None). Set on the span; the caller returns it to terminate the invoke.
-        span.abort = resolve_override_results(
-            override_effects=[],
-            abort_errors=ctx.abort_errors,
-        )
+        def _abort(abort_errors: list[Exception]) -> NoReturn:
+            # Composed Abort: close the span Aborted, then raise the carried exception —
+            # propagation, not laundering (see span_repl_exec._abort for the rationale).
+            nonlocal closed
+            exc = self._record_own_abort(abort_errors)
+            closed = True
+            self._emit_guarded_exit(_exit_event(self._unwind_outcome(exc)))
+            raise exc
 
-        exceptional_exit = False
         try:
-            yield span
-        except BaseException:
-            # Body unwound on an in-flight exception (LLM/provider failure, KeyboardInterrupt)
-            # — see _log_incomplete_span for why this stays quiet rather than logging the
-            # forgot-to-complete error.
-            exceptional_exit = True
-            raise
-        finally:
-            if span.abort is not None:
-                # Aborted at enter: the LLM call never happened and the span is not
-                # completed by design — fire no LLMQueryExit and log no "not completed"
-                # error (there is no response to report).
-                pass
-            elif not span.is_completed():
-                _log_incomplete_span(
-                    exceptional_exit,
-                    debug_msg=(
-                        "LLMQuery span exited on an in-flight exception before "
-                        "completion — no LLMQueryExit fires."
-                    ),
-                    error_msg=(
-                        "LLMQuery span was not completed. "
-                        "You must call span.complete(...) before exiting."
+            ctx = self._compose_llm_query(effects)
+            # Abort @ LLMQueryEnter (iteration / budget hard-stop): the query never
+            # happens — the span closes Aborted and the exception raises out of the
+            # `with` statement before the body runs.
+            if ctx.abort_errors:
+                _abort(ctx.abort_errors)
+            span = LLMQuerySpan(ctx=ctx)
+
+            def _emit_send(shown_messages: "list[MessageDict]") -> None:
+                # Resolve the edit records HERE — the dispatcher holds both the enter
+                # snapshot and the composed edits (see _resolve_message_edits).
+                send_event = LLMQuerySend(
+                    config=enter_event.config,
+                    invoke_id=enter_event.invoke_id,
+                    depth=enter_event.depth,
+                    messages=shown_messages,
+                    model=enter_event.model,
+                    iteration=enter_event.iteration,
+                    edits=self._resolve_message_edits(
+                        enter_event.messages, ctx.message_edits
                     ),
                 )
-                # Don't return - let exceptions propagate
+                # Send is the supply boundary: a SupplyLLMResponse (e.g. Replay) answers
+                # here with the committed list in view, overriding the default producer;
+                # an Abort declines the input (raising out of span.send).
+                send_ctx = self._compose_llm_query_send(self.emit(send_event))
+                if send_ctx.abort_errors:
+                    _abort(send_ctx.abort_errors)
+                assert span is not None
+                span.supplied_response = send_ctx.supplied_response
+
+            span._emit_send = _emit_send
+            yield span
+
+            # ---- Normal close (the body finished cleanly) ----
+            if not span.is_completed():
+                # The forgot-to-complete programming error — loud ERROR tripwire, no exit.
+                _log_incomplete_span(
+                    "LLMQuery span was not completed. "
+                    "You must call span.complete(...) before exiting."
+                )
             else:
-                # Fire exit event only if span was completed
-                exit_event = LLMQueryExit(
+                # Response control boundary first: LLMQueryComplete fires with the raw
+                # response and its Abort effects compose (no response-modify effect
+                # exists yet — the slot is documented on the event). An abort here closes
+                # the span Aborted and raises out of the `with` close — after the query
+                # was observed, before the caller reads its content.
+                complete_event = LLMQueryComplete(
                     config=enter_event.config,
                     invoke_id=enter_event.invoke_id,
                     response=span.get_response(),
                     model=enter_event.model,
-                    iteration=span.get_iteration(),
+                    # From the enter event, the family's single iteration source — the
+                    # span's own (mismatchable) channel was removed (audit C3).
+                    iteration=enter_event.iteration,
                     depth=enter_event.depth,
-                    start_time=span.get_start_time(),
-                    end_time=span.get_end_time(),
-                    message_edits=ctx.message_edits,
                 )
-                self.emit(exit_event)
+                complete_ctx = self._compose_llm_query_complete(
+                    self.emit(complete_event)
+                )
+                if complete_ctx.abort_errors:
+                    _abort(complete_ctx.abort_errors)
+                # Exit closes the observation record — after Complete, so observers see
+                # the final state of the turn. Observation-only: returned effects are
+                # rejected loudly; `closed` is set before the emit so a raise from the
+                # emission propagates without a double-close.
+                exit_event = LLMQueryExit(
+                    config=enter_event.config,
+                    invoke_id=enter_event.invoke_id,
+                    model=enter_event.model,
+                    iteration=enter_event.iteration,
+                    depth=enter_event.depth,
+                    outcome=Completed(span.get_response()),
+                )
+                closed = True
+                self._reject_observation_only_effects(self.emit(exit_event), exit_event)
+        except BaseException as exc:
+            # Abnormal close (#892): fire the exit with the classified outcome
+            # (_unwind_outcome: Aborted iff this invoke's own resolved abort, else
+            # Failed), then let the exception propagate untouched.
+            if not closed:
+                self._emit_guarded_exit(_exit_event(self._unwind_outcome(exc)))
+            raise
 
     @contextmanager
     def span_invoke(self, enter_event: InvokeEnter):
@@ -1455,80 +1830,134 @@ class HookDispatcher:
         Usage:
             enter_event = InvokeEnter(...)
             with dispatcher.span_invoke(enter_event) as span:
-                if span.enter_override is not None:
-                    result = span.enter_override  # a hook aborted the invoke
-                else:
-                    # Use span.ctx.added_inputs / dropped_inputs, etc.
-                    result = agent._invoke_internal(...)
+                # Use span.ctx.added_inputs / dropped_inputs, etc.
+                result = agent._invoke_internal(...)
                 span.complete(result=result)
+
+        An :class:`Abort` composed at :class:`InvokeEnter` raises its carried exception
+        from the ``with`` statement itself (the span closes ``Aborted`` first); one at
+        :class:`InvokeSend` raises out of ``span.send(...)``; one at
+        :class:`InvokeComplete` raises from the block's close. The exception propagates
+        out of ``jaz.invoke()`` bare — the top-level caller contract.
         """
-        # Fire enter event and compose context
+        # Fire the enter event. No CM-side timing: every event carries its own
+        # emission ``timestamp`` (stamped in emit()); intervals are consumer arithmetic.
         effects = self.emit(enter_event)
-        ctx = self._compose_invoke(effects)
+        # The try opens IMMEDIATELY after the enter-emit (close-then-propagate, #892): an
+        # enter-composition conflict error must close the span, never be absorbed — see
+        # span_repl_exec for the full rationale.
+        span: InvokeSpan | None = None
+        # True once this CM has emitted the span's Exit (see span_repl_exec).
+        closed = False
 
-        # Create span
-        span = InvokeSpan(ctx=ctx)
+        def _exit_event(outcome: Completed | Aborted | Failed) -> InvokeExit:
+            return InvokeExit(
+                config=enter_event.config,
+                invoke_id=enter_event.invoke_id,
+                depth=enter_event.depth,
+                outcome=outcome,
+            )
 
-        # Enter-time Abort short-circuits the whole invoke (no execution has happened yet).
-        span.enter_override = resolve_override_results(
-            override_effects=[],
-            abort_errors=ctx.abort_errors,
-        )
+        def _abort(abort_errors: list[Exception]) -> NoReturn:
+            # Composed Abort: close the span Aborted, then raise the carried exception —
+            # propagation, not laundering (see span_repl_exec._abort for the rationale).
+            nonlocal closed
+            exc = self._record_own_abort(abort_errors)
+            closed = True
+            self._emit_guarded_exit(_exit_event(self._unwind_outcome(exc)))
+            raise exc
 
-        exceptional_exit = False
         try:
-            yield span
-        except BaseException:
-            # Body unwound on an in-flight exception — see _log_incomplete_span for why
-            # this stays quiet rather than logging the forgot-to-complete error.
-            exceptional_exit = True
-            raise
-        finally:
-            # Ensure span was completed
-            if not span.is_completed():
-                _log_incomplete_span(
-                    exceptional_exit,
-                    debug_msg=(
-                        "Invoke span exited on an in-flight exception before "
-                        "completion — no InvokeExit fires."
-                    ),
-                    error_msg=(
-                        "Invoke span was not completed. "
-                        "You must call span.complete(result=...) before exiting."
-                    ),
+            ctx = self._compose_invoke(effects)
+            # Enter-time Abort short-circuits the whole invoke (no execution has happened
+            # yet): the span closes Aborted and the carried exception raises out of the
+            # `with` statement before the loop starts.
+            if ctx.abort_errors:
+                _abort(ctx.abort_errors)
+            span = InvokeSpan(ctx=ctx)
+
+            def _emit_send(inputs: "Any") -> None:
+                # The committed inputs come from the loop (it owns the input fold); the
+                # add/drop payloads come from composition here.
+                send_event = InvokeSend(
+                    config=enter_event.config,
+                    invoke_id=enter_event.invoke_id,
+                    depth=enter_event.depth,
+                    inputs=inputs,
+                    # Uncopied — the event's __post_init__ owns severing + freezing
+                    # (see the REPLExecSend construction).
+                    added_inputs=ctx.added_inputs,
+                    dropped_inputs=ctx.dropped_inputs,
                 )
-                # Don't return - let exceptions propagate
+                # Send composes abort only (no invoke supplier effect exists): the
+                # combined exception raises out of span.send(), declining the committed
+                # input set.
+                send_ctx = self._compose_invoke_send(self.emit(send_event))
+                if send_ctx.abort_errors:
+                    _abort(send_ctx.abort_errors)
+
+            span._emit_send = _emit_send
+            yield span
+
+            # ---- Normal close (the body finished cleanly) ----
+            if not span.is_completed():
+                # The forgot-to-complete programming error — loud ERROR tripwire, no exit.
+                _log_incomplete_span(
+                    "Invoke span was not completed. "
+                    "You must call span.complete(result=...) before exiting."
+                )
             else:
-                # Fire the exit event and honor exit-time ModifyResult / Abort — the invoke's
-                # terminal result is a transform boundary now (#568), symmetric with
-                # span_repl_exec. A ReturnType / ValidateReturn hook downgrades a wrong-typed /
-                # invalid final Return to a Raise here (the backstop for another hook's
-                # REPLExecExit override reinstating a Return). The (possibly overridden) result is
-                # stored back on the span; the invoke loop reads span.get_result() AFTER the span
+                # Transform boundary first: InvokeComplete fires with the RAW terminal
+                # result and its ModifyExecResult effects compose (#568); an Abort here
+                # supersedes the fold and raises (the span closes Aborted). A
+                # ReturnType / ValidateReturn hook downgrades a wrong-typed / invalid final
+                # Return to a Raise here (the backstop for another hook's REPLExecComplete
+                # override reinstating a Return). The (possibly overridden) result is stored
+                # back on the span; the invoke loop reads span.get_result() AFTER the span
                 # closes and returns/raises from that.
-                #
-                # Known limitation (#906): the InvokeExit *event* carries the PRE-transform
-                # ``original``, but the invoke actually returns/raises the POST-transform
-                # ``span.get_result()``. So a *passive* observer keyed on ``event.result`` (ATIF
-                # trace, conversation history, OTel span) records the pre-backstop result and misses a
-                # ReturnType/ValidateReturn InvokeExit downgrade. This is inherent to the event being
-                # the transform's *input*; a hook that wants to affect the final value emits
-                # ModifyResult here (folded by resolve_modify_results below), not read the event.
                 original = span.get_result()
-                exit_event = InvokeExit(
+                complete_event = InvokeComplete(
                     config=enter_event.config,
                     invoke_id=enter_event.invoke_id,
                     result=original,
                     depth=enter_event.depth,
                 )
-                exit_ctx = self._compose_invoke_exit(self.emit(exit_event))
-                override = resolve_modify_results(
-                    modify_effects=exit_ctx.modify_effects,
-                    abort_errors=exit_ctx.abort_errors,
+                complete_ctx = self._compose_invoke_complete(self.emit(complete_event))
+                if complete_ctx.abort_errors:
+                    _abort(complete_ctx.abort_errors)
+                transformed = resolve_modify_results(
+                    modify_effects=complete_ctx.modify_effects,
                     original=original,
                 )
-                if override is not None:
-                    span.set_final_result(override)
+                if transformed is not None:
+                    span.set_final_result(transformed)
+                # Exit carries the POST-transform result — the #906 fix, delivered by the
+                # Complete→Exit ordering: observers of the close finally record what the
+                # invoke actually returned/raised, backstop downgrades included, instead of
+                # composition's input. Observation-only — returned effects are rejected
+                # loudly; `closed` is set before the emit so a raise from the emission
+                # propagates without a double-close.
+                final_result = span.get_result()
+                # An invoke only ever exits on a *terminal* result (the loop completes the
+                # span solely from its Return/Raise arm; a Continue appends an observation
+                # and iterates), which is what lets InvokeOutcome's Completed payload be
+                # ``Return | Raise`` rather than the full ExecResult. Asserted here — the
+                # one place the payload enters the outcome — so a leaked Continue fails at
+                # the source instead of in whichever observer matches the union first.
+                assert isinstance(final_result, Return | Raise)
+                exit_event = _exit_event(Completed(final_result))
+                closed = True
+                self._reject_observation_only_effects(self.emit(exit_event), exit_event)
+        except BaseException as exc:
+            # Abnormal close (#892): fire the exit with the classified outcome, then let
+            # the exception propagate untouched. _unwind_outcome is where an invoke span
+            # closes Aborted for its OWN invoke's aborts resolved at an inner span's stage
+            # (the LLM-query or REPL-exec CM recorded the exception, and it is unwinding
+            # through this loop now); any foreign exception — a child invoke's propagated
+            # abort, a FatalError from below, KeyboardInterrupt — closes Failed.
+            if not closed:
+                self._emit_guarded_exit(_exit_event(self._unwind_outcome(exc)))
+            raise
 
     # Simple events (no enter/exit pair, just fire and compose)
 

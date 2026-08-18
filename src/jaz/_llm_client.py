@@ -1,10 +1,10 @@
 """Selecting and building the configured LLM backend.
 
-The backend classes themselves live in :mod:`jaz.providers.llm` — this module is the thin layer
+The backend classes themselves live in :mod:`jaz.llm.llm` — this module is the thin layer
 between ``Config.llm`` and them: it validates the tag, routes ``llm.params`` to the right
 destination, and builds the instance.
 
-``LLM`` and ``LLMResponse`` are re-exported here because this is where they lived before the
+``BaseLLM`` and ``LLMResponse`` are re-exported here because this is where they lived before the
 ``LLMClient``/``Provider`` merge, and internal call sites import them from this path.
 """
 
@@ -14,18 +14,18 @@ import asyncio
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .providers.llm import (
-    LLM,
+from .llm.llm import (
+    BaseLLM,
     LLMResponse,
 )
-from .providers.registry import (
+from .llm.registry import (
     register_llm,
     registered_llm_tags,
     resolve_llm,
 )
 
 __all__ = [
-    "LLM",
+    "BaseLLM",
     "LLMResponse",
     "MockLLMClient",
     "create_llm",
@@ -45,7 +45,7 @@ def known_llm_tags() -> frozenset[str]:
     return registered_llm_tags()
 
 
-def validate_llm_tag(name: str, *, field: str = "llm.tag") -> None:
+def validate_llm_tag(name: str, *, field: str = "llm.backend") -> None:
     """Raise ``ValueError`` if ``name`` is not a registered backend tag.
 
     Single source of truth for the message so the ``configure`` / ``ConfigOverride`` /
@@ -60,7 +60,7 @@ def validate_llm_tag(name: str, *, field: str = "llm.tag") -> None:
         )
 
 
-def create_llm(tag: str, params: Mapping[str, Any] | None = None) -> LLM:
+def create_llm(tag: str, params: Mapping[str, Any] | None = None) -> BaseLLM:
     """Build the backend named by ``tag``, configured from ``params``.
 
     The whole ``params`` mapping is handed to the backend's constructor, whose
@@ -81,7 +81,7 @@ def create_llm(tag: str, params: Mapping[str, Any] | None = None) -> LLM:
     return cls.from_dict(params)
 
 
-class MockLLMClient(LLM):
+class MockLLMClient(BaseLLM):
     """LLM backend that delegates to a user-provided callback.
 
     The callback receives ``(model, messages, **kwargs)`` and returns either:
@@ -106,7 +106,7 @@ class MockLLMClient(LLM):
     the ordinary way to select any backend.
     """
 
-    #: Its own default, rather than the real one it would otherwise inherit from ``LLM``. A mock
+    #: Its own default, rather than the real one it would otherwise inherit from ``BaseLLM``. A mock
     #: reporting ``gpt-5-mini`` would be priced and described as that model.
     model: str = "mock"
 
@@ -121,9 +121,8 @@ class MockLLMClient(LLM):
                 content=result,
                 prompt_tokens=0,
                 completion_tokens=0,
-                total_tokens=0,
                 cached_tokens=0,
-                cost=0.0,
+                cost_usd=0.0,
             )
         return result
 
@@ -143,8 +142,7 @@ class MockLLMClient(LLM):
                 content=result,
                 prompt_tokens=0,
                 completion_tokens=0,
-                total_tokens=0,
-                cost=0.0,
+                cost_usd=0.0,
             )
         return result
 

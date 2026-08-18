@@ -18,13 +18,14 @@ def _build_langfuse_headers(public_key: str, secret_key: str) -> dict[str, str]:
 
 
 class LangfuseTracing(OTelTracing):
-    """Hook preset for exporting Jaz traces to Langfuse Cloud.
+    """Hook preset for exporting JAZ traces to Langfuse Cloud.
 
     By default, credentials are read from environment:
+
     - ``LANGFUSE_PUBLIC_KEY``
     - ``LANGFUSE_SECRET_KEY``
-    - ``LANGFUSE_HOST`` (optional, defaults to ``https://cloud.langfuse.com``)
-      ``LANGFUSE_BASE_URL`` is also supported as an alias.
+    - ``LANGFUSE_HOST`` (optional, defaults to ``https://cloud.langfuse.com``;
+      ``LANGFUSE_BASE_URL`` is also supported as an alias)
 
     Args:
         public_key: Langfuse public key. Falls back to env if omitted.
@@ -74,5 +75,5 @@ class LangfuseTracing(OTelTracing):
 #: Deprecated alias for the pre-rename spelling — see the rationale block in
 #: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
 #: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_every_renamed_hook_has_an_alias``).
+#: (``test_legacy_hook_names_still_importable``).
 LangfuseTracingHook = LangfuseTracing

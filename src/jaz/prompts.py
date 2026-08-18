@@ -2,7 +2,6 @@ import inspect
 from collections.abc import Callable, Collection, Mapping, Sequence
 
 from .descriptions import HIDDEN, get_description, resolve_jaz_get
-from .library import Library
 from .repl.registry import REPL_LANGUAGE_MAP
 from .string_utils import abbreviate_string
 from .template_loader import _jinja_env
@@ -100,7 +99,7 @@ def _render_input_block(
     key: str,
     value: object,
     *,
-    max_input_length: int,
+    max_invoke_input_length: int,
     prefix_ratio: float,
 ) -> tuple[str | None, bool]:
     """Render one input as a prompt block.
@@ -124,12 +123,12 @@ def _render_input_block(
     if desc is HIDDEN:
         return None, False  # jaz.Display(value, None): hidden for this call
     real_value = resolve_jaz_get(value)
-    # The per-input `max_input_length` cap is a property of the invoke, applied
+    # The per-input `max_invoke_input_length` cap is a property of the invoke, applied
     # uniformly to whatever text renders for this input — author-authored
     # (Display / describe / Library catalog) and auto-stringified defaults alike.
     # Provenance does not earn an exemption: a huge `describe` string or catalog
     # would otherwise escape the invoke's ceiling entirely. `abbreviate_string`
-    # splices the cut in place ("[N characters omitted]") and flags `was_truncated`, so a
+    # splices the cut in place ("[...N characters omitted...]") and flags `was_truncated`, so a
     # truncated value always announces itself rather than silently appearing whole.
     # TODO(#553): give the agent a REPL tool to read the omitted portion on demand,
     # so uniform truncation stays ergonomic instead of exempting text from the cap.
@@ -140,7 +139,7 @@ def _render_input_block(
         desc if isinstance(desc, str) else _format_input_value_default(key, real_value)
     )
     abbreviated_value, was_truncated = abbreviate_string(
-        value_str, max_input_length, prefix_ratio=prefix_ratio
+        value_str, max_invoke_input_length, prefix_ratio=prefix_ratio
     )
     # Each input renders as a single XML block whose tag name IS the input's bound name
     # and whose `type=` attribute is the runtime type — the unified surface after `task`
@@ -164,9 +163,9 @@ def _render_input_block(
 def render_input_section(
     inputs: Mapping[str, object],
     *,
-    max_input_length: int,
+    max_invoke_input_length: int,
     # Mirrors ``Config.protocol.truncation_prefix_ratio``'s default; the production caller
-    # (``DefaultProtocol``) always passes the configured value, so this only covers direct
+    # (``CodeOnlyProtocol``) always passes the configured value, so this only covers direct
     # callers. Kept in step with the config so those two never disagree about the split.
     prefix_ratio: float = 0.5,
 ) -> tuple[str, list[str], list[str]]:
@@ -193,7 +192,7 @@ def render_input_section(
         block, was_truncated = _render_input_block(
             key,
             value,
-            max_input_length=max_input_length,
+            max_invoke_input_length=max_invoke_input_length,
             prefix_ratio=prefix_ratio,
         )
         if block is None:
@@ -208,13 +207,25 @@ def render_input_section(
 def get_system_prompt(
     *,
     system_prompt_template: str = "system_prompt.jinja2",
-    jaz_library: Library | None,
+    subinvoke_description: str | None,
     depth: int,
     recursion_available: bool,
     repl_language: str,
     repl: object | None = None,
     scoped_inputs_str: str = "",
     scoped_names: Sequence[str] = (),
+    # The wire-format instruction block, owned and supplied by the BaseProtocol
+    # (#639) — this helper only places it via `{{ format_instructions }}`, it does not
+    # author it. Defaults to "" so direct callers that don't drive a protocol (tests,
+    # bare prompt renders) still satisfy the template's StrictUndefined without inventing
+    # the text here; the production caller (CodeOnlyProtocol) always passes the real block.
+    format_instructions: str = "",
+    # The `__history__` block, likewise owned and supplied by the protocol (its record seam —
+    # BaseProtocol.describe_history_entry) and merely placed here. Defaults to "" on the same
+    # reasoning as `format_instructions`: a direct caller with no protocol renders a prompt that
+    # simply does not mention history, rather than this helper inventing a record shape it has no
+    # way to know. The production caller gates it on `repl.maintains_repl_history` before passing.
+    history_description: str = "",
 ) -> str:
     # Scoped inputs (ambient via `jaz.scope`) render here in the SYSTEM prompt,
     # not the user prompt: they are global/ambient to the whole invoke — like the
@@ -233,9 +244,17 @@ def get_system_prompt(
     # shown names; the template writes the sentence around it exactly as
     # `user_prompt.jinja2` does for explicit inputs.
     # Generate REPL description header (an agent has exactly one REPL).
+    #
+    # NO LONGER RENDERED BY THE SHIPPED TEMPLATE, and still computed and passed on purpose —
+    # do not delete it as dead code. The shipped `system_prompt.jinja2` dropped its
+    # `{{ repl_summary }}` line because the description below already opens by naming the
+    # language ("## Python REPL specification"), so the sentence was a second, wordier
+    # statement of it. But the render env is `StrictUndefined`: an out-of-tree
+    # system-prompt template that still references `{{ repl_summary }}` would *raise* the
+    # moment we stopped passing it, rather than quietly rendering nothing. Keeping the kwarg
+    # is therefore the non-breaking half of the change — the same reasoning that keeps
+    # `show_depth` under its stale name below.
     repl_summary = f"You have access to the `{repl_language}` REPL. "
-
-    # Get REPL configs - use provided or empty dict
 
     # Collect the REPL-specific instructions for the agent's REPL.
     if repl_language not in REPL_LANGUAGE_MAP:
@@ -252,15 +271,26 @@ def get_system_prompt(
         if repl is not None
         else REPL_LANGUAGE_MAP[repl_language].get_description()
     )
-    repl_specific_instructions = (
-        f'<repl_description lang="{repl_language}">\n{description}\n</repl_description>'
-    )
+    # Passed through unwrapped: the template owns the tag (`<repl_spec>`). This used to add a
+    # second `<repl_description lang="...">` wrapper of its own, which nested one tag inside
+    # another around a single block once the template grew its own.
+    #
+    # The `lang` attribute went with it, which leaves the *body* of whatever description
+    # template is configured as the only place the language is named — the shipped
+    # `python_repl_description.jinja2` opens "## Python REPL specification" and the evals
+    # variants open "PYTHON REPL INPUT SPECIFICATION", so every template in this repo still
+    # says it. Not a guarantee though: `repl_description_template` is caller-configurable, so
+    # an out-of-tree description that never names its language now yields a prompt that names
+    # it nowhere, where the dropped `lang=` and `{{ repl_summary }}` were two independent
+    # statements of it. Accepted — the agent's own code makes the language obvious — but it is
+    # why removing BOTH in one change is a bigger step than either alone.
+    repl_specific_instructions = description
 
-    # Tell the agent the propagation rule (scoped values ride along into every `jaz.invoke()`)
-    # exactly when it can recurse — i.e. when the recursive jaz.invoke tool is bound. Keyed on
-    # `recursion_available`, NOT on `jaz_library is not None`: at a RecursionLimit cap leaf the
-    # library can still be present (it carries the side-effect-free jaz.* helpers minus invoke,
-    # #635) while recursion is off, so library-presence is no longer the signal.
+    # Tell the agent the propagation rule (scoped values ride along into every `invoke()`)
+    # exactly when it can recurse. Keyed on `recursion_available` rather than on
+    # `subinvoke_description is not None` even though the two now always agree: `recursion_available`
+    # is the *reason* (a DisableRecursion effect), and reading the reason keeps this correct if a
+    # future caller ever withholds the tool for some other cause.
     #
     # The template variable is still spelled `show_depth` because out-of-tree system-prompt
     # templates use that name; it no longer gates any depth line (there hasn't been one for a
@@ -269,17 +299,38 @@ def get_system_prompt(
     # rule gets the honest name, `recursion_available`.
     show_depth = recursion_available
 
-    rendered_jaz_library = (
-        jaz_library.render_prompt_description(full_docstrings=True)
-        if jaz_library is not None
-        else None
-    )
-
+    # One catalog entry — `- `invoke(**inputs)`: <docstring>` — rather than the library card
+    # (name / description / top-level modules) this used to render via
+    # `Library.render_prompt_description`. The description is produced by the PROTOCOL
+    # (`BaseProtocol.get_subinvoke_description`, whose default introspects the bound `invoke`
+    # closure) and arrives here pre-rendered as `subinvoke_description`; this helper only places
+    # it, staying codec-agnostic. It is still exposed to the template under the name `invoke_tool`.
+    #
+    # RENAMED (`jaz_library` -> `invoke_tool`) even though `show_depth` above was deliberately
+    # NOT renamed, for the same out-of-tree-template audience. The two point opposite ways on
+    # purpose: what differs is whether the old name still tells the truth. `show_depth`'s VALUE
+    # is unchanged, so a stale `{% if show_depth %}` keeps working AND keeps meaning what it
+    # meant — renaming it would break out-of-tree templates to buy nothing but a tidier word.
+    # This variable's value changed shape — a library card became one function's catalog entry —
+    # so keeping the name would hand out-of-tree templates a `jaz_library` that is not a library,
+    # and their `<jaz_library>` wrapper tag would end up labelling an `invoke` entry.
+    #
+    # Renaming is safe to do loudly here: the Jinja env uses `StrictUndefined`, which raises on
+    # *any* operation on an undefined — including a boolean test — so a stale
+    # `{% if jaz_library %}` fails at render with "'jaz_library' is undefined" rather than
+    # quietly testing falsy and dropping the block. That is the outcome a rename wants (a named,
+    # immediate error), and it is why no compatibility alias is passed alongside. In-tree
+    # exposure is nil regardless: every `system_prompt_template:` in `evals/configs/` points at
+    # the shipped `system_prompt.jinja2`.
     template = _jinja_env.get_template(system_prompt_template)
     prompt = template.render(
         repl_summary=repl_summary,
         repl_specific_instructions=repl_specific_instructions,
-        jaz_library=rendered_jaz_library,
+        format_instructions=format_instructions,
+        history_description=history_description,
+        # `subinvoke_description` (protocol-rendered) is exposed to the template under the name
+        # `invoke_tool` — see the block comment above on why the template var keeps that name.
+        invoke_tool=subinvoke_description,
         show_depth=show_depth,
         depth=depth,
         scoped_inputs_str=scoped_inputs_str,
@@ -293,7 +344,7 @@ def get_user_prompt(
     *,
     user_prompt_template: str = "user_prompt.jinja2",
     inputs: Mapping[str, object],
-    max_input_length: int,
+    max_invoke_input_length: int,
     input_truncation_advice_template: str | None = None,
     extra_truncated_names: Collection[str] | None = None,
     prefix_ratio: float = 0.5,  # mirrors Config.protocol.truncation_prefix_ratio
@@ -329,7 +380,7 @@ def get_user_prompt(
         block, was_truncated = _render_input_block(
             key,
             value,
-            max_input_length=max_input_length,
+            max_invoke_input_length=max_invoke_input_length,
             prefix_ratio=prefix_ratio,
         )
         if block is None:

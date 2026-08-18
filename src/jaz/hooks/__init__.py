@@ -1,7 +1,15 @@
-"""Hook system for orchestrating hooks and composing execution contexts.
+"""Hook system: observe and influence a running agent through events and effects.
 
-The hook system provides a type-safe, composable way to observe and influence
-agent execution through events, effects, and contexts.
+The mental model in three sentences. As an agent runs, the framework fires typed
+**events** at fixed points: once around the whole invoke, and per turn around the LLM
+query and the REPL execution — each of those three spans walks the same four stages,
+``Enter → Send → Complete → Exit`` (see :mod:`jaz.hooks.events` for the pipeline). A
+**hook** is a class with a method per event it cares about (:class:`LLMQueryEnter` →
+``on_llm_query_enter``); each handler receives the event and returns a list of
+**effects** — the only way a hook changes anything (:mod:`jaz.hooks.effects` says which
+effect is valid at which stage). Effects from all active hooks are composed
+order-independently and applied by the framework; a hook that returns ``[]`` everywhere
+is a pure observer.
 
 Public surface (three parts):
 
@@ -10,22 +18,34 @@ Public surface (three parts):
   :class:`ReturnType`, ...).
 - ``jaz.hooks.events`` — the typed events a hook handler *receives* (:class:`InvokeEnter`,
   :class:`REPLExecExit`, ...).
-- ``jaz.hooks.effects`` — the typed effects a hook handler *returns* (:class:`ModifyResult`,
+- ``jaz.hooks.effects`` — the typed effects a hook handler *returns* (:class:`ModifyExecResult`,
   :class:`AddMessages`, :class:`Abort`, ...).
 
-Example usage::
+A complete first hook — count the turns, nudge the agent, then stop it::
 
-    from jaz.hooks import Hook, PrintLogger
-    from jaz.hooks.events import REPLExecExit
-    from jaz.hooks.effects import ModifyResult
+    from jaz import invoke
+    from jaz.hooks import Hook
+    from jaz.hooks.effects import Abort, AddMessages, Effect
+    from jaz.hooks.events import LLMQueryEnter
+
+    class TurnLimiter(Hook):
+        def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+            if event.iteration >= 10:
+                return [Abort(error=RuntimeError("out of turns"))]
+            if event.iteration >= 8:
+                return [AddMessages([{"role": "user", "content": "Finish soon."}])]
+            return []
 
     # `with` activation propagates to nested invokes:
-    with BudgetPool(cost_budget=1.0, calls_budget=50), PrintLogger():
-        result = invoke(...)
+    with TurnLimiter():
+        result = invoke(task="...")
 
     # Passing a hook positionally scopes it to that one invoke — nested invokes
-    # do NOT see it. See ``Hook`` for the difference.
-    result = invoke(PrintLogger(), task="...")
+    # do NOT see it. See the Hook class for the difference.
+    result = invoke(TurnLimiter(), task="...")
+
+Before writing your own, check the battery hooks — limits, budgets, logging, tracing,
+compaction, and replay are already covered.
 
 **Experimental.** The hook system is an experimental feature; its interfaces may change
 in a future release.
@@ -49,22 +69,30 @@ from . import effects, events
 # hook *vocabulary* lives in the events/effects sub-namespaces (jaz.hooks.events /
 # jaz.hooks.effects). The dispatch engine (`HookDispatcher`/`get_dispatcher`), the
 # internal contract base (`ExecutionContext`), the `Blackboard` store type, and
-# `MetaData`/`WorkflowReplayHook`/`TemplatedMustExitWarning` are demoted (see `_DEMOTED`:
+# `MetaData`/`WorkflowReplayHook` are demoted (see `_DEMOTED`:
 # reachable via `__getattr__`, with a NonPublicAPIWarning).
 #
-# `ConversationHistory` and `Replay` are demoted too, and are deliberately absent from this
-# eager import: an eagerly-bound attribute is found by normal lookup and never reaches
-# `__getattr__`, so importing them here would silently re-promote the two names.
+# `ATIFTrace`/`ATIFReplay` are public here as of 2026-08-15 (user call), superseding the
+# review-of-#962 demotion of the replay hook and `ATIFTrace`'s deep-path-only status:
+# ATIF is the canonical trace/replay/cost format (#813, #1159), so its write/read pair
+# belongs on the offered surface rather than behind deep imports every consumer had to
+# know. The replay hook was renamed `Replay` → `ATIFReplay` at promotion (user call,
+# same review): `RolloutRecorder` already makes token-native rollouts a second recorded
+# format, so the bare name would collide with a future token-native replay, and the
+# shared prefix keeps the write/read pair adjacent in `__all__` and on the docs page.
 from .builtin import (
+    ATIFReplay,
+    ATIFTrace,
     BudgetForcing,
     BudgetPool,
     Compaction,
-    ContextWindow,
+    ContextWindowWarning,
     FileLogger,
     IterationLimit,
     PrintLogger,
     RecursionLimit,
     ReturnType,
+    RolloutRecorder,
     ValidateREPLInput,
     ValidateReturn,
 )
@@ -80,16 +108,14 @@ if TYPE_CHECKING:
     # ``.builtin``, which binds them as plain aliases of the renamed classes.
     from .builtin import BudgetForcingHook as BudgetForcingHook
     from .builtin import CompactionHook as CompactionHook
+    from .builtin import ContextWindow as ContextWindow
     from .builtin import ContextWindowHook as ContextWindowHook
-    from .builtin import ConversationHistory as ConversationHistory
-    from .builtin import ConversationHistoryHook as ConversationHistoryHook
     from .builtin import IterationLimitHook as IterationLimitHook
     from .builtin import JaegerTracingHook as JaegerTracingHook
     from .builtin import LangfuseTracingHook as LangfuseTracingHook
     from .builtin import MetaData as MetaData
     from .builtin import Replay as Replay
     from .builtin import ReplayHook as ReplayHook
-    from .builtin import TemplatedMustExitWarning as TemplatedMustExitWarning
     from .builtin import WorkflowReplay as WorkflowReplay
     from .builtin import WorkflowReplayHook as WorkflowReplayHook
     from .dispatcher import HookDispatcher as HookDispatcher
@@ -104,24 +130,41 @@ if TYPE_CHECKING:
     from .effects import DropMessages as DropMessages
     from .effects import DropVariables as DropVariables
     from .effects import Effect as Effect
-    from .effects import ModifyResult as ModifyResult
-    from .effects import OverrideResponse as OverrideResponse
-    from .effects import OverrideResult as OverrideResult
+    from .effects import ModifyExecResult as ModifyExecResult
+    from .effects import SupplyExecResult as SupplyExecResult
+    from .effects import SupplyLLMResponse as SupplyLLMResponse
+    from .events import Aborted as Aborted
+    from .events import Completed as Completed
     from .events import Event as Event
+    from .events import Failed as Failed
+    from .events import InvokeComplete as InvokeComplete
+    from .events import InvokeCompleteContext as InvokeCompleteContext
     from .events import InvokeContext as InvokeContext
     from .events import InvokeEnter as InvokeEnter
     from .events import InvokeExit as InvokeExit
+    from .events import InvokeOutcome as InvokeOutcome
+    from .events import InvokeSend as InvokeSend
+    from .events import InvokeSendContext as InvokeSendContext
     from .events import InvokeSpan as InvokeSpan
+    from .events import LLMQueryComplete as LLMQueryComplete
+    from .events import LLMQueryCompleteContext as LLMQueryCompleteContext
     from .events import LLMQueryContext as LLMQueryContext
     from .events import LLMQueryEnter as LLMQueryEnter
     from .events import LLMQueryExit as LLMQueryExit
+    from .events import LLMQueryOutcome as LLMQueryOutcome
     from .events import LLMQueryRetry as LLMQueryRetry
     from .events import LLMQueryRetryContext as LLMQueryRetryContext
+    from .events import LLMQuerySend as LLMQuerySend
+    from .events import LLMQuerySendContext as LLMQuerySendContext
     from .events import LLMQuerySpan as LLMQuerySpan
+    from .events import REPLExecComplete as REPLExecComplete
+    from .events import REPLExecCompleteContext as REPLExecCompleteContext
     from .events import REPLExecContext as REPLExecContext
     from .events import REPLExecEnter as REPLExecEnter
     from .events import REPLExecExit as REPLExecExit
-    from .events import REPLExecExitContext as REPLExecExitContext
+    from .events import REPLExecOutcome as REPLExecOutcome
+    from .events import REPLExecSend as REPLExecSend
+    from .events import REPLExecSendContext as REPLExecSendContext
     from .events import REPLExecSpan as REPLExecSpan
 
 # Conditionally import tracing hooks
@@ -139,15 +182,18 @@ __all__ = [
     # Authoring primitive
     "Hook",
     # Concrete built-in hooks ("batteries")
+    "ATIFReplay",
+    "ATIFTrace",
     "BudgetForcing",
     "BudgetPool",
     "Compaction",
-    "ContextWindow",
+    "ContextWindowWarning",
     "IterationLimit",
     "RecursionLimit",
     "PrintLogger",
     "FileLogger",
     "ReturnType",
+    "RolloutRecorder",
     "ValidateReturn",
     "ValidateREPLInput",
 ]
@@ -161,20 +207,21 @@ if _TRACING_AVAILABLE:
 # `jaz.hooks.<name>` spelling of it is demoted; the dispatch engine / internal machinery
 # has no public home.
 _DEMOTED = {
-    "ConversationHistory": ("jaz.hooks.builtin", "ConversationHistory"),
-    "Replay": ("jaz.hooks.builtin", "Replay"),
+    # Pre-promotion spelling of ATIFReplay: this name was reachable-with-warning here
+    # before the rename, so it keeps exactly that status rather than becoming an
+    # AttributeError.
+    "Replay": ("jaz.hooks.builtin", "ATIFReplay"),
     "ExecutionContext": ("jaz.hooks.base", "ExecutionContext"),
     "Blackboard": ("jaz.hooks.blackboard", "Blackboard"),
     "MetaData": ("jaz.hooks.builtin", "MetaData"),
-    "TemplatedMustExitWarning": ("jaz.hooks.builtin", "TemplatedMustExitWarning"),
     "WorkflowReplay": ("jaz.hooks.builtin", "WorkflowReplay"),
     "HookDispatcher": ("jaz.hooks.dispatcher", "HookDispatcher"),
     "get_dispatcher": ("jaz.hooks.dispatcher", "get_dispatcher"),
     # Effect vocabulary — blessed path: jaz.hooks.effects.<name>
     "Effect": ("jaz.hooks.effects", "Effect"),
     "Abort": ("jaz.hooks.effects", "Abort"),
-    "OverrideResult": ("jaz.hooks.effects", "OverrideResult"),
-    "ModifyResult": ("jaz.hooks.effects", "ModifyResult"),
+    "SupplyExecResult": ("jaz.hooks.effects", "SupplyExecResult"),
+    "ModifyExecResult": ("jaz.hooks.effects", "ModifyExecResult"),
     "DisableRecursion": ("jaz.hooks.effects", "DisableRecursion"),
     "AddInputs": ("jaz.hooks.effects", "AddInputs"),
     "DropInputs": ("jaz.hooks.effects", "DropInputs"),
@@ -182,31 +229,48 @@ _DEMOTED = {
     "DropVariables": ("jaz.hooks.effects", "DropVariables"),
     "DropMessages": ("jaz.hooks.effects", "DropMessages"),
     "AddMessages": ("jaz.hooks.effects", "AddMessages"),
-    "OverrideResponse": ("jaz.hooks.effects", "OverrideResponse"),
+    "SupplyLLMResponse": ("jaz.hooks.effects", "SupplyLLMResponse"),
     "BlackboardWrite": ("jaz.hooks.effects", "BlackboardWrite"),
     # Event vocabulary — blessed path: jaz.hooks.events.<name>
     "Event": ("jaz.hooks.events", "Event"),
+    "Completed": ("jaz.hooks.events", "Completed"),
+    "Aborted": ("jaz.hooks.events", "Aborted"),
+    "Failed": ("jaz.hooks.events", "Failed"),
+    "LLMQueryOutcome": ("jaz.hooks.events", "LLMQueryOutcome"),
+    "REPLExecOutcome": ("jaz.hooks.events", "REPLExecOutcome"),
+    "InvokeOutcome": ("jaz.hooks.events", "InvokeOutcome"),
     "REPLExecEnter": ("jaz.hooks.events", "REPLExecEnter"),
+    "REPLExecSend": ("jaz.hooks.events", "REPLExecSend"),
+    "REPLExecComplete": ("jaz.hooks.events", "REPLExecComplete"),
     "REPLExecExit": ("jaz.hooks.events", "REPLExecExit"),
     "LLMQueryEnter": ("jaz.hooks.events", "LLMQueryEnter"),
+    "LLMQuerySend": ("jaz.hooks.events", "LLMQuerySend"),
+    "LLMQueryComplete": ("jaz.hooks.events", "LLMQueryComplete"),
     "LLMQueryExit": ("jaz.hooks.events", "LLMQueryExit"),
     "InvokeEnter": ("jaz.hooks.events", "InvokeEnter"),
+    "InvokeSend": ("jaz.hooks.events", "InvokeSend"),
+    "InvokeComplete": ("jaz.hooks.events", "InvokeComplete"),
     "InvokeExit": ("jaz.hooks.events", "InvokeExit"),
     "LLMQueryRetry": ("jaz.hooks.events", "LLMQueryRetry"),
     # internal dispatcher contracts / span wrappers
     "InvokeContext": ("jaz.hooks.events", "InvokeContext"),
+    "InvokeSendContext": ("jaz.hooks.events", "InvokeSendContext"),
+    "InvokeCompleteContext": ("jaz.hooks.events", "InvokeCompleteContext"),
     "InvokeSpan": ("jaz.hooks.events", "InvokeSpan"),
     "LLMQueryContext": ("jaz.hooks.events", "LLMQueryContext"),
+    "LLMQuerySendContext": ("jaz.hooks.events", "LLMQuerySendContext"),
+    "LLMQueryCompleteContext": ("jaz.hooks.events", "LLMQueryCompleteContext"),
     "LLMQuerySpan": ("jaz.hooks.events", "LLMQuerySpan"),
     "LLMQueryRetryContext": ("jaz.hooks.events", "LLMQueryRetryContext"),
     "REPLExecContext": ("jaz.hooks.events", "REPLExecContext"),
-    "REPLExecExitContext": ("jaz.hooks.events", "REPLExecExitContext"),
+    "REPLExecSendContext": ("jaz.hooks.events", "REPLExecSendContext"),
+    "REPLExecCompleteContext": ("jaz.hooks.events", "REPLExecCompleteContext"),
     "REPLExecSpan": ("jaz.hooks.events", "REPLExecSpan"),
 }
 
 # Pre-rename spellings (#806 question 1 dropped the ``Hook`` suffix across the whole set).
 # Every one was in ``__all__`` before the rename — documented surface, not merely reachable —
-# so dropping it outright would turn `from jaz.hooks import ConversationHistoryHook` in
+# so dropping it outright would turn `from jaz.hooks import WorkflowReplayHook` in
 # out-of-tree code into an ImportError with no hint of the replacement.
 #
 # Routed through ``_DEMOTED`` rather than bound as plain aliases (`XHook = X`), which is what
@@ -216,17 +280,16 @@ _DEMOTED = {
 # alias, and an eagerly-bound attribute never reaches ``__getattr__`` — silently un-demoting
 # the very name this module means to demote.
 #
-# These are *import*-compatibility only. The serialized ``qualified_name`` in existing ATIF
-# traces / conversation-history records is handled separately by ``_LEGACY_HOOK_QUALNAMES``
-# in ``dispatcher.py`` — an entry here registers nothing.
+# These are *import*-compatibility only: they keep the old ``XxxHook`` names importable. An
+# entry here registers nothing and has no bearing on serialized ``qualified_name`` reconstruction.
 _DEMOTED.update(
     {
         "BudgetForcingHook": ("jaz.hooks.builtin", "BudgetForcing"),
         "CompactionHook": ("jaz.hooks.builtin", "Compaction"),
-        "ContextWindowHook": ("jaz.hooks.builtin", "ContextWindow"),
-        "ConversationHistoryHook": ("jaz.hooks.builtin", "ConversationHistory"),
+        "ContextWindow": ("jaz.hooks.builtin", "ContextWindowWarning"),
+        "ContextWindowHook": ("jaz.hooks.builtin", "ContextWindowWarning"),
         "IterationLimitHook": ("jaz.hooks.builtin", "IterationLimit"),
-        "ReplayHook": ("jaz.hooks.builtin", "Replay"),
+        "ReplayHook": ("jaz.hooks.builtin", "ATIFReplay"),
         "WorkflowReplayHook": ("jaz.hooks.builtin", "WorkflowReplay"),
     }
 )

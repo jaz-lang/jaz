@@ -13,11 +13,11 @@ from typing import Any
 from jaz.exceptions import ConfigOverrideActivationError
 
 from .instantiate import unknown_option_error
-from .protocol.base import InteractionProtocol
-from .protocol.default import DefaultProtocol
-from .providers.llm import LLM
-from .providers.openai import OpenAILLM
-from .repl.base import REPL
+from .llm import LiteLLM
+from .llm.llm import BaseLLM
+from .protocol.base import BaseProtocol
+from .protocol.code_only import CodeOnlyProtocol
+from .repl.base import BaseREPL
 from .repl.python_repl import PythonREPL
 
 # Default per-level governance limit (preserves the historical Config default for
@@ -31,8 +31,9 @@ _DEFAULT_MAX_ITERATIONS = 10
 # (``repl.params`` is a protected key, #690). The name surface is policed separately by the builtins
 # allowlist installed as ``__builtins__`` (#804, permissions.py), not by a config key. All defaults
 # are secure-by-default and live next to enforcement in ``repl/python_repl.py``: ``allowed_imports``
-# and the file paths default to ``[]`` (deny all), ``allowed_attributes`` to ``["*", "!__*"]`` (allow
-# all except dunders); "allow all" is always the explicit pattern (``["*"]`` for names, ``["//**"]``
+# and the file paths default to ``[]`` (deny all), ``allowed_attributes`` to
+# ``DEFAULT_ALLOWED_ATTRIBUTES`` (allow all except dunders and the frame-bearing interpreter
+# surface); "allow all" is always the explicit pattern (``["*"]`` for names, ``["//**"]``
 # for the whole filesystem — file anchors are ``//``=fs, ``~/``=home, ``/``=cwd-top, bare=cwd). The old
 # ``_DEFAULT_*`` reference constants that used to sit here were dead once #688 made the sandbox
 # config-driven, so they were removed.
@@ -50,26 +51,26 @@ _DEPTH_OVERRIDE_EXCLUDED_FIELDS = frozenset({"depth_overrides"})
 # consumer derives from this one mapping rather than restating the names, so a fourth group
 # cannot be added in one place and silently skipped in another.
 #
-# Config stores the *configured components themselves* — an `LLM`, a `REPL`, an
-# `InteractionProtocol` — not a `{tag, params}` description of them. What that buys, and what it
+# Config stores the *configured components themselves* — a `BaseLLM`, a `BaseREPL`, a
+# `BaseProtocol` — not a `{tag, params}` description of them. What that buys, and what it
 # cost to get here, is recorded on `Config`.
 _SUBCONFIG_TYPES: dict[str, type] = {
-    "llm": LLM,
-    "repl": REPL,
-    "protocol": InteractionProtocol,
+    "llm": BaseLLM,
+    "repl": BaseREPL,
+    "protocol": BaseProtocol,
 }
 _SUBCONFIGS = tuple(_SUBCONFIG_TYPES)
 
 #: Copy-pasteable "build one of these" hint per group, for the error a caller gets when they
 #: pass a dict. Spelled with the import because none of these names is reachable from the `jaz`
 #: top level, and this is printed to someone whose config just stopped working. A concrete class
-#: rather than the ABC in `_SUBCONFIG_TYPES`: "must be a REPL" does not tell you what to build.
+#: rather than the ABC in `_SUBCONFIG_TYPES`: "must be a BaseREPL" does not tell you what to build.
 _COMPONENT_HINT = {
-    "llm": "from jaz.providers.openai import OpenAILLM; jaz.configure(llm=OpenAILLM(model=...))",
-    "repl": "from jaz.repl.python_repl import PythonREPL; jaz.configure(repl=PythonREPL(...))",
+    "llm": "from jaz.llm import LiteLLM; jaz.configure(llm=LiteLLM(model=...))",
+    "repl": "from jaz.repl import PythonREPL; jaz.configure(repl=PythonREPL(...))",
     "protocol": (
-        "from jaz.protocol.default import DefaultProtocol; "
-        "jaz.configure(protocol=DefaultProtocol(...))"
+        "from jaz.protocol import CodeOnlyProtocol; "
+        "jaz.configure(protocol=CodeOnlyProtocol(...))"
     ),
 }
 
@@ -82,10 +83,15 @@ def _default_components() -> dict[str, Any]:
     and never mutates one in place), but a shared *default* would make that convention the only
     thing standing between two unrelated configs.
     """
+    # LiteLLM is the default LLM, as PythonREPL/CodeOnlyProtocol are the default REPL/protocol —
+    # v1 ships exactly one backend (design/design_features/litellm_sole_backend_v1.md), so an
+    # unconfigured `llm` need not be spelled out. Like OpenAILLM() before it, this instance carries
+    # no model (`model=""`), so it is a placeholder that raises at `get_model` until a model is set
+    # — the model half of #1086's "no silent default" still holds; only the backend half is retired.
     return {
-        "llm": OpenAILLM(),
+        "llm": LiteLLM(),
         "repl": PythonREPL(),
-        "protocol": DefaultProtocol(),
+        "protocol": CodeOnlyProtocol(),
     }
 
 
@@ -93,9 +99,9 @@ def _default_components() -> dict[str, Any]:
 class Config:
     """JAZ framework configuration, grouped by architectural component.
 
-    - ``llm``      (:class:`~jaz.providers.llm.LLM`) — how JAZ talks to the LLM.
-    - ``repl``     (:class:`~jaz.repl.base.REPL`) — how agent code executes.
-    - ``protocol`` (:class:`~jaz.protocol.base.InteractionProtocol`) — the LLM↔REPL codec
+    - ``llm``      (:class:`BaseLLM`) — how JAZ talks to the LLM.
+    - ``repl``     (:class:`BaseREPL`) — how agent code executes.
+    - ``protocol`` (:class:`BaseProtocol`) — the LLM↔REPL codec
       (prompts + parsing).
     - top-level: genuinely cross-cutting options that belong to none of the three.
 
@@ -121,15 +127,9 @@ class Config:
     # * **Typing stopped at the bag.** `params: dict[str, Any]` cannot be checked; a constructor
     #   call can.
 
-    llm: LLM
-    repl: REPL
-    protocol: InteractionProtocol
-
-    # Cross-cutting (belongs to none of the three pieces): whether a sub-agent's synthesized
-    # recursive ``jaz.invoke`` tool may take positional hooks / config overrides. False
-    # (default) → minimal ``(**inputs)`` signature; True → full ``(*local_config_hooks,
-    # **inputs)``.
-    allow_config_hooks_in_subinvoke: bool = False
+    llm: BaseLLM
+    repl: BaseREPL
+    protocol: BaseProtocol
 
     def __init__(self, **kwargs: Any) -> None:
         """Construct a Config from the grouped shape — ``llm=``/``repl=``/``protocol=`` as
@@ -137,19 +137,9 @@ class Config:
 
         Explicit arguments are the only source of configuration: there is no ambient layer
         underneath them, so a Config built here is fully determined by its call site.
-
-        EXECUTIVE CALL (user, 2026-07-31): a leftover ``JAZ_*`` variable is **silently
-        ignored** — no warning, no error. The cost is understood and accepted: a stale
-        ``JAZ_MODEL_CONFIG`` does not crash, it changes model behavior and spend, and shows up
-        later as "results drifted" with nothing pointing at config. Two louder designs were
-        weighed and rejected — warn once at import naming the equivalent ``configure()`` call,
-        and raise outright — on the grounds that a shell profile holding a stale variable
-        should not warn or break runs that never used the feature. Do not add a warning here
-        without revisiting that call.
         """
         for group, component in _default_components().items():
             setattr(self, group, component)
-        self.allow_config_hooks_in_subinvoke = False
         if kwargs:
             self.update(**kwargs)
 
@@ -157,7 +147,7 @@ class Config:
         # Components are SHARED by reference, not copied. They are values here: a fold rebinds a
         # whole field and nothing mutates a component in place, so two configs holding the same
         # `PythonREPL` cannot interfere. Copying them instead would be wrong as well as wasteful
-        # — a `REPL` template is deliberately reusable (its `initialize` returns a fresh
+        # — a `BaseREPL` template is deliberately reusable (its `initialize` returns a fresh
         # instance per invoke), so duplicating it per fold would multiply objects for nothing.
         #
         # `object.__new__` rather than `Config()`: every field is rebound from the source below,
@@ -170,21 +160,6 @@ class Config:
         for f in dataclass_fields(Config):
             setattr(new, f.name, getattr(self, f.name))
         return new
-
-    @staticmethod
-    def _validate(update_dict: Mapping[str, Any]) -> None:
-        """Validate the top-level (non-group) fields.
-
-        Group values need nothing here: each *is* a constructed component, so its own
-        constructor already rejected a bad value at the point it was written. That is most of
-        why this method shrank from ~140 lines — it used to re-check `retry_max_attempts`,
-        `exec_timeout`, `truncation_prefix_ratio` and the template names on behalf of three
-        classes it did not own, gated by group so a leaf could not meet the wrong validator.
-        """
-        if "allow_config_hooks_in_subinvoke" in update_dict and not isinstance(
-            update_dict["allow_config_hooks_in_subinvoke"], bool
-        ):
-            raise ValueError("allow_config_hooks_in_subinvoke must be a boolean")
 
     def _validate_depth_overrides(
         self, value: object
@@ -251,10 +226,10 @@ class Config:
         for key, value in updates.items():
             if key not in valid_top:
                 raise unknown_option_error(key)
-            if key in _SUBCONFIGS:
-                cls._check_component(key, value)
-            else:
-                cls._validate({key: value})
+            # Every top-level field is a configured component (llm/repl/protocol), so validation
+            # is a component-type check; each component's own constructor already validated its
+            # leaves at the point they were written.
+            cls._check_component(key, value)
 
     @staticmethod
     def _check_component(group: str, value: object) -> None:
@@ -265,7 +240,7 @@ class Config:
         # A dict or a bare tag string is the one likely mistake here, because both *used* to work:
         # config compiled authored data itself before the boundary moved out. Point at where that
         # data goes now rather than only naming the offending type — a caller who gets
-        # "must be a REPL, got dict" back from a config file they have used for months otherwise
+        # "must be a BaseREPL, got dict" back from a config file they have used for months otherwise
         # has no way to know the migration errors moved with it.
         if isinstance(value, Mapping | str):
             raise ValueError(
@@ -299,11 +274,10 @@ class Config:
             value = kwargs.pop(group)
             self._check_component(group, value)
             setattr(self, group, value)
-        self._validate(kwargs)
-        for key, value in kwargs.items():
-            if key not in self.__dataclass_fields__:
-                raise unknown_option_error(key)
-            setattr(self, key, value)
+        # Every dataclass field is a component, popped above, so anything left is an unknown
+        # option. (No non-component top-level field exists to setattr — the loop only rejects.)
+        for key in kwargs:
+            raise unknown_option_error(key)
 
 
 _default_config = Config()
@@ -594,7 +568,7 @@ def get_config() -> Config:
 def get_config_stack() -> ConfigStack:
     """Return the live ``_config_stack`` ContextVar value (the ordered override stack).
 
-    The agent-facing synthesized :func:`invoke` (see ``get_jaz_library`` in library/jaz.py) reads
+    The agent-facing synthesized :func:`invoke` (see ``get_invoke_tool`` in _invoke_tool.py) reads
     this to re-establish propagated config across a raw worker-thread boundary: it composes the
     closure-threaded ancestor stack with any layers the worker pushed locally. ``stack.established``
     distinguishes a fresh worker (ContextVar didn't propagate → needs re-base) from a same-thread
@@ -619,10 +593,28 @@ def _reset_config_stack(token: Token[ConfigStack]) -> None:
     _config_stack.reset(token)
 
 
-# TODO(#993): replace `**kwargs` with an explicit keyword signature so configure sites are
-# statically checked. Needs an `_UNSET` sentinel first: `Config.update` keys off kwarg
-# *presence*, and `None` is a real value for several leaves (`exec_timeout`, `exec_memory_limit`).
-def configure(**kwargs) -> None:
+# Sentinel default for the explicit configure()/ConfigOverride signatures. Config.update keys off
+# argument *presence* — naming a field replaces it, omitting it leaves it untouched — and None/False
+# are legitimate values for some fields, so "omitted" cannot be spelled None. Typed Any so it
+# satisfies every parameter's declared type as a default.
+_UNSET: Any = object()
+
+
+def _configured_fields(**maybe_unset: Any) -> dict[str, Any]:
+    """Keep only the fields the caller actually passed (drop ``_UNSET``).
+
+    Preserves ``Config.update``'s presence semantics under an explicit signature: a field is
+    applied only when named, never merely because it carries a default.
+    """
+    return {name: value for name, value in maybe_unset.items() if value is not _UNSET}
+
+
+def configure(
+    *,
+    llm: BaseLLM = _UNSET,
+    repl: BaseREPL = _UNSET,
+    protocol: BaseProtocol = _UNSET,
+) -> None:
     """
     Configure the global default JAZ framework settings.
 
@@ -637,31 +629,27 @@ def configure(**kwargs) -> None:
     completely rather than adjusting one of its settings in place.
 
     Args:
-        llm: How JAZ talks to the model — an :class:`~jaz.providers.llm.LLM` such as
-            ``OpenAILLM(model="gpt-5-mini", temperature=0.7)``. ``openai`` and ``anthropic``
-            ship built in; ``@register_llm`` adds your own. The constructor is the whole
+        llm: How JAZ talks to the model — a :class:`BaseLLM` such as
+            ``LiteLLM(model="openai/gpt-5-mini", temperature=0.7)``. ``litellm`` is the sole
+            built-in backend and the default; ``@register_llm`` adds your own. The constructor is the whole
             surface: the ``model`` id, the backend's own settings (``base_url``, ``api_key``),
-            the retry policy (``retry_max_attempts``, ``retry_wait_multiplier``,
+            the retry policy (``max_retries``, ``retry_wait_multiplier``,
             ``retry_wait_min``, ``retry_wait_max``, ``retry_policy``), and any per-request
             default (``temperature``, ``max_tokens``, ``reasoning_effort``, ...) it passes
             through to the provider API. Anything the constructor does not name becomes a
             per-request default, so a backend gains a setting simply by declaring it.
-        repl: The REPL execution layer — a :class:`~jaz.repl.base.REPL` such as
+        repl: The REPL execution layer — a :class:`BaseREPL` such as
             ``PythonREPL(exec_timeout=60)``. Its constructor takes ``exec_timeout``,
             ``exec_memory_limit`` (process-RSS ceiling in bytes, enforced independently of
             ``exec_timeout``), and the sandbox allow-lists.
-        protocol: The LLM↔REPL codec — an :class:`~jaz.protocol.base.InteractionProtocol` such
-            as ``DefaultProtocol(max_input_length=20000)``. Its constructor takes the
-            ``*_template`` prompt-template paths, ``max_input_length``, ``max_output_length``
+        protocol: The LLM↔REPL codec — a :class:`BaseProtocol` such
+            as ``CodeOnlyProtocol(max_invoke_input_length=20000)``. Its constructor takes the
+            ``*_template`` prompt-template paths, ``max_invoke_input_length``, ``max_repl_output_length``
             and ``truncation_prefix_ratio``.
-        allow_config_hooks_in_subinvoke: Cross-cutting (belongs to none of the three). Whether
-            a sub-agent's synthesized recursive ``jaz.invoke`` tool accepts positional local
-            hooks. ``False`` (default) gives it a minimal ``(**inputs)`` signature; ``True``
-            exposes ``(*local_config_hooks, **inputs)``.
 
     Examples:
         jaz.configure(repl=PythonREPL(exec_timeout=60))
-        jaz.configure(llm=OpenAILLM(model="gpt-5-mini", temperature=0.7))
+        jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7))
 
     Interaction with :func:`configure_by_depth`: an explicit ``configure`` of a field **overrides**
     any prior per-depth override of that *same* field — the touched keys are stripped from every
@@ -669,9 +657,13 @@ def configure(**kwargs) -> None:
     globally" behavior). Per-depth overrides of *other* fields are untouched. (A later
     ``configure_by_depth`` can re-establish a per-depth override.)
     """
-    # TODO: revise docstring
-    _default_config.update(**kwargs)
-    _strip_base_depth_layer_keys(kwargs.keys())
+    updates = _configured_fields(
+        llm=llm,
+        repl=repl,
+        protocol=protocol,
+    )
+    _default_config.update(**updates)
+    _strip_base_depth_layer_keys(updates.keys())
 
 
 def _strip_base_depth_layer_keys(keys: Iterable[str]) -> None:
@@ -723,12 +715,12 @@ def configure_by_depth(
 
     Stored as a single base ``DepthLayer`` in ``_base_config_layer`` (the bottom of the resolve fold),
     NOT as a field on ``_default_config`` — per-depth is a resolution-context rule, not a property
-    of the unconditional default (#727).
+    of the unconditional default.
 
     Examples:
         jaz.configure_by_depth({
-            1: {"llm": OpenAILLM(model="gpt-5")},                    # top invoke
-            2: {"llm": OpenAILLM(model="gpt-5-mini"),                # its sub-invokes
+            1: {"llm": LiteLLM(model="openai/gpt-5")},         # top invoke
+            2: {"llm": LiteLLM(model="openai/gpt-5-mini"),     # its sub-invokes
                 "repl": PythonREPL(exec_timeout=10.0)},
         })
 
@@ -784,19 +776,19 @@ class ConfigOverride:
 
     Contrast with ``jaz.configure(...)``, which sets the process-wide global default.
 
-    Field names and values are validated by ``Config.update`` (same rules as :func:`configure`);
-    unknown fields raise.
+    Takes the same explicit keyword-only fields as :func:`configure` (``llm`` / ``repl`` /
+    ``protocol``); an unknown field is a ``TypeError`` at construction. Field *values* are
+    validated by ``Config.update`` when the override is applied.
 
     Examples:
         # Dynamically scoped — propagates to nested invokes:
-        with ConfigOverride(protocol=DefaultProtocol(max_output_length=20000)):
-            jaz.invoke(...)
+        with ConfigOverride(protocol=CodeOnlyProtocol(max_repl_output_length=20000)):
+            invoke(...)
 
         # Local to one invoke — passed POSITIONALLY. A nested invoke the agent makes uses the
         # ambient config, not the override:
-        jaz.invoke(
-            ReturnType(str),
-            ConfigOverride(protocol=DefaultProtocol(max_output_length=5000)),
+        invoke(
+            ConfigOverride(protocol=CodeOnlyProtocol(max_repl_output_length=5000)),
             task="task",
         )
     """
@@ -808,15 +800,27 @@ class ConfigOverride:
     # harmless — but it keeps the activation model byte-for-byte identical to a hook's, which is
     # the property the two-ways-to-use framing rests on.
 
-    # TODO(#993): explicit keyword signature here too — same `**kwargs`/no-static-typing gap as
-    # ``configure``, and the same `_UNSET` prerequisite.
-    def __init__(self, **overrides: Any) -> None:
-        # Field names/values are validated lazily by ``Config.update`` when the override is
-        # applied — ``apply_to`` for the local form, ``__enter__`` for the scoped form — like
-        # every other field.
+    def __init__(
+        self,
+        *,
+        llm: BaseLLM = _UNSET,
+        repl: BaseREPL = _UNSET,
+        protocol: BaseProtocol = _UNSET,
+    ) -> None:
+        # Field *values* are still validated lazily by ``Config.update`` when the override is
+        # applied — ``apply_to`` for the local form, ``__enter__`` for the scoped form. An
+        # *unknown* field is now a ``TypeError`` at construction (the explicit signature, #993)
+        # rather than a deferred ``ValueError`` — that eager, statically-checkable rejection is
+        # the point of the explicit surface.
         # Exposed read-only (a MappingProxyType view): a ConfigOverride is a value — its
         # override set is fixed at construction.
-        self.overrides: Mapping[str, Any] = MappingProxyType(dict(overrides))
+        self.overrides: Mapping[str, Any] = MappingProxyType(
+            _configured_fields(
+                llm=llm,
+                repl=repl,
+                protocol=protocol,
+            )
+        )
         # A single reset token, non-None only while this instance is active as a `with`
         # block. Entering the *same* instance while it is already active (nested on one
         # thread, or concurrently from another) is forbidden — see `__enter__`. We keep one
@@ -834,7 +838,7 @@ class ConfigOverride:
 
         The input ``config`` is never *rebound* — ``update`` replaces whole fields via ``setattr``,
         never mutating a container in place — so a shallow copy is leak-safe by the same "no in-place
-        container mutation" convention the stack fold relies on (#741 tracks making that structural).
+        container mutation" convention the stack fold relies on.
         Consistent with ``ConfigStack._shallow_fold`` (they were reconciled — both shallow — so
         there is one copy semantics for "resolve overrides onto a base"); the returned config's
         *unoverridden* mutable fields (``repl.configs``/``llm.params``/…) therefore stay shared
@@ -939,15 +943,15 @@ class ConfigOverrideByDepth(ConfigOverride):
     by the local-invoke fold), matching the base's validate-on-use — so a bad partial still fails
     fast when the override is entered/used, while ``repr`` of an unentered instance stays cheap.
 
-    Precedence (#727, now live): if a live :class:`ConfigOverride` and a per-depth override set the
+    Precedence: if a live :class:`ConfigOverride` and a per-depth override set the
     *same* field, precedence follows **declaration nesting** — an inner :class:`ConfigOverride`
     entered *after* a ``ConfigOverrideByDepth`` wins at that depth (the per-depth ``DepthLayer`` is
     folded in push order like any other layer; the global ``configure_by_depth`` base layer is the
-    lowest-precedence per-depth source). Pinned by ``test_nested_config_override_wins_over_depth_override``.
+    lowest-precedence per-depth source).
 
     Examples:
         with ConfigOverrideByDepth({2: {"repl": PythonREPL(exec_timeout=10.0)}}):
-            jaz.invoke(...)   # depth-2 sub-invokes get the 10s timeout; others unchanged
+            invoke(...)   # depth-2 sub-invokes get the 10s timeout; others unchanged
     """
 
     def __init__(self, overrides_by_depth: dict[int, dict[str, Any]] | None) -> None:

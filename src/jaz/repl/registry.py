@@ -8,11 +8,11 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .base import REPL
+    from .base import BaseREPL
 
 
 # Global mapping from language names to REPL classes
-REPL_LANGUAGE_MAP: dict[str, type["REPL"]] = {}
+REPL_LANGUAGE_MAP: dict[str, type["BaseREPL"]] = {}
 
 # Character class for valid REPL language names. No longer shared with the protocol layer: the
 # The response is raw code with no wrapper tag or ``lang=`` attribute, so the protocol has no language
@@ -35,7 +35,7 @@ def register_repl(language: str):
         Decorator function that registers the REPL class
 
     A registered REPL must follow two contracts, neither of which this decorator can check
-    (it verifies only that the class subclasses ``REPL``):
+    (it verifies only that the class subclasses ``BaseREPL``):
 
     * ``__init__`` takes **configuration only** and must leave the instance inert — no
       namespace, no session, nothing per-run. Its declared parameters are the REPL's config
@@ -46,15 +46,15 @@ def register_repl(language: str):
       its own state.
 
     Examples:
-        from jaz.repl.base import REPL
+        from jaz.repl.base import BaseREPL
         from jaz.repl.registry import register_repl
 
         @register_repl("javascript")
-        class JavaScriptREPL(REPL):
+        class JavaScriptREPL(BaseREPL):
             def __init__(self, exec_timeout=30.0):
                 self.exec_timeout = exec_timeout  # configuration only
 
-            def initialize(self, inputs, jaz_library, ...):
+            def initialize(self, inputs, invoke_tool, ...):
                 new = copy.copy(self)             # never bind onto `self`
                 new.namespace = dict(inputs)      # per-invoke state on the copy
                 return new
@@ -72,8 +72,8 @@ def register_repl(language: str):
     # invoke, and starts bleeding state between invokes the moment one is held and reused —
     # silently, as wrong output rather than an error. There is no dispatch seam around
     # `initialize` to enforce it from, so it is stated here, where an implementer looks, and on
-    # the `REPL` ABC. TODO(#1057) tracks detecting it; TODO(#1058) tracks removing the need for
-    # it by making `REPL` stateless with an explicit `REPLState`, which is the intended end
+    # the `BaseREPL` ABC. TODO(#1057) tracks detecting it; TODO(#1058) tracks removing the need for
+    # it by making `BaseREPL` stateless with an explicit `REPLState`, which is the intended end
     # state — there is then no `self` to bind to and the contract cannot be violated.
 
     if not REPL_LANGUAGE_NAME_RE.match(language):
@@ -82,14 +82,14 @@ def register_repl(language: str):
             "REPL language names must match the regex [a-zA-Z0-9_]+"
         )
 
-    def decorator[C: type["REPL"]](repl_class: C) -> C:
+    def decorator[C: type["BaseREPL"]](repl_class: C) -> C:
         """Register the REPL class in the global map."""
         # Import here to avoid circular dependency
-        from .base import REPL
+        from .base import BaseREPL
 
-        if not issubclass(repl_class, REPL):
+        if not issubclass(repl_class, BaseREPL):
             raise TypeError(
-                f"REPL class {repl_class.__name__} must inherit from REPL base class"
+                f"REPL class {repl_class.__name__} must inherit from BaseREPL base class"
             )
         if language in REPL_LANGUAGE_MAP:
             raise ValueError(

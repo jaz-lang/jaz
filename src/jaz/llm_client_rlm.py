@@ -3,16 +3,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ._llm_client import LLM, LLMResponse
-from .providers import cost_per_token
-from .providers.registry import register_llm
+from ._llm_client import BaseLLM, LLMResponse
+from .llm import cost_per_token
+from .llm.registry import register_llm
 
 # TODO: clean up and consolidate logging (logging module vs. our logger hooks)
 logger = logging.getLogger(__name__)
 
 
 @register_llm("rlm")
-class RLMClient(LLM):
+class RLMClient(BaseLLM):
     """LLM client that wraps the RLM framework.
 
     Settings ride the base class's ``**request_defaults`` tail, so they are ordinary keyword
@@ -141,8 +141,7 @@ class RLMClient(LLM):
                 content=result,
                 prompt_tokens=None,
                 completion_tokens=None,
-                total_tokens=None,
-                cost=None,
+                cost_usd=None,
                 raw_response=result,
             )
 
@@ -159,8 +158,7 @@ class RLMClient(LLM):
             content=result.response,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            cost=cost,
+            cost_usd=cost,
             raw_response=result,
         )
 
@@ -247,7 +245,7 @@ class RLMClient(LLM):
         return model
 
     def get_model_info(self, model_config: dict[str, object]) -> dict[str, Any]:
-        from .providers import get_model_info as _get_model_info
+        from .llm import get_model_info as _get_model_info
 
         model_name = self.get_model(model_config)
         info = _get_model_info(model_name) or {}

@@ -1,39 +1,33 @@
 """The LLM backend: one class per backend, doing the whole job.
 
-An :class:`LLM` owns everything about talking to one model service — the HTTP call, error
+A :class:`BaseLLM` owns everything about talking to one model service — the HTTP call, error
 mapping, retry, cost accounting and model metadata. It is selected by a single tag
-(``"openai"``, ``"anthropic"``, ``"rlm"``, plus anything ``@register_llm``\\ ed) and built from
+(``"litellm"``, ``"sglang"``, ``"rlm"``, plus anything ``@register_llm``\\ ed) and built from
 that tag's params: ``LLM_REGISTRY[tag].from_dict(params)``.
 
-**This class is a merge of two.** JAZ used to split the job across an ``LLMClient`` (retry, cost,
-model info; returned an ``LLMResponse``) and a ``Provider`` beneath it (the HTTP call; returned a
-``CompletionResponse``), with ``DefaultLLMClient`` delegating from one to the other. The split
-was never a real seam:
-
-- **One config field already resolved into two class layers.** ``llm={"tag": ..., "params":
-  {...}}`` had to be split across *two* constructors by key, so ``create_llm`` hardcoded which
-  keys belonged to the client and which to the provider — specific knowledge of
-  ``DefaultLLMClient``'s signature living in the factory.
-- **Backends outside that pairing got nothing.** Retry lived on the client, so a ``Provider``
-  had it only via ``DefaultLLMClient``; cost accounting lived in ``DefaultLLMClient.complete``,
-  so a backend registered any other way was silently unpriced.
-- **The duplication was already biting.** The response normalization existed twice, in
-  ``complete`` and ``acomplete``, and the two had diverged — the async copy dropped
-  ``cached_tokens`` and the whole ``extra`` bag.
-
-Merged, a backend declares its ``__init__`` and implements ``complete``; :meth:`LLM.finalize`
-gives it cost accounting, the base gives it retry, and its ``__init__`` signature declares its
-config surface. ``Provider``, ``register_provider``, ``PROVIDER_REGISTRY``
-and ``DefaultLLMClient`` were removed outright rather than aliased (executive call, user,
-2026-08-07): keeping a second name for one concept is what let the two layers drift apart in the
-first place, and the client seam was explicitly not yet public API (#984).
+A backend declares its ``__init__`` (whose signature declares its config surface) and implements
+``complete``; :meth:`BaseLLM.finalize` gives it cost accounting and the base gives it retry.
 """
+
+# History (executive call, user, 2026-08-07): this class is a merge of two. JAZ used to split the
+# job across an ``LLMClient`` (retry, cost, model info; returned an ``LLMResponse``) and a
+# ``Provider`` beneath it (the HTTP call; returned a ``CompletionResponse``), with
+# ``DefaultLLMClient`` delegating between them. The split was never a real seam: one ``llm`` config
+# field resolved into two constructor layers (``create_llm`` hardcoded which keys went where);
+# backends outside that pairing got no retry or cost accounting; and response normalization was
+# duplicated across ``complete``/``acomplete`` and had drifted (the async copy dropped
+# ``cached_tokens`` and the ``extra`` bag). ``Provider``, ``register_provider``, ``PROVIDER_REGISTRY``
+# and ``DefaultLLMClient`` were removed outright rather than aliased — keeping a second name for one
+# concept is what let the layers drift — and the client seam was explicitly not yet public API (#984).
 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import numbers
+import os
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -45,6 +39,9 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
 )
+
+from jaz.exceptions import UnknownRequestParamWarning
+from jaz.tokens import TurnRecord
 
 from .base import CompletionResponse
 from .exceptions import (
@@ -61,71 +58,170 @@ from .pricing import get_model_info as _get_model_info
 logger = logging.getLogger(__name__)
 
 
-def _legacy_names_by_current() -> dict[str, tuple[str, ...]]:
-    """Current exception class name -> its deprecated spelling(s), for ``retry_policy`` keys.
-
-    ``retry_policy`` is keyed by **exception class name as a string** and matched against
-    ``type(exc).__name__`` (see the retry predicate), so the #806 rename
-    pass would silently break every existing config: ``{"RateLimitError": 5}`` stops matching
-    ``RateLimitError`` with no error — the budget just falls through to ``max_attempts``.
-    A *silent* behavior change in retry policy is exactly the failure mode
-    ``_LEGACY_HOOK_QUALNAMES`` exists to prevent for serialized hook names.
-
-    Derived rather than hand-listed: a deprecated alias in :mod:`jaz.exceptions` is precisely
-    an attribute whose name differs from the class's own ``__name__``, so every present and
-    future alias is picked up automatically and there is no second list to keep in sync.
-    """
-    from . import exceptions
-
-    out: dict[str, list[str]] = {}
-    for attr, obj in vars(exceptions).items():
-        if (
-            isinstance(obj, type)
-            and issubclass(obj, BaseException)
-            and obj.__name__ != attr
-        ):
-            out.setdefault(obj.__name__, []).append(attr)
-    return {current: tuple(sorted(legacy)) for current, legacy in out.items()}
-
-
-_LEGACY_RETRY_POLICY_NAMES: dict[str, tuple[str, ...]] = _legacy_names_by_current()
-
-
 @dataclass
 class LLMResponse:
     """Normalized response from an LLM completion call.
 
-    Field semantics align with ATIF v1.7 ``MetricsSchema``:
+    The metric fields are named and defined as in ATIF v1.7 ``MetricsSchema``:
       * ``prompt_tokens`` — total input tokens INCLUDING cached tokens
       * ``cached_tokens`` — subset of ``prompt_tokens`` that hit the cache
       * ``completion_tokens`` — total output tokens INCLUDING reasoning
         and tool-call tokens (matches OpenAI's billing definition; for
         reasoning models the ``reasoning_tokens`` sub-count is surfaced
         in ``extra``)
+      * ``cost_usd`` — cost of this call in US dollars
       * ``extra`` — provider-specific metrics (e.g. ``reasoning_tokens``,
-        ``cache_creation_input_tokens`` for Anthropic)
+        ``cache_creation_input_tokens`` for Anthropic), and where a backend
+        reports them, ATIF's optional ``prompt_token_ids``,
+        ``completion_token_ids`` and ``logprobs``
+
+    ``content`` and ``raw_response`` are not metrics and have no ATIF counterpart.
+    There is no ``total_tokens``: sum ``prompt_tokens`` and ``completion_tokens``.
     """
+
+    # Aligned field-for-field with ATIF v1.7 MetricsSchema (executive call, user,
+    # 2026-08-12) rather than either adopting the format's schema wholesale or letting the
+    # two drift. Full unification was never reachable — this is a *response*, not a metrics
+    # record, so `content`/`raw_response` keep it a strict superset of MetricsSchema.
+    #
+    # `cost` became `cost_usd` to match ATIF: the old name never said what currency it was
+    # in, and both emitters already renamed it on the way out.
+    #
+    # `total_tokens` was REMOVED. It carried nothing its parts did not — every backend
+    # either forwarded a provider number that the OpenAI usage contract defines as
+    # `prompt + completion` (openai, litellm) or derived exactly that sum itself (anthropic,
+    # rlm) — and ATIF has no counterpart. It could also contradict its own parts: OpenAI's
+    # read zero-filled a missing count while LiteLLM's gave None, so the same unreported
+    # usage surfaced as `total_tokens=0` beside nonzero parts on one backend and None on the
+    # other. Consumers now sum at the point of use. `Budget` still records a total because
+    # its cost records are an on-disk format the eval tooling reads.
+    #
+    # ATIF's remaining three metrics (`prompt_token_ids`, `completion_token_ids`,
+    # `logprobs`) are deliberately NOT fields here. They are optional, provider-rare, and by
+    # far the largest payload in a response — per-token arrays — so promoting them would
+    # write a retention cost into the contract every backend nominally implements. They ride
+    # in `extra` under their ATIF names (`extras_merge` already standardizes on those
+    # spellings), and the two ATIF emitters hoist them into top-level `metrics`, which is
+    # the layer that actually owes the format conformance.
 
     content: str | None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
-    total_tokens: int | None = None
     cached_tokens: int | None = None
-    cost: float | None = None
+    cost_usd: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     raw_response: Any = field(default=None, repr=False)
+    # Per-turn token record from a token-native backend; None for text backends.
+    #
+    # A first-class field rather than `extra` keys — unlike the per-token ATIF arrays above,
+    # this is a cross-provider *contract* (any token-native backend returns one, and the
+    # agent's stamp-back and RolloutRecorder key off it), and `extras_merge`'s additive merge
+    # rules are wrong for token sequences (extras_merge.py's own docstring anticipates
+    # exactly this). Pointer cost only: the record shares the per-message stamp objects.
+    tokens: TurnRecord | None = None
 
 
-# Retry defaults — these duplicate ``Config``'s (config.py: max_llm_attempts,
-# llm_retry_wait_multiplier, llm_retry_wait_min, llm_retry_wait_max). The Agent
-# always passes explicit values from ``Config`` (via ``Agent._make_llm_retry_fn``);
-# these apply only to direct callers that omit them (e.g. ace_baseline.py). They
-# are duplicated, not shared, so keep them in sync — guarded by
-# test_retry_defaults_match_config.
-_DEFAULT_MAX_ATTEMPTS = 10
+# Retry defaults — the class-attribute fallbacks used when a caller constructs a backend
+# without passing retry params (e.g. ace_baseline.py). Retry config otherwise rides in the
+# backend's ``llm.params`` (``max_retries``, ``retry_wait_*``, ``retry_policy``); there is no
+# separate config-layer copy to keep in sync.
+#
+# ``max_retries`` is EXTRA retries after the first call (the LLM-SDK convention — OpenAI /
+# Anthropic / LangChain / … all count this way), NOT total attempts: ``max_retries=2`` → 3
+# calls. Default 10 (→ 11 attempts): bare client SDKs default to 2, but an AGENT framework
+# running long autonomous loops wants more per-call resilience (a transient blip mid-run is
+# expensive), so this matches the Claude Agent SDK / Claude Code default of 10 — its closest
+# peer — rather than the client-SDK 2 or the more centrist agent default of ~3-4 (OpenHands/DSPy).
+# Near-identical to the prior behaviour too (was ``retry_max_attempts=10`` total = 9 retries;
+# rounded up to a clean 10).
+_DEFAULT_MAX_RETRIES = 10
 _DEFAULT_WAIT_MULTIPLIER = 1.0
 _DEFAULT_WAIT_MIN = 4.0
 _DEFAULT_WAIT_MAX = 60.0
+
+
+# Common cross-provider request parameters — the reference the typo check matches against. NOT an
+# allow-list: an unrecognized key is still forwarded (the ``**request_defaults`` tail is an open
+# passthrough for provider-specific extras a JAZ release cannot enumerate). This set exists only so
+# a *near-miss* of one of these can be flagged as a likely misspelling. Kept deliberately generous
+# so a real, correctly-spelled param never trips the warning.
+_KNOWN_REQUEST_PARAMS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "top_a",
+        "min_p",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "stop",
+        "stream",
+        "stream_options",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "seed",
+        "response_format",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning_effort",
+        "verbosity",
+        "thinking",
+        "service_tier",
+        "user",
+        "safety_identifier",
+        "prompt_cache_key",
+        "metadata",
+        "store",
+        "modalities",
+        "prediction",
+        "audio",
+        "timeout",
+        "extra_headers",
+        "extra_body",
+        "extra_query",
+    }
+)
+
+
+# The ``src/jaz`` root (this file is ``src/jaz/llm/llm.py``). Used to skip ALL internal jaz frames
+# when attributing the misspelled-param warning, so it points at the caller's construction /
+# ``jaz.configure`` site regardless of how many backend ``__init__``\\ s forwarded via
+# ``super().__init__`` — a fixed ``stacklevel`` can't, since real backends add a forwarding frame
+# and every one would then share a single internal lineno (collapsing distinct call sites under
+# Python's once-per-location dedup).
+_JAZ_PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _warn_on_misspelled_request_params(
+    request_defaults: Mapping[str, Any], backend: str
+) -> None:
+    """Warn once per kwarg that looks like a misspelled request parameter.
+
+    A key is flagged only when it is a *close* match to a known param (``difflib`` ratio ≥ 0.8)
+    and is not itself known — the "looks like a typo of `temperature`" case. Unknown keys with no
+    close match are assumed to be intentional provider extras and pass silently. The kwarg is
+    forwarded either way; this only surfaces the likely mistake.
+    """
+    known = _KNOWN_REQUEST_PARAMS
+    for key in request_defaults:
+        if key in known:
+            continue
+        match = difflib.get_close_matches(key, known, n=1, cutoff=0.8)
+        if match:
+            warnings.warn(
+                f"{backend} received request parameter {key!r}, which is not a recognized "
+                f"parameter — did you mean {match[0]!r}? It will be forwarded to the provider "
+                f"as-is (which typically ignores unknown fields).",
+                UnknownRequestParamWarning,
+                # Skip jaz's own frames so the warning lands on the caller's construction site,
+                # not on a backend's internal ``super().__init__`` (see the note on _JAZ_PKG_ROOT).
+                skip_file_prefixes=(_JAZ_PKG_ROOT,),
+            )
 
 
 def _default_retry_logger(max_attempts: int) -> Callable[[RetryCallState], None]:
@@ -145,13 +241,13 @@ def _default_retry_logger(max_attempts: int) -> Callable[[RetryCallState], None]
     return _log
 
 
-class LLM(ABC):
+class BaseLLM(ABC):
     """One LLM backend: the API call, retry, cost accounting and model metadata.
 
     Subclass this and register it to add a backend::
 
         @register_llm("mybackend")
-        class MyLLM(LLM):
+        class MyLLM(BaseLLM):
             def __init__(self, base_url: str | None = None, **retry):
                 super().__init__(**retry)
                 self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
@@ -163,15 +259,26 @@ class LLM(ABC):
     what authored config can set, and the ``**request_defaults`` tail takes everything else as a
     per-request default that rides on the wire.
 
-    **Retry** is not a framework layer wrapped around backends — ``complete_with_retry`` /
-    ``acomplete_with_retry`` are ordinary methods here, and the ``retry_*`` settings are
-    ordinary construction fields of this base class, being the defaults its own
-    ``complete_with_retry`` reads. That is what lets the config layer route them with no
-    special knowledge: they are discovered from this ``__init__`` signature exactly as a
-    backend's ``base_url`` is discovered from its own. Every name is ``retry_``-prefixed so they
-    stay unambiguous as flat siblings of ``model`` and ``temperature`` in authored config.
+    To read a key from the shared credentials store (``~/.jaz/credentials.json``), call
+    :func:`jaz.credentials.resolve_credential` with the provider's tag — the default
+    :class:`LiteLLM` backend does this per request, keyed by the provider it routes the model to,
+    while the in-tree :class:`OpenAILLM` / :class:`AnthropicLLM` classes do it once in ``__init__``
+    (one vendor each). A backend that never calls it does not read the store, so a key stored under
+    its tag is inert. Resolve it *below* an explicitly passed ``api_key`` and below the provider's
+    environment variable, and hold it outside ``request_defaults`` so the secret never becomes
+    construction config.
 
-    **Cost accounting** is :meth:`finalize`, which every backend calls on its wire response —
+    **Retry** is not a framework layer wrapped around backends — ``complete_with_retry`` /
+    ``acomplete_with_retry`` are ordinary methods here, and the retry settings are ordinary
+    construction fields of this base class, being the defaults its own ``complete_with_retry``
+    reads. That is what lets the config layer route them with no special knowledge: they are
+    discovered from this ``__init__`` signature exactly as a backend's ``base_url`` is discovered
+    from its own. ``max_retries`` carries the LLM-SDK name unprefixed (the count is the headline
+    knob every caller recognises); the backoff-tuning siblings stay ``retry_``-prefixed
+    (``retry_wait_multiplier``/``retry_wait_min``/``retry_wait_max``/``retry_policy``) so they
+    read as retry settings among flat siblings like ``model`` and ``temperature``.
+
+    **Cost accounting** is :meth:`~BaseLLM.finalize`, which every backend calls on its wire response —
     so pricing is written once rather than per backend, and a new backend is priced for free.
 
     The one part that cannot be construction-time is the retry *observer*: ``Agent`` passes an
@@ -184,32 +291,57 @@ class LLM(ABC):
     # them. Subclassing an ABC and forgetting the super call is common enough — and the
     # failure would be an ``AttributeError`` deep inside a retry, far from the cause — that
     # the settings must not depend on cooperative construction.
-    retry_max_attempts: int = _DEFAULT_MAX_ATTEMPTS
+    #: Retries after the first call (the LLM-SDK convention: OpenAI/Anthropic/… all count
+    #: *extra* retries, not total attempts). ``max_retries=2`` → up to 3 calls; ``0`` = no retry.
+    #: Must be ``>= 0``. (``retry_wait_*`` / ``retry_policy`` tune the backoff and per-error budget.)
+    max_retries: int = _DEFAULT_MAX_RETRIES
     retry_wait_multiplier: float = _DEFAULT_WAIT_MULTIPLIER
     retry_wait_min: float = _DEFAULT_WAIT_MIN
     retry_wait_max: float = _DEFAULT_WAIT_MAX
     retry_policy: dict[str, int] | None = None
 
-    #: The model id this backend serves.
-    #:
-    #: Defaulted on the class, not supplied by `Config`. A `Config` default would apply only to a
-    #: config nobody touched: with groups replacing rather than merging, `configure(llm={...})`
-    #: builds a *new* backend, and one whose model came from the config layer would come out
-    #: unset. Every other component default lives on its component for the same reason.
-    #:
-    #: A backend that serves no sensible default overrides this with `""`, and `get_model` then
-    #: raises rather than letting `"model": ""` reach the API.
-    model: str = "gpt-5-mini"
+    #: The model id this backend serves. Required — there is no default; ``get_model`` raises
+    #: when it is unset rather than letting ``"model": ""`` reach the API.
+    model: str = ""
+
+    # No default model, by executive call (#1086): "an LLM with no model" is underspecified, and a
+    # silent ``gpt-5-mini`` fallback would pin a model nobody wrote and price/describe runs as it.
+    # (The *backend* now does default — to ``litellm``, v1's sole backend
+    # (design/design_features/litellm_sole_backend_v1.md) — because a single registered backend
+    # removes the "rides on whichever is first" ambiguity #1086 fought; the *model* has no such safe
+    # default, so it stays required.) The unset value is ``""`` (not a `Config`-supplied default:
+    # groups replace rather than merge, so
+    # a config-layer default would apply only to a config nobody touched and come out unset the
+    # moment `configure(llm={...})` builds a new backend). The empty string is caught by the
+    # existing `get_model` guard at `Agent.__init__`; the authored-data path (`build_component`)
+    # additionally requires `model` up front so a YAML/settings block fails at build time. This
+    # matches DSPy ("No LM is loaded") and LangChain (no auto-picked model) — a bare
+    # `jaz.invoke("hi")` with nothing configured now raises rather than quietly calling gpt-5-mini.
+    # A backend that genuinely does serve a canonical model may still override this with a literal.
 
     #: The tag ``@register_llm`` registered this class under; ``None`` for an unregistered
     #: one. Declared with the other class attributes so the class surface reads in one place.
     registry_tag: ClassVar[str | None] = None
 
+    #: Reserved sidecar keys (see ``jaz.provenance.RESERVED_KEYS``) this backend reads and
+    #: therefore receives on the wire; every other reserved key is stripped at egress.
+    #: Default: none — a text backend's wire list carries no internal keys.
+    #
+    # A per-class declaration like ``registry_tag`` (and a class attribute for the same
+    # reason as the retry fields above: it must resolve even when a subclass skips
+    # ``super().__init__()``). Text backends drop ``messages`` straight into their request
+    # payloads, so nothing internal may survive egress for them; a token-native backend
+    # (``SGLangLLM``) declares the token key so its stamps reach ``complete()``. Keying the
+    # strip by backend declaration keeps the single egress choke point
+    # (``to_wire_messages``) while letting each backend opt in to exactly the sidecars it
+    # consumes. Provenance is declared by no backend, so it is stripped for all.
+    consumes_internal_keys: ClassVar[frozenset[str]] = frozenset()
+
     def __init__(
         self,
         *,
         model: str | None = None,
-        retry_max_attempts: int | None = None,
+        max_retries: int | None = None,
         retry_wait_multiplier: float | None = None,
         retry_wait_min: float | None = None,
         retry_wait_max: float | None = None,
@@ -239,13 +371,13 @@ class LLM(ABC):
         # worked example for no gain. The caller reads `llm.model` and passes it, exactly as it
         # passed a bag-derived one before.
         # Retry values are checked here rather than by the config layer, which used to do it
-        # on this class's behalf. A bad one fails far from its cause otherwise — a
-        # `retry_max_attempts` of 0 silently behaves like 1, many turns later.
-        if retry_max_attempts is not None and (
-            not isinstance(retry_max_attempts, numbers.Integral)
-            or retry_max_attempts < 1
+        # on this class's behalf. A bad one fails far from its cause otherwise. ``max_retries``
+        # counts EXTRA retries, so ``0`` is valid (no retry); only a negative — which would abort
+        # before the first call even completes — is rejected.
+        if max_retries is not None and (
+            not isinstance(max_retries, numbers.Integral) or max_retries < 0
         ):
-            raise ValueError("retry_max_attempts must be a positive integer")
+            raise ValueError("max_retries must be a non-negative integer")
         for name, value, inclusive in (
             ("retry_wait_multiplier", retry_wait_multiplier, False),
             ("retry_wait_min", retry_wait_min, True),
@@ -267,19 +399,20 @@ class LLM(ABC):
                     raise ValueError(
                         "retry_policy keys must be exception class names (str)"
                     )
-                # A *total* attempt cap, so it must be >= 1 for the same reason
-                # `retry_max_attempts` must be: 0 silently behaves like 1.
-                if not isinstance(limit, numbers.Integral) or limit < 1:
+                # A per-error *retry* count (extra retries), consistent with ``max_retries``, so
+                # ``0`` is valid (that error type never retries); only a negative is rejected.
+                if not isinstance(limit, numbers.Integral) or limit < 0:
                     raise ValueError(
-                        f"retry_policy[{exc_name!r}] must be a positive integer"
+                        f"retry_policy[{exc_name!r}] must be a non-negative integer"
                     )
         self.request_defaults: dict[str, Any] = request_defaults
+        _warn_on_misspelled_request_params(request_defaults, type(self).__name__)
         if model is not None:
             self.model = model
         # Only set what was actually passed, so an unset kwarg falls through to the class
         # default rather than shadowing it with ``None``.
         for name, value in (
-            ("retry_max_attempts", retry_max_attempts),
+            ("max_retries", max_retries),
             ("retry_wait_multiplier", retry_wait_multiplier),
             ("retry_wait_min", retry_wait_min),
             ("retry_wait_max", retry_wait_max),
@@ -294,7 +427,7 @@ class LLM(ABC):
 
         Args:
             model: The model identifier, as this backend's API expects it
-                (e.g. ``"gpt-4"``) — see :meth:`validate_model`.
+                (e.g. ``"gpt-4"``) — see :meth:`~BaseLLM.validate_model`.
             messages: The conversation messages in OpenAI format.
             **kwargs: Additional provider-specific parameters (temperature, max_tokens, etc.).
 
@@ -347,7 +480,7 @@ class LLM(ABC):
     def _retryer(
         self,
         *,
-        max_attempts: int,
+        max_retries: int,
         wait_multiplier: float,
         wait_min: float,
         wait_max: float,
@@ -364,13 +497,13 @@ class LLM(ABC):
         counted independently; the call is retried only while the *current*
         error's category is still under its own budget:
 
-        - a type named in ``retry_policy`` -> its own budget (that value),
-          overriding both ``max_attempts`` and ``non_retryable_exceptions``
-          (set 1 to force no retry);
-        - any other retryable type -> a shared default budget of ``max_attempts``
-          (so an empty policy reduces exactly to the prior behavior:
-          ``max_attempts`` total attempts, non-retryable types failing fast);
-        - any other non-retryable type -> budget 1 (fail fast).
+        - a type named in ``retry_policy`` -> its own retry budget (that value),
+          overriding both ``max_retries`` and ``non_retryable_exceptions``
+          (set 0 to force no retry for that type);
+        - any other retryable type -> a shared default budget of ``max_retries``
+          (so an empty policy reduces exactly to the plain behavior:
+          ``max_retries`` retries, non-retryable types failing fast);
+        - any other non-retryable type -> budget 0 (fail fast).
 
         Counting each category independently is the semantics LiteLLM's
         ``RetryPolicy`` docstring *promises* ("custom number of retries per
@@ -383,17 +516,11 @@ class LLM(ABC):
         ``attempt_number``, which had the same cross-contamination bug in a
         different guise; the per-category counters below fix it.)
 
-        Two intentional differences from LiteLLM's API (see ``Config.retry_policy``):
-        the value is a total *attempt* count (N), consistent with
-        ``max_attempts``, not LiteLLM's *retry* count (N -> N+1 calls); and
-        matching is by *exact* runtime class name (``type(exc).__name__``) over an
-        open dict, not LiteLLM's subclass-aware ``isinstance`` over a fixed set of
-        typed fields — so a base-class key like "LLMError" will NOT catch
-        subclasses.
-
-        Pre-rename spellings are also accepted (see :data:`_LEGACY_RETRY_POLICY_NAMES`):
-        ``{"RateLimitError": 5}`` still matches ``RateLimitError``. The current name wins
-        if both are present.
+        Values are *retry* counts (extra retries, N -> N+1 calls), consistent with
+        ``max_retries`` and with the LLM-SDK convention. Matching is by *exact*
+        runtime class name (``type(exc).__name__``) over an open dict, not LiteLLM's
+        subclass-aware ``isinstance`` over a fixed set of typed fields — so a
+        base-class key like "LLMError" will NOT catch subclasses.
         """
         policy = retry_policy or {}
         non_retryable = self.non_retryable_exceptions
@@ -405,32 +532,29 @@ class LLM(ABC):
         default_bucket = object()
         counts: dict[Any, int] = {}
 
-        def budget_for(exc: BaseException) -> tuple[Any, int]:
+        def retries_for(exc: BaseException) -> tuple[Any, int]:
             name = type(exc).__name__
             if name in policy:
                 return name, policy[name]
-            # A config written before the #806 rename keys the OLD spelling; honour it rather
-            # than silently falling through to max_attempts. Keyed on the legacy name so the
-            # per-category counter stays one bucket per error type either way.
-            for legacy in _LEGACY_RETRY_POLICY_NAMES.get(name, ()):
-                if legacy in policy:
-                    return legacy, policy[legacy]
             if isinstance(exc, non_retryable):
-                return name, 1  # fail fast
-            return default_bucket, max_attempts
+                return name, 0  # fail fast — no retries
+            return default_bucket, max_retries
 
         def should_retry(retry_state: RetryCallState) -> bool:
             exc = retry_state.outcome.exception() if retry_state.outcome else None
             if exc is None:
                 return False
-            key, budget = budget_for(exc)
+            key, retries = retries_for(exc)
             counts[key] = counts.get(key, 0) + 1
-            return counts[key] < budget
+            # ``counts`` is attempts completed on this category; retry while that does not exceed
+            # the allowed *retries*. So ``retries`` extra calls follow the first: after attempt
+            # ``retries + 1`` this is ``> retries`` and stops. (0 retries -> stop after attempt 1.)
+            return counts[key] <= retries
 
-        # Liveness backstop only — the per-category counters above are the real
-        # stop condition, and total attempts are naturally bounded by the sum of
-        # the budgets that fire. Equals max_attempts when no policy is set.
-        attempt_cap = max_attempts + sum(policy.values())
+        # Liveness backstop only — the per-category counters above are the real stop condition.
+        # Total attempts are bounded by (1 first call + max_retries) plus each policy type's
+        # extra retries. Equals max_retries + 1 when no policy is set.
+        attempt_cap = max_retries + 1 + sum(policy.values())
 
         return retry(
             reraise=True,
@@ -449,7 +573,7 @@ class LLM(ABC):
         model: str,
         messages: list[Any],
         *,
-        retry_max_attempts: int | None = None,
+        max_retries: int | None = None,
         retry_wait_multiplier: float | None = None,
         retry_wait_min: float | None = None,
         retry_wait_max: float | None = None,
@@ -465,10 +589,10 @@ class LLM(ABC):
         Args:
             model: The model identifier.
             messages: The conversation messages.
-            retry_max_attempts: Per-call override; defaults to the field of the same
-                name. The call kwargs, the constructor parameters and the ``llm.params``
-                keys deliberately share one ``retry_``-prefixed vocabulary, so a setting
-                is spelled identically wherever it is written.
+            max_retries: Per-call override; defaults to the field of the same name — extra
+                retries after the first call (``2`` → up to 3 calls; ``0`` = no retry). The call
+                kwargs, the constructor parameters and the ``llm.params`` keys share one
+                vocabulary, so a setting is spelled identically wherever it is written.
             retry_wait_multiplier: Per-call override; defaults to the field.
             retry_wait_min: Per-call override; defaults to the field.
             retry_wait_max: Per-call override; defaults to the field.
@@ -483,7 +607,7 @@ class LLM(ABC):
             An LLMResponse with the completion content and usage information.
         """
         retryer = self._retryer(
-            max_attempts=self._retry_default("retry_max_attempts", retry_max_attempts),
+            max_retries=self._retry_default("max_retries", max_retries),
             wait_multiplier=self._retry_default(
                 "retry_wait_multiplier", retry_wait_multiplier
             ),
@@ -499,7 +623,7 @@ class LLM(ABC):
         model: str,
         messages: list[Any],
         *,
-        retry_max_attempts: int | None = None,
+        max_retries: int | None = None,
         retry_wait_multiplier: float | None = None,
         retry_wait_min: float | None = None,
         retry_wait_max: float | None = None,
@@ -514,7 +638,7 @@ class LLM(ABC):
         this via ``_make_llm_retry_fn``, passing its hook-dispatching ``on_retry``.
         """
         retryer = self._retryer(
-            max_attempts=self._retry_default("retry_max_attempts", retry_max_attempts),
+            max_retries=self._retry_default("max_retries", max_retries),
             wait_multiplier=self._retry_default(
                 "retry_wait_multiplier", retry_wait_multiplier
             ),
@@ -529,7 +653,7 @@ class LLM(ABC):
         """The model id this backend serves.
 
         Raises ``ValueError`` when none is configured, or when the id carries a backend prefix
-        this backend would not send (see :meth:`validate_model`). Override only for a backend whose
+        this backend would not send (see :meth:`~BaseLLM.validate_model`). Override only for a backend whose
         model is not the ``model`` constructor argument (``MockLLMClient`` does).
         """
         # Read from the instance rather than from a passed-in config bag: the backend now holds
@@ -561,10 +685,9 @@ class LLM(ABC):
         this only says yes or no. A leading ``segment/`` naming a registered backend tag is an
         error, and the message names the id to use instead::
 
-            OpenAILLM().validate_model("gpt-5-mini")                       -> ok
-            OpenAILLM().validate_model("meta-llama/Llama-3.1-8B-Instruct") -> ok (not a tag)
-            OpenAILLM().validate_model("openai/gpt-5-mini")                -> ValueError
-            OpenAILLM().validate_model("anthropic/claude-sonnet-4-5")      -> ValueError
+            OpenAILLM().validate_model("gpt-5-mini")                       -> ok (bare id)
+            OpenAILLM().validate_model("meta-llama/Llama-3.1-8B-Instruct") -> ok (slash, not a tag)
+            OpenAILLM().validate_model("litellm/gpt-5-mini")               -> ValueError (registered tag)
 
         The rule that makes this predictable: **write the id the backend's own documentation
         uses.** OpenAI documents ``gpt-5-mini`` and Anthropic documents ``claude-sonnet-4-5`` —
@@ -644,7 +767,7 @@ class LLM(ABC):
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_dict(cls, params: Mapping[str, Any] | None = None) -> LLM:
+    def from_dict(cls, params: Mapping[str, Any] | None = None) -> BaseLLM:
         """Build this backend from its construction params — ``REGISTRY[tag].from_dict(params)``.
 
         The default maps params to constructor kwargs. Override for a backend whose config
@@ -719,9 +842,9 @@ class LLM(ABC):
             content=response.choices[0].message.content if response.choices else None,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=usage.total_tokens if usage else None,
             cached_tokens=usage.cache_read_input_tokens if usage else None,
-            cost=cost,
+            cost_usd=cost,
             extra=extra,
             raw_response=response,
+            tokens=response.tokens,
         )

@@ -6,10 +6,9 @@ If there's a large object you need to process in full:
 - For example,
 ...  # Initialize running state/analysis
 for part in ...:  # Some way of iterating through the large object
-    subagent_result = jaz.invoke(
-        ReturnType(...),  # Expected return type from subagent -- can be any PEP type annotation
-        ...,  # Instructions for the subagent to analyze the piece
+    subagent_result = invoke(
+        task=...,  # Instructions for the subagent to analyze the piece -- state the expected result and its type here
         part=part,  # Or some other variable name
     )
     ...  # Accumulate subagent_result into the running state/analysis
-State in a leading comment your strategy for going through all the "parts" of the large object, including how a "part" is defined. If you use a jaz.invoke() subagent to process each part, estimate the size of each part -- ideally the way you define a "part" is such that each part has a string representation of <10000 characters.
+State in a leading comment your strategy for going through all the "parts" of the large object, including how a "part" is defined. If you use an invoke() subagent to process each part, estimate the size of each part -- ideally the way you define a "part" is such that each part has a string representation of <50000 characters.

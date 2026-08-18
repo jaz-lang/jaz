@@ -1,40 +1,46 @@
-# jaz
+# JAZ
 
 A Python framework for building and optimizing LLM-agents through intelligent, iterative execution.
 
 ## Overview
 
-jaz provides a unified framework for creating agents that combine deterministic Python code with LLM reasoning. Agents execute in a REPL loop where the LLM generates code, observes results, and iterates until the task is complete.
+JAZ provides a unified framework for creating agents that combine deterministic Python code with LLM reasoning. Agents execute in a REPL loop where the LLM generates code, observes results, and iterates until the task is complete.
 
 ### Prerequisites
 
 - **Python ≥ 3.12** — 3.14+ is recommended for the full feature set. Everything works on
-  3.12/3.13 except the t-string prompt syntax (`jaz.invoke(t"Analyze the {data}")`), which
+  3.12/3.13 except the t-string prompt syntax (`invoke(task=t"Analyze the {data}")`), which
   is PEP 750 and requires Python ≥ 3.14; the equivalent
-  ``jaz.invoke("Analyze the `data`", data=data)`` works on every supported version.
-- **GitHub SSH access** — your SSH key must be authorized for the `jaz-lang` GitHub org
+  ``invoke(task="Analyze the `data`", data=data)`` works on every supported version.
 
 ## Installation
 
 ```bash
-pip install git+ssh://git@github.com/jaz-lang/jaz-dist.git@v0.1.0
+pip install jaz-lang
 ```
 
-Or with a specific version tag:
+The distribution is named `jaz-lang`; the import name is `jaz`:
 
-```bash
-pip install "jaz @ git+ssh://git@github.com/jaz-lang/jaz-dist.git@v0.1.0"
+```python
+import jaz
 ```
 
 Optional extras:
 
 ```bash
-pip install "jaz[tracing] @ git+ssh://git@github.com/jaz-lang/jaz-dist.git@v0.1.0"
+pip install "jaz-lang[tracing]"
+```
+
+To pin a specific release, or to install one that has not reached PyPI, use the
+distribution repo and a release tag:
+
+```bash
+pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a2"
 ```
 
 ### API Keys
 
-JAZ uses native OpenAI and Anthropic HTTP clients. Set your API keys via any of:
+JAZ reads provider API keys from the environment, under each provider's standard variable name. Set them via any of:
 
 - **Shell profile** — add `export OPENAI_API_KEY=sk-...` to `~/.zshrc` or `~/.bashrc` (simplest, available globally)
 - **`.env` file** — create a `.env` at the project root with `OPENAI_API_KEY=sk-...` per line, then load it with:
@@ -52,21 +58,25 @@ After installation, select the Python interpreter so VS Code uses the correct en
 ## Quick Start
 
 ```python
-import jaz
+from jaz import invoke
+from jaz.hooks import ReturnType
 
 # Simple task
-result = jaz.invoke(
-    jaz.hooks.ReturnType(int),
+result = invoke(
+    ReturnType(int),
     task="Calculate the factorial of 10",
 )
 
 # With custom inputs
-result = jaz.invoke(
-    jaz.hooks.ReturnType(list),
+result = invoke(
+    ReturnType(list),
     task="Double each number in the list",
     numbers=[1, 2, 3, 4, 5]
 )
 ```
+
+Later snippets assume the Quick Start imports (`from jaz import invoke`,
+`from jaz.hooks import ReturnType`, `import jaz`) and show only what each adds.
 
 ## Key Features
 
@@ -75,46 +85,72 @@ result = jaz.invoke(
 Agents can invoke nested agents with separate budgets and automatic cost tracking:
 
 ```python
-result = jaz.invoke(
-    jaz.hooks.ReturnType(list),
-    jaz.ConfigOverride(max_depth=3),
-    task="""
-    For each item, use jaz.invoke to process it.
-    Combine and return the results.
-    """,
-    items=data,
-)
+from jaz.hooks import RecursionLimit, ReturnType
+
+with RecursionLimit(max_depth=3):  # optional cap; recursion is unbounded by default
+    result = invoke(
+        ReturnType(list),
+        task="""
+        For each item, use jaz.invoke to process it.
+        Combine and return the results.
+        """,
+        items=data,
+    )
 ```
 
-### Tool Libraries
+### Custom Tools
 
-Provide custom tools to agents. A `Library` is an ordinary input: pass it as a
-keyword argument and it binds into the agent's REPL under that name (its tool
-catalog renders in the prompt automatically):
+A tool is just a function you pass in. Give it as a keyword argument and it binds to
+that name in the agent's REPL; its signature and docstring render in the prompt, so
+the docstring *is* the description the agent reads:
 
 ```python
-from jaz import Library, invoke
-from jaz.hooks import ReturnType
-
 def my_tool(x: int) -> int:
     """Double a number."""
     return x * 2
 
-my_tools = Library("tools", "Custom tools",
-                   modules=[("utils", "Utility helpers")],
-                   tools=[("utils.my_tool", my_tool)])
-# Binds the library's root module as `utils`; the catalog renders `utils.my_tool`.
-result = invoke(ReturnType(int), task="Use utils.my_tool on 5", utils=my_tools)
+result = invoke(ReturnType(int), task="Use my_tool on 5", my_tool=my_tool)
 ```
 
-To make a tool library propagate automatically to nested `invoke` calls, bind it
-with `jaz.scope` instead:
+The agent sees `` `my_tool(x: int) -> int`: Double a number. `` — type hints and a
+one-line docstring are what make a tool usable. Nothing is registered up front, so tools
+sit alongside data in the same call:
 
 ```python
-import jaz
+def web_search(query: str) -> list[str]:
+    """Search the web and return result snippets."""
+    ...
 
-with jaz.scope(utils=my_tools):
-    invoke(jaz.hooks.ReturnType(int), task="Use utils.my_tool on 5")  # nested invokes inherit `utils`
+result = invoke(
+    ReturnType(dict),
+    task="Look up each name and summarize what you find",
+    names=["ada", "grace"],
+    web_search=web_search,
+)
+```
+
+To group related tools under one name, pass an object instead: its public methods render
+as a catalog under that name, and the agent calls them as `utils.my_tool(...)`.
+
+```python
+class Utils:
+    """Utility helpers."""
+
+    def my_tool(self, x: int) -> int:
+        """Double a number."""
+        return x * 2
+
+result = invoke(ReturnType(int), task="Use utils.my_tool on 5", utils=Utils())
+```
+
+To make a tool propagate automatically to nested `invoke` calls, bind it with
+`jaz.scope` instead of passing it per call:
+
+```python
+from jaz import scope
+
+with scope(my_tool=my_tool):
+    invoke(ReturnType(int), task="Use my_tool on 5")  # nested invokes inherit `my_tool`
 ```
 
 ### Hooks for Extensibility
@@ -122,11 +158,10 @@ with jaz.scope(utils=my_tools):
 Use hooks to add logging, tracing, workflow strategies, and more:
 
 ```python
-from jaz.hooks import FileLogger, WorkflowStrategyHook
+from jaz.hooks import BudgetPool, FileLogger
 
-with FileLogger("agent.log"):
-    with WorkflowStrategyHook(enable_invoke_start=True):
-        result = jaz.invoke(jaz.hooks.ReturnType(str), task="Build a web scraper")
+with FileLogger("agent.log"), BudgetPool(cost_budget=1.0):
+    result = invoke(ReturnType(str), task="Build a web scraper")
 ```
 
 ### Budget Control
@@ -136,19 +171,15 @@ tree) are enforced by the opt-in `BudgetPool`; per-level execution limits
 are configuration:
 
 ```python
-from jaz.hooks import BudgetPool
+from jaz.hooks import BudgetPool, IterationLimit, RecursionLimit
 
 # Pool budgets: tracked + enforced only while the hook is active.
 with BudgetPool(cost_budget=0.50, calls_budget=100):  # USD / call-count
-    result = jaz.invoke(jaz.hooks.ReturnType(str), task="Complex task")
+    result = invoke(ReturnType(str), task="Complex task")
 
-# Per-level execution limits are config options:
-with jaz.ConfigOverride(
-    max_depth=2,
-    max_repl_invoke_calls=10,
-    max_repl_iterations=20,
-):
-    result = jaz.invoke(jaz.hooks.ReturnType(str), task="Complex task")
+# Per-level execution limits are hooks too:
+with IterationLimit(max_iterations=20), RecursionLimit(max_depth=2):
+    result = invoke(ReturnType(str), task="Complex task")
 ```
 
 ### Configuration
@@ -160,47 +191,49 @@ Setting a group *replaces* it — a component states itself completely, so there
 update of one setting.
 
 ```python
-from jaz.providers.openai import OpenAILLM
+from jaz.llm import LiteLLM
 from jaz.repl.python_repl import PythonREPL
 
 # Per-invoke override
-with jaz.ConfigOverride(llm=OpenAILLM(model="gpt-4", temperature=0.7, max_tokens=2000)):
-    result = jaz.invoke(jaz.hooks.ReturnType(str), task="Creative task")
+with jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7, max_tokens=2000)):
+    result = invoke(ReturnType(str), task="Creative task")
 
 # Global configuration
-jaz.configure(llm=OpenAILLM(model="gpt-4"), repl=PythonREPL(exec_timeout=60))
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"), repl=PythonREPL(exec_timeout=60))
 ```
 
 
 ### Custom & Local LLM Backends
 
-`jaz` talks to LLMs through a small `LLM` layer (`openai`/`anthropic` built in — no `litellm` runtime dependency). You can add your own backend without forking, mirroring the REPL extension pattern.
+JAZ talks to LLMs through a small `BaseLLM` layer. Currently, **LiteLLM is the only backend covered by the stable API, and the default** — one backend that routes to every provider LiteLLM supports (OpenAI, Anthropic, Gemini, Bedrock, Vertex, …). Other backends ship in the package but can change or be removed. You can add your own backend without forking, mirroring the REPL extension pattern.
 
-A config selects **one** backend: the `LLM` you pass to `llm=`. Its constructor takes everything it needs — the `model` id, the backend's own settings (`base_url`, `api_key`), and any per-request defaults. `@register_llm` also gives it a `tag`, which is how jaz's own config-file loaders (the eval harness, the console's `--model`) name a backend written as data.
+A config selects **one** backend: the `BaseLLM` you pass to `llm=`, defaulting to `LiteLLM`. Its constructor takes everything it needs — the `model` id (a LiteLLM route like `openai/gpt-5-mini`), the backend's own settings, and any per-request defaults. `@register_llm` also gives a backend a `tag`, which is how JAZ's own config-file loaders (the eval harness, the console's `--model`) name it as data; because litellm is the default, a config need only name the `model`.
 
 **Local OpenAI-compatible server** (Ollama, vLLM, LM Studio, llama.cpp, …) — no code, just config:
 
 ```python
-# point the built-in `openai` backend at a local server (set a dummy OPENAI_API_KEY)
+# route the litellm backend to a local OpenAI-compatible server
+# (api_key is required by the openai/ route even for a local server — a dummy value is fine;
+#  it rides request_defaults into litellm.completion)
 jaz.configure(
-    llm=OpenAILLM(model="llama3", base_url="http://localhost:11434/v1"),
+    llm=LiteLLM(model="openai/llama3", api_base="http://localhost:11434/v1", api_key="dummy"),
 )
 ```
 
-**A custom backend** — subclass `LLM` and pass an instance (registering it is only needed if a config *file* must name it):
+**A custom backend** — subclass `BaseLLM` and pass an instance (registering it is only needed if a config *file* must name it):
 
 ```python
 import os
-from jaz.providers import LLM, register_llm, CompletionResponse, Usage, Choice, Message
+from jaz.llm import BaseLLM, register_llm, CompletionResponse, Usage, Choice, Message
 
 @register_llm("mybackend")                    # the tag a config file can name
-class MyLLM(LLM):
+class MyLLM(BaseLLM):
     def __init__(self, base_url: str | None = None, **retry):
         super().__init__(**retry)             # forwards the retry_* settings
         self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
 
     def complete(self, model, messages, **kwargs):
-        # ... call self.base_url; raise jaz.providers.RateLimitError / AuthenticationError / ...
+        # ... call self.base_url; raise jaz.llm.RateLimitError / AuthenticationError / ...
         # on API errors so retry classification works.
         response = CompletionResponse(
             choices=[Choice(message=Message("assistant", "..."))],
@@ -212,151 +245,128 @@ class MyLLM(LLM):
 jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
 ```
 
-One class owns the whole job: the API call, retry, cost accounting and model metadata. `finalize()` turns your wire response into the normalized `LLMResponse` and prices it from the bundled table (models absent from it simply report `cost=None`); the retry wrappers and the non-retryable-error classification come from the base.
+One class owns the whole job: the API call, retry, cost accounting and model metadata. `finalize()` turns your wire response into the normalized `jaz.llm.LLMResponse` and prices it from the bundled table (models absent from it simply report `cost=None`); the retry wrappers and the non-retryable-error classification come from the base.
 
 When a config *file* names your backend by tag, the split between "settings for the backend object" and "params for the request" is taken from your `__init__` signature, so `base_url` reaches `MyLLM(...)` while `model` rides each call — a backend declares its construction keys just by declaring `__init__`. Constructing it yourself needs no such rule: `ConfigOverride(llm=my_llm)`.
 
-`register_llm` deliberately refuses to clobber an existing tag — registering `"openai"`/`"anthropic"` again raises. Naming a built-in as the tag *reconfigures* it (e.g. a base URL); to *replace* one entirely (e.g. route through a corporate gateway with custom auth), subclass or write your own `LLM`, then use the instance as the tag.
-
-> **Note:** `LLMClient`, `Provider`, `DefaultLLMClient` and `register_provider` were merged into this single `LLM` class and removed — one class per backend, rather than a client delegating to a provider it was always paired with. [#984](https://github.com/jaz-lang/jaz/issues/984) tracks giving the seam its final public form.
+`register_llm` deliberately refuses to clobber an existing tag — registering `"litellm"` again raises. `OpenAILLM` and `AnthropicLLM` ship in the package but are not registered, so `backend: openai` does not resolve — reach those providers through litellm's `openai/…` / `anthropic/…` routes. Registration and stability are separate axes: a tag can resolve without being covered by the stable API. To add or replace a backend, subclass `BaseLLM` and register your own tag.
 
 ## Architecture
 
 ```
 jaz/
-├── _agent.py       # Core Agent class (agent.py is a legacy-path shim over it)
 ├── invoke.py       # Public invoke() API
 ├── config.py       # Configuration system
 ├── budget.py       # Cost tracking
 ├── repl/           # Python REPL implementations
 ├── hooks/          # Hook system, event orchestration, and built-in hooks
-├── providers/      # LLM provider clients (OpenAI, Anthropic)
-└── library/        # Tool library system
+├── llm/            # LLM backends (LiteLLM by default)
+└── protocol/       # Wire-format codec between the LLM and the REPL
 ```
 
 ### Core Concepts
 
-- **Agent**: Orchestrates LLM queries and REPL execution
+- **Agent loop**: Orchestrates LLM queries and REPL execution
 - **REPL**: Executes agent-generated code with safety controls
 - **Hooks**: Event-based system for logging, budget control, workflow capture, and extensibility
-- **Libraries**: Hierarchical tool namespaces for agent use
+- **Tools**: Plain functions passed as inputs; their signature and docstring become the description the agent reads
 
 ## Built-in Hooks
 
 | Hook | Purpose |
 |------|---------|
-| `PrintLogger` | Log events to console |
-| `FileLogger` | Log events to file |
-| `WorkflowReplay` | Materialize agent trajectories as Python code |
-| `WorkflowStrategyHook` | Multi-select workflow strategy at decision points |
-| `MemoryStoreHook` | Inject per-episode in-memory code memory into the REPL |
-| `JaegerTracing` | OpenTelemetry distributed tracing |
-| `LangfuseTracing` | OpenTelemetry tracing to Langfuse Cloud |
+| `ReturnType` | Declare + enforce the invoke's return type |
+| `ValidateReturn` / `ValidateREPLInput` | Validate the return value / veto REPL input before it runs |
+| `BudgetPool` | Shared LLM cost / call-count budget with hard-stop enforcement |
+| `IterationLimit` / `RecursionLimit` | Per-level turn cap / invoke-nesting cap |
+| `BudgetForcing` | Refuse early finishes so the agent keeps working |
+| `Compaction` | Summarize old turns to stay inside the context window |
+| `ContextWindowWarning` | Warn the agent as its prompt nears the model's window |
+| `PrintLogger` / `FileLogger` | Log events to console / file |
+| `ATIFTrace` | Write the run as an ATIF trajectory (replay/cost source) |
+| `ATIFReplay` | Resume a run from an ATIF trace: saved responses replay, then live calls take over |
+| `RolloutRecorder` | Record token-native rollouts for training |
+| `JaegerTracing` / `LangfuseTracing` | OpenTelemetry tracing presets |
 
 
 ### Writing Custom Hooks
 
-Hooks observe agent execution via **events** and influence it by returning **effects**. All imports come from `jaz.hooks`:
+Hooks observe agent execution via **events** (from `jaz.hooks.events`) and influence it by
+returning **effects** (from `jaz.hooks.effects`):
 
 ```python
-from jaz.hooks import Hook, Event, Effect, ReplIterationEnter, AddInstructionPrompt
+from jaz import invoke
+from jaz.hooks import Hook
+from jaz.hooks.effects import AddMessages, Effect
+from jaz.hooks.events import LLMQueryEnter
 
 class ConciseHook(Hook):
     """Instruct the agent to be concise after iteration 3."""
 
     # Override the typed per-event handler for the event you care about — no
     # isinstance/dispatch boilerplate. (A cross-cutting observer that wants *every*
-    # event overrides `on_any` instead; the internal router `_dispatch_event` is private.)
-    def on_repl_iteration_enter(self, event: ReplIterationEnter) -> list[Effect]:
-        if event.iteration > 3:
-            return [AddInstructionPrompt("Be concise — you're running low on iterations.")]
+    # event overrides `on_any` instead.)
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        if event.iteration >= 3:  # iterations are 0-based
+            return [AddMessages([{"role": "user", "content": "Be concise."}])]
         return []
 
 # Hooks activate via context managers and propagate to nested invoke() calls
 with ConciseHook():
-    result = jaz.invoke(jaz.hooks.ReturnType(str), task="Solve this step by step")
+    result = invoke(task="Solve this step by step")
 ```
 
 Hooks compose naturally as context managers:
 
 ```python
-from jaz.hooks import clear_all_hooks
-
 # Stack multiple hooks
 with ConciseHook(), FileLogger("agent.log"):
-    result = jaz.invoke(...)
-
-# Clear all parent hooks for a clean slate (rare — see clear_all_hooks docstring)
-with clear_all_hooks():
-    result = jaz.invoke(...)  # No hooks active
+    result = invoke(...)
 ```
 
 ### Event Types
 
-Events are fired at discrete points in the agent's execution lifecycle. All are importable from `jaz.hooks`.
+Events fire around three spans — the whole **Invoke**, each turn's **LLMQuery**, and each
+turn's **REPLExec** — and every span walks the same four stages. All are importable from
+`jaz.hooks.events`.
 
-| Event | Fired when... |
-|-------|---------------|
-| `InvokeEnter` | `invoke()` is called, before any execution begins |
-| `InvokeExit` | `invoke()` completes (success or failure) |
-| `ReplIterationEnter` | Before a REPL iteration (LLM query + code execution) |
-| `ReplIterationExit` | After a REPL iteration completes |
-| `ReplExecutionEnter` | After LLM generates code, before it's executed |
-| `ReplExecutionExit` | After code execution completes |
-| `LLMQueryEnter` | Before making an LLM API call |
-| `LLMQueryExit` | After receiving the LLM response |
-| `Message` | The agent emits a message (e.g., status update) |
-| `BudgetUpdate` | Cost or iteration budget changes |
-| `LLMQueryRetry` | An LLM API call is being retried after failure |
+| Stage | Observes | Accepts | Fires |
+|-------|----------|---------|-------|
+| `*Enter` | the proposal | edit effects + `Abort` | always |
+| `*Send` | the committed input | supply effects + `Abort` | iff the input committed |
+| `*Complete` | the raw result | modify effects + `Abort` | iff a raw result exists |
+| `*Exit` | the outcome union (`Completed \| Aborted \| Failed`) | nothing (observation-only) | whenever the span opened |
 
-Each event carries contextual data (e.g., `ReplIterationEnter.iteration`, `LLMQueryEnter.model`). Span variants (`InvokeSpan`, `ReplIterationSpan`, etc.) are context managers that fire the corresponding enter/exit events.
+Plus `LLMQueryRetry`, fired per retry attempt of an LLM call. Every event carries
+contextual data (e.g. `LLMQueryEnter.model`, `LLMQueryEnter.iteration`) and a
+`timestamp` (its emission time — durations are arithmetic over two events' timestamps).
 
 ### Effect Types
 
-Effects are returned by hooks to influence execution. All are importable from `jaz.hooks`.
+Effects are returned by hooks to influence execution. All are importable from
+`jaz.hooks.effects`; each composes at a specific stage (an effect returned anywhere else
+raises `InvalidEffectError`).
 
-| Effect | Influence |
-|--------|-----------|
-| `ErrorEffect` | Turn the REPL execution into a recoverable `ErrorResult` shown to the agent (loop continues) |
-| `RaiseEffect` | Turn the REPL execution into a terminal `RaiseResult` whose exception propagates out of `jaz.invoke()` |
-| `AddInstructionPrompt` | Append text to the next user prompt sent to the agent |
-| `AddReplInput` | Inject a Python object into the REPL environment |
-| `OverrideLLMClient` | Switch the LLM client for this query |
-| `OverrideModelConfig` | Override model parameters (temperature, max_tokens, etc.) |
-| `AddLibrary` | Add a tool library to the agent's environment |
-
-### Episode Memory Store (Eval Harness)
-
-For Oolong evals, you can enable an episode-local memory store that is exposed
-directly in the agent REPL:
-
-```yaml
-jaz:
-  memory_store: true
-```
-
-When enabled, each episode gets a fresh in-memory store (no cross-episode/task persistence),
-and the REPL receives:
-
-- `store`: memory store object
-- `__store_catalog__`: `{name: description}` for all stored items
-
-REPL API:
-
-- `store.get(name)` -> live object
-- `store.get_code(name)` -> raw code string
-- `store.insert(name, description, code)` -> add item (code must define symbol `name`)
-- `store.delete(name)` -> remove item
-- `store.catalog` -> `{name: description}` mapping
+| Effect | Stage | Influence |
+|--------|-------|-----------|
+| `AddInputs` / `DropInputs` | `InvokeEnter` | Add/un-pass invoke inputs (prompt + REPL) |
+| `DisableRecursion` | `InvokeEnter` | Withhold the recursive `jaz.invoke` tool |
+| `AddMessages` / `DropMessages` | `LLMQueryEnter` | Edit the messages sent to the model (transient or persistent) |
+| `AddVariables` / `DropVariables` | `REPLExecEnter` | Bind/unbind REPL namespace names for the turn |
+| `SupplyLLMResponse` | `LLMQuerySend` | Supply the response, skipping the API call |
+| `SupplyExecResult` | `REPLExecSend` | Supply a result, skipping execution |
+| `ModifyExecResult` | `REPLExecComplete` / `InvokeComplete` | Replace the raw result |
+| `Abort` | any `Enter`/`Send`/`Complete` | Abort the invoke; its error propagates out of `invoke()` |
+| `BlackboardWrite` | any event | Write to the per-invoke cross-hook blackboard |
 
 ### Langfuse Tracing Quick Start
 
 ```python
-import jaz
-from jaz.hooks import LangfuseTracing
+from jaz import invoke
+from jaz.hooks import LangfuseTracing, ReturnType
 
 with LangfuseTracing():
-    result = jaz.invoke(jaz.hooks.ReturnType(int), task="Calculate 2+2")
+    result = invoke(ReturnType(int), task="Calculate 2+2")
 ```
 
 Environment variables:
@@ -366,7 +376,8 @@ Environment variables:
 
 ## Contributing
 
-Contributor setup, eval install matrix, and pre-commit instructions live in [DEV_SETUP.md](DEV_SETUP.md). PR workflow and code conventions are documented in [CLAUDE.md](CLAUDE.md).
+This repository is generated: each release publishes a cleaned copy of the package, so
+changes are not made here. Contributor setup and code conventions live with the source.
 
 ## License
 

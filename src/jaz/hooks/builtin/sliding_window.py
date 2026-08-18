@@ -6,6 +6,7 @@ keeping the system prompt and most recent messages.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from jaz.provenance import MessageKind, provenance_of
@@ -21,7 +22,7 @@ class SlidingWindow(Hook):
 
     The system prompt and the initial user prompt (task + inputs) are always kept, as are the
     most recent messages that fit in the budget. Everything between them is dropped from the
-    conversation — unlike :class:`~jaz.hooks.builtin.compaction.Compaction`, nothing is
+    conversation — unlike :class:`~Compaction`, nothing is
     summarized first, so this hook leaves nothing in its place.
 
     Useful for long-running agents that do not delegate, where the conversation would
@@ -42,7 +43,7 @@ class SlidingWindow(Hook):
         from jaz.hooks.builtin.sliding_window import SlidingWindow
 
         with SlidingWindow(fraction=0.7, max_input_tokens=272000):
-            jaz.invoke(...)
+            invoke(...)
 
     Raises:
         ValueError: If ``fraction`` is outside ``(0, 1]`` or ``max_input_tokens`` is not
@@ -61,7 +62,21 @@ class SlidingWindow(Hook):
             raise ValueError(
                 f"max_input_tokens must be positive, got {max_input_tokens}"
             )
+        # Kept alongside the derived `_budget` purely so `__repr__` can report the configuration
+        # as authored. `_budget` alone cannot: `int(fraction * max_input_tokens)` is lossy, so any
+        # pair with the same product would render identically.
+        #
+        # Underscored: these exist only to feed the repr, and naming them publicly would add API
+        # this hook has never offered — `_budget` is the value it actually works from.
+        self._fraction = fraction
+        self._max_input_tokens = max_input_tokens
         self._budget = int(fraction * max_input_tokens)
+
+    def __repr__(self) -> str:
+        return (
+            f"SlidingWindow(fraction={self._fraction!r}, "
+            f"max_input_tokens={self._max_input_tokens!r})"
+        )
 
     def on_any(self, event: Event) -> list[Effect]:
         match event:
@@ -74,7 +89,7 @@ class SlidingWindow(Hook):
         return []
 
 
-def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+def _estimate_tokens(messages: Sequence[dict[str, Any]]) -> int:
     """Fast token estimate: ~4 chars per token."""
     total = 0
     for msg in messages:
@@ -90,7 +105,7 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return total // 4
 
 
-def _indices_to_drop(messages: list[dict[str, Any]], budget: int) -> set[int]:
+def _indices_to_drop(messages: Sequence[dict[str, Any]], budget: int) -> set[int]:
     """Indices to drop to fit ``budget``.
 
     Pins the seed (system prompt + initial user prompt, plus any protocol-seeded prefix) by
@@ -138,6 +153,6 @@ def _indices_to_drop(messages: list[dict[str, Any]], budget: int) -> set[int]:
 #: Deprecated alias for the pre-rename spelling — see the rationale block in
 #: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
 #: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_every_renamed_hook_has_an_alias``). This hook is absent from every ``__all__``,
+#: (``test_legacy_hook_names_still_importable``). This hook is absent from every ``__all__``,
 #: so that deep-path import is the only way it was ever reachable.
 SlidingWindowHook = SlidingWindow

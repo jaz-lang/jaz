@@ -13,10 +13,10 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .base import InteractionProtocol
+    from .base import BaseProtocol
 
-# Global mapping from protocol names to InteractionProtocol classes.
-INTERACTION_PROTOCOL_MAP: dict[str, type[InteractionProtocol]] = {}
+# Global mapping from protocol names to BaseProtocol classes.
+INTERACTION_PROTOCOL_MAP: dict[str, type[BaseProtocol]] = {}
 
 # Valid protocol-name character class, mirroring REPL_LANG_NAME_PAT.
 PROTOCOL_NAME_PAT = r"[a-zA-Z0-9_]+"
@@ -24,15 +24,15 @@ PROTOCOL_NAME_RE = re.compile(rf"^{PROTOCOL_NAME_PAT}$")
 
 
 def register_protocol(name: str):
-    """Decorator registering an :class:`InteractionProtocol` under ``name``.
+    """Decorator registering a :class:`BaseProtocol` under ``name``.
 
     Example::
 
-        from jaz.protocol import InteractionProtocol, register_protocol
+        from jaz.protocol import BaseProtocol, register_protocol
 
         @register_protocol("my_protocol")
-        class MyProtocol(InteractionProtocol):
-            def parse(self, response_content, repl_language): ...
+        class MyProtocol(BaseProtocol):
+            def parse(self, llm_response, repl_language): ...
 
         # Now nameable in authored data as {"name": "my_protocol"}; in code, pass the
         # instance: jaz.configure(protocol=MyProtocol())
@@ -43,15 +43,15 @@ def register_protocol(name: str):
             "Protocol names must match the regex [a-zA-Z0-9_]+"
         )
 
-    def decorator[C: type["InteractionProtocol"]](protocol_class: C) -> C:
+    def decorator[C: type["BaseProtocol"]](protocol_class: C) -> C:
         # Import here to mirror register_repl; base.py does not import registry, so this
         # is cycle-free either way (the import guards against future import-order shifts).
-        from .base import InteractionProtocol
+        from .base import BaseProtocol
 
-        if not issubclass(protocol_class, InteractionProtocol):
+        if not issubclass(protocol_class, BaseProtocol):
             raise TypeError(
                 f"Protocol class {protocol_class.__name__} must inherit from "
-                "InteractionProtocol base class"
+                "BaseProtocol base class"
             )
         if name in INTERACTION_PROTOCOL_MAP:
             raise ValueError(
@@ -75,9 +75,7 @@ def validate_protocol_name(name: str, field: str = "interaction_protocol") -> No
         raise ValueError(f"Unknown {field}: {name!r}. Registered protocols: {known}.")
 
 
-def create_protocol(
-    name: str, params: Mapping[str, Any] | None = None
-) -> InteractionProtocol:
+def create_protocol(name: str, params: Mapping[str, Any] | None = None) -> BaseProtocol:
     """Instantiate the registered protocol ``name``, configured from ``params``.
 
     ``REGISTRY[tag].from_dict(params)`` — the same shape as ``create_llm``. Params it does not

@@ -5,9 +5,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import Any, overload
+from typing import overload
 
 from ._agent import Agent
+from ._invoke_tool import InvokeTool, get_invoke_tool
 from .config import (
     Config,
     ConfigOverride,
@@ -28,7 +29,6 @@ from .hooks.context import (
     get_current_hooks,
 )
 from .instantiate import language_of
-from .library import Library, get_jaz_library
 from .repl.stdout_proxy import capturing as _stdout_capturing
 from .scope import _scope_var
 
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # (`_config_stack`) and hook (`_hook_context`) ContextVars: live ContextVar is
 # primary; unset means a true top-level call. On a raw worker thread the agent
 # facade re-establishes this var from its captured ancestor before it calls in
-# (see get_jaz_library in library/jaz.py, alongside the symmetric config/hook
+# (see get_invoke_tool in _invoke_tool.py, alongside the symmetric config/hook
 # re-establishment), so a public `jaz.invoke` reached from inside a worker
 # inherits the enclosing depth rather than minting a fresh root.
 _current_prehook: ContextVar["Prehook | None"] = ContextVar(
@@ -166,94 +166,6 @@ def _activate_local_hooks(hooks: tuple[Hook, ...]) -> Iterator[None]:
         _reset_hook_context(token)
 
 
-# Common misspellings or misuses of invoke() kwargs.
-# Keys are invalid kwarg names that users may pass; values are suggestions.
-#
-# Scope: this guard fires only at the *public* invoke()/ainvoke() boundary. The
-# in-REPL nested jaz.invoke (the closure in library/jaz.py) routes through
-# _invoke and deliberately does NOT consult this map, so an agent that passes a
-# removed kwarg (e.g. additional_repls=...) inside a REPL binds it as an ordinary
-# input variable instead of getting this guidance. Extending the check there was
-# considered and declined: the nested closure's **inputs are agent-supplied task
-# data, where names like `model`/`temperature`/`repl` can legitimately be inputs,
-# so raising on them would be a false positive on real data.
-_REPL_HINT = (
-    "from jaz.repl.python_repl import PythonREPL; jaz.configure(repl=PythonREPL({}))"
-)
-_LLM_HINT = "from jaz.providers.openai import OpenAILLM; jaz.{}(llm=OpenAILLM({}))"
-
-_INVOKE_KWARG_TYPOS: dict[str, str] = {
-    # Config knobs are no longer invoke() kwargs: set them via a local
-    # ConfigOverride (or jaz.ConfigOverride(...) / jaz.configure(...)).
-    "max_iterations": "with jaz.hooks.IterationLimit(max_iterations=...): jaz.invoke(...)",
-    "max_repl_iterations": "with jaz.hooks.IterationLimit(max_iterations=...): jaz.invoke(...)",
-    "max_depth": "with jaz.hooks.RecursionLimit(max_depth=...): jaz.invoke(...)",
-    "max_cost_budget": "with jaz.hooks.BudgetPool(cost_budget=...): jaz.invoke(...)",
-    "max_llm_calls_budget": "with jaz.hooks.BudgetPool(calls_budget=...): jaz.invoke(...)",
-    # Kept (repointed, not deleted) now that the per-level nested-invoke cap is gone:
-    # the hint is most valuable right after a removal, when callers still reach for the
-    # old name and the generic TypeError would name no replacement.
-    "max_invoke_calls": "removed (YAGNI — the per-level nested-invoke cap): use "
-    "with jaz.hooks.BudgetPool(calls_budget=...) to bound work, or "
-    "with jaz.hooks.RecursionLimit(max_depth=...) to bound depth",
-    "max_repl_invoke_calls": "removed (YAGNI — the per-level nested-invoke cap): use "
-    "with jaz.hooks.BudgetPool(calls_budget=...) to bound work, or "
-    "with jaz.hooks.RecursionLimit(max_depth=...) to bound depth",
-    "context_window_fraction": "with jaz.hooks.ContextWindow(context_window_fraction=...): jaz.invoke(...)",
-    # Spelled with the import, because neither name is reachable from the `jaz` top level and
-    # these strings are printed to someone who just hit a typo — a hint they cannot paste is
-    # only half a hint.
-    "allowed_imports": _REPL_HINT.format("allowed_imports=[...]"),
-    "allowed_attributes": _REPL_HINT.format("allowed_attributes=[...]"),
-    "repls": "jaz.ConfigOverride(repl=...)",
-    "repl": "jaz.ConfigOverride(repl=...)",
-    "additional_repls": "jaz.ConfigOverride(repl=...) (multiple REPLs are no longer supported)",
-    "model": _LLM_HINT.format("configure", "model=..."),
-    "temperature": _LLM_HINT.format("ConfigOverride", "temperature=..."),
-    "max_tokens": _LLM_HINT.format("ConfigOverride", "max_tokens=..."),
-    # task_name moved off the core signature onto the per-invoke blackboard: it is
-    # now hook metadata (consumed by WorkflowReplay / tracing), seeded by a
-    # MetaData carrier hook rather than a kwarg.
-    "task_name": "jaz.invoke(jaz.hooks.MetaData(task_name=...), ...) (or with jaz.hooks.MetaData(task_name=...): ...)",
-    # input_descriptions was replaced by value-attached descriptions: attach a
-    # permanent description to a value with jaz.describe(value, text), or control
-    # per-call rendering (relabel/hide) with jaz.Display(value, text|None).
-    # Leads with `describe` because `Display` is demoted (outside __all__, warns on use):
-    # a rejection message naming it first sends the caller from an error straight into a
-    # warning. Kept as a flagged second option since it is the only one that can hide.
-    "input_descriptions": "jaz.describe(value, text), or jaz.Display(value, text|None) per input (experimental — warns on use)",
-    # local_hooks is no longer a keyword: hooks are leading POSITIONAL arguments now, so
-    # a stray `local_hooks=[...]` would silently become an ordinary input (pyright can't
-    # catch it — any keyword is a valid `**inputs`). Redirect it to the positional form.
-    "local_hooks": "pass hooks positionally: jaz.invoke(MyHook(), OtherHook(), ..., task=...)",
-    # The return_type= keyword was removed (#528): the return type is now declared with a
-    # positional ReturnType(...) hook. The keyword lived on for a while as a thin shim; that
-    # shim is gone, so a stray `return_type=` would silently become an ordinary `**inputs`
-    # variable. Guard it and point at the hook. Static typing (`x: T = jaz.invoke(...)`) still
-    # works when ReturnType(T) is the FIRST positional argument (see the typed overload).
-    "return_type": "pass a ReturnType(...) hook positionally (first, for static typing): "
-    "jaz.invoke(ReturnType(T), ..., task=...)",
-    # config_override= is no longer a keyword: a local ConfigOverride is now passed POSITIONALLY,
-    # in the same `*local_config_hooks` channel as hooks (it composes with them the same way — a
-    # local, non-propagating override for this one invoke). A stray `config_override=` would
-    # otherwise become an ordinary `**inputs` variable, so guard it and point at the positional
-    # form. (The agent-facing synthesized jaz.invoke still takes config_override= — it forwards to
-    # the internal plumbing keyword — but that surface routes through _invoke, not this guard.)
-    "config_override": "pass the ConfigOverride positionally: "
-    "jaz.invoke(ConfigOverride(...), ..., task=...)",
-    # Return-value and REPL-input validation moved to positional hooks (#528). The old
-    # return_validator=/repl_input_validator= keywords are gone; a stray one would silently
-    # become an ordinary `**inputs` variable, so guard it and point at the hook. (A
-    # process-wide input validator is a propagating `with ValidateREPLInput(fn):` context
-    # manager — the config-level `repl_input_validator` field was removed too.)
-    "return_validator": "pass a ValidateReturn(fn) hook positionally: "
-    "jaz.invoke(ReturnType(T), jaz.hooks.ValidateReturn(fn), ..., task=...)",
-    "repl_input_validator": "pass a ValidateREPLInput(fn) hook positionally: "
-    "jaz.invoke(jaz.hooks.ValidateREPLInput(fn), ..., task=...)  "
-    "(or process-wide via `with jaz.hooks.ValidateREPLInput(fn):`)",
-}
-
-
 @dataclass(kw_only=True, frozen=True)
 class PrehookOutput:
     repl_depth: int
@@ -278,7 +190,7 @@ class Prehook:
         self.parent_repl_iteration: int | None = None
         # Snapshot the ancestor hook context at construction time (parent's thread).
         # Closure-threaded alongside the prehook so the ancestor hook chain survives a raw
-        # worker thread, where the _hook_context ContextVar doesn't propagate: get_jaz_library
+        # worker thread, where the _hook_context ContextVar doesn't propagate: get_invoke_tool
         # re-bases this snapshot's hooks UNDER any the worker activates locally (#727 composition,
         # not either/or). An established live ContextVar stays primary (same-thread and
         # copy_context paths); only a fresh worker falls back to this snapshot.
@@ -317,11 +229,7 @@ class _InvokeSetup:
     invoke_id: str
     parent_invoke_id: str | None
     parent_repl_iteration: int | None
-    jaz_library: Library | None
-    # Cap-leaf variant of `jaz_library` — same opted-in `jaz.*` helpers minus `jaz.invoke`
-    # (#635). The Agent binds this instead of `jaz_library` when a DisableRecursion effect
-    # fires at InvokeEnter. `None` when nothing is opted in (cap leaf then gets no library).
-    jaz_library_no_invoke: Library | None
+    invoke_tool: InvokeTool
     config: Config
     child_prehook: Prehook
     # Explicit `**inputs` kwargs and resolved ambient `jaz.scope`, kept as SEPARATE
@@ -363,14 +271,14 @@ def _build_invoke_setup(
     # INNERMOST layer on a throwaway copy of the stack — so it wins over propagating overrides and
     # per-depth layers (declaration-nesting: innermost wins, #727) and applies to THIS invoke
     # only. It is NOT pushed onto the live stack, so it does not propagate to sub-invokes (which
-    # inherit the ancestor `ancestor_stack` — see get_jaz_library below). A local
+    # inherit the ancestor `ancestor_stack` — see get_invoke_tool below). A local
     # `ConfigOverrideByDepth` argument never reaches here: `_extract_config_override` rejects one
     # passed positionally with a TypeError (see its docstring), precisely because locally it would
     # collapse to a degenerate depth-gated plain override. Both the public `invoke`/`ainvoke` and
     # the synthesized agent-facing `invoke` route through that helper, so `config_override` here is
     # always a plain `ConfigOverride`.
-    # The agent-facing synthesized invoke accepts a `config_override` too (see get_jaz_library in
-    # library/jaz.py), so an agent can pass one to its own sub-invokes. To cap a subtree's
+    # The agent-facing synthesized invoke accepts a `config_override` too (see get_invoke_tool in
+    # _invoke_tool.py), so an agent can pass one to its own sub-invokes. To cap a subtree's
     # recursion depth it wraps the sub-invoke in
     # `with jaz.hooks.RecursionLimit(max_depth=...):` (the cap is no longer a config key;
     # local_hooks would NOT work — it doesn't propagate, and RecursionLimit rejects that channel).
@@ -428,7 +336,7 @@ def _build_invoke_setup(
 
     # The former `max_task_length` guard is gone (#538): there is no distinguished task
     # string to bound — the prompt is now an ordinary input, subject to the same
-    # `max_input_length` per-input rendering cap as every other input, not a separate
+    # `max_invoke_input_length` per-input rendering cap as every other input, not a separate
     # length ceiling here.
 
     prehook_output = prehook()
@@ -467,30 +375,23 @@ def _build_invoke_setup(
         parent_invoke_id=invoke_id,
     )
 
-    # Build the framework `jaz_library` — the synthesized JAZ library, whose sole member is the
-    # recursive `jaz.invoke` tool. Bound *unconditionally* now: the framework imposes no
-    # recursion cap. Two variants are built and handed to the Agent, which picks between them
-    # when it honors a DisableRecursion effect at InvokeEnter (a RecursionLimit at the cap):
-    #   - `jaz_library`          — the full surface, incl. the recursive `jaz.invoke` tool.
-    #   - `jaz_library_no_invoke`— the cap-leaf surface: WITHOUT `jaz.invoke`. Since `jaz.invoke`
-    #     is now the namespace's only member, this variant has no members and is always `None`
-    #     (get_jaz_library's `if not all_tools: return None`), so an at-cap agent has no `jaz`
-    #     library at all. Framework helpers (ReturnType/Display/…) reach an agent as ordinary
-    #     inputs the host passes, not via `jaz.*` (#635 kept the leaf variant only for exports,
-    #     which are gone).
-    # Both are built here (not in Agent) because the DisableRecursion decision is only known at
-    # InvokeEnter — after Agent already holds both. User tool namespaces are ordinary inputs bound
-    # via `__jaz_get__` (see library_as_input.md), not passed here.
+    # Build the recursive sub-invoke primitive the agent calls as the bare name `invoke`. Built
+    # *unconditionally*: the framework imposes no recursion cap, and the one thing that withholds
+    # the tool — a DisableRecursion effect at InvokeEnter (RecursionLimit at the cap) — is only
+    # known once the Agent is running, so the Agent nulls it out then rather than choosing here
+    # between two prebuilt variants. (There used to be a second `jaz_library_no_invoke` build for
+    # exactly that: a cap-leaf surface keeping the `jaz.*` helpers minus `jaz.invoke`. #635 moved
+    # the helpers out to ordinary inputs, leaving it permanently empty, and dropping the `jaz`
+    # namespace leaves nothing for it to hold — "the invoke tool without invoke" is just `None`.)
+    # User tool namespaces are ordinary inputs bound via `__jaz_get__` (see library_as_input.md),
+    # not passed here.
     new_prehook = child_prehook
-    # The `config.allow_config_hooks_in_subinvoke` read below intentionally uses the overridden
-    # `config`: it describes how THIS agent sees its sub-invoke surface (full-vs-minimal invoke
-    # signature), not how the sub-invocations execute. A local ConfigOverride of it is therefore
-    # scoped to this level only (non-propagating). `config_stack=` below is the *ancestor* stack
-    # (WITHOUT this invoke's local override layer) precisely because it controls how the nested
-    # invokes execute, which IS supposed to be non-propagating — the closure re-bases this stack
-    # onto a raw worker thread (#727).
-    _jaz_library_kwargs: dict[str, Any] = dict(
-        allow_config_hooks_in_subinvoke=config.allow_config_hooks_in_subinvoke,
+    # Passed directly rather than through a shared kwargs dict: that indirection existed only
+    # to feed the two library builds the same arguments, and a `dict[str, Any]` splat costs the
+    # type checking of these kwargs against `get_invoke_tool`'s signature.
+    invoke_tool: InvokeTool = get_invoke_tool(
+        _invoke,
+        new_prehook,
         # Snapshot of this level's scope, bound as data so it propagates to
         # nested invokes across thread/task hops (see `parent_scope` above).
         parent_scope=scoped,
@@ -500,17 +401,6 @@ def _build_invoke_setup(
         # last-wins, even across a raw worker-thread boundary (#727).
         config_stack=ancestor_stack,
     )
-    jaz_library: Library | None = get_jaz_library(
-        _invoke, new_prehook, include_invoke=True, **_jaz_library_kwargs
-    )
-    # The cap-leaf variant is now ALWAYS None: with `jaz.invoke` the namespace's only member,
-    # `get_jaz_library(include_invoke=False)` has no tools and short-circuits to None
-    # unconditionally. Written as a literal rather than that guaranteed-None call so the reader
-    # doesn't wonder whether the second build can ever differ. The `jaz_library_no_invoke`
-    # plumbing (through _InvokeSetup / Agent) is retained deliberately: it lets a future PR
-    # re-introduce a helper-only cap-leaf surface without re-threading five call sites — and
-    # `get_jaz_library` keeps its `include_invoke` parameter for that.
-    jaz_library_no_invoke: Library | None = None
 
     # Invoke agent in REPL.
     # local_hooks is bound to this Agent's dispatcher only; nested
@@ -533,8 +423,7 @@ def _build_invoke_setup(
         invoke_id=invoke_id,
         parent_invoke_id=parent_invoke_id,
         parent_repl_iteration=parent_repl_iteration,
-        jaz_library=jaz_library,
-        jaz_library_no_invoke=jaz_library_no_invoke,
+        invoke_tool=invoke_tool,
         config=config,
         child_prehook=child_prehook,
         inputs=inputs,
@@ -546,7 +435,7 @@ def _build_invoke_setup(
 def _established_config_stack() -> Iterator[None]:
     """Mark the propagating config stack "established" for this invoke's dynamic extent (#727).
 
-    The agent-facing synthesized ``jaz.invoke`` (``get_jaz_library``) re-bases the ancestor stack
+    The agent-facing synthesized ``invoke`` (``get_invoke_tool``) re-bases the ancestor stack
     onto a raw worker thread by detecting an *unestablished* stack — the module-default stack a
     fresh worker sees because the ``_config_stack`` ContextVar didn't propagate. Marking the stack
     established here means a SAME-thread sub-invoke (where the ContextVar *did* propagate) is not
@@ -624,7 +513,7 @@ def _invoke(
     # root. The token-based reset restores the parent's value, so same-thread nested
     # invokes stack correctly (child@2 -> child@3 -> ...). Mirrors the config/hook
     # ContextVars; a raw worker thread does not inherit it, which is why the agent facade
-    # re-establishes it from its captured ancestor (see get_jaz_library).
+    # re-establishes it from its captured ancestor (see get_invoke_tool).
     _prehook_token = _set_current_prehook(s.child_prehook)
     try:
         # NOTE: For static type checking, we need to call the overloads explicitly
@@ -645,8 +534,7 @@ def _invoke(
             _stdout_capturing(),
         ):
             return s.agent.invoke(
-                jaz_library=s.jaz_library,
-                jaz_library_no_invoke=s.jaz_library_no_invoke,
+                invoke_tool=s.invoke_tool,
                 depth=s.repl_depth,
                 invoke_id=s.invoke_id,
                 parent_invoke_id=s.parent_invoke_id,
@@ -697,8 +585,7 @@ async def _ainvoke(
             _stdout_capturing(),
         ):
             return await s.agent.ainvoke(
-                jaz_library=s.jaz_library,
-                jaz_library_no_invoke=s.jaz_library_no_invoke,
+                invoke_tool=s.invoke_tool,
                 depth=s.repl_depth,
                 invoke_id=s.invoke_id,
                 parent_invoke_id=s.parent_invoke_id,
@@ -805,8 +692,8 @@ def _resolve_invoke_hooks(
 #   1. ``ReturnType[ReturnT]`` first  -> ``-> ReturnT`` (static ``x: T = jaz.invoke(ReturnType(T), ...)``)
 #   2. no leading ``ReturnType``      -> ``-> object``
 # The ``return_type=`` keyword shim is GONE (#528): the return type is declared solely via a
-# positional ``ReturnType(...)`` hook. A stray ``return_type=`` now trips the ``_INVOKE_KWARG_TYPOS``
-# guard (it lands in ``**inputs``) rather than silently typing the call. Static typing survives
+# positional ``ReturnType(...)`` hook. A stray ``return_type=`` now lands in ``**inputs`` and
+# binds as an ordinary agent input rather than typing the call. Static typing survives
 # because overload 1 keys on the *leading position* — the runtime extraction still accepts a
 # ``ReturnType`` anywhere among the positional hooks, but only the leading form is type-inferred.
 #
@@ -853,10 +740,10 @@ def invoke(
     the description of each ``input_i`` along with its ``name_i``, and binds each ``input_i``
     to a variable ``name_i`` in the REPL. Inputs typically include the prompt (e.g. ``instructions="..."``
     or ``task="..."``), input data (e.g. ``df=pd.DataFrame(...)``), and tools (e.g.
-    ``def web_search(...): ...; jaz.invoke(..., web_search=web_search)``).
+    ``def web_search(...): ...; invoke(..., web_search=web_search)``).
 
     Pass a :class:`ReturnType` hook as the first positional arg (e.g.
-    ``jaz.invoke(ReturnType(int), ...)``) to narrow the static return type and enforce it at
+    ``invoke(ReturnType(int), ...)``) to narrow the static return type and enforce it at
     runtime.
 
     To allow the agent to write async code with top-level ``await`` in its REPL, use
@@ -876,14 +763,19 @@ def invoke(
     Returns:
         The value the agent returned from the REPL session.
     """
-    # Catch common kwarg misspellings before they silently become input variables
-    for key in inputs:
-        if key in _INVOKE_KWARG_TYPOS:
-            raise TypeError(
-                f"invoke() got unexpected keyword argument '{key}'. "
-                f"Did you mean: {_INVOKE_KWARG_TYPOS[key]}"
-            )
-
+    # Docs idiom (user decisions in the #1165 review, 2026-08-15). The *calling surface*
+    # is imported bare in examples — ``from jaz import invoke, scope, describe``
+    # (`ainvoke` rides with `invoke`): these are the verbs written in the flow of
+    # agent-calling code, and bare they read as language primitives. Every other `jaz`
+    # name (configure/ConfigOverride, Library, Display, the hooks namespaces) stays
+    # package-qualified in examples — the qualified spelling is itself the signal of
+    # facility rather than primitive. Carve-outs: inline prose name-references stay
+    # qualified (they double as fully qualified names); agent-REPL-side examples spell
+    # the fixed facade name ``jaz.invoke``, which is how the primitive appears inside an
+    # agent's own REPL; multi-line runnable examples carry the import in-snippet, while
+    # one-line schematics rely on the convention. This lived in the docstring above
+    # until the review called it what it is — authoring policy, not user-facing API
+    # documentation.
     # Split a positional ConfigOverride (the config_override= keyword was removed) out of the
     # positional args, then resolve the return type / hooks from what remains. Order matters: a
     # ReturnType is a Hook and stays in `local_hooks` for _resolve_invoke_hooks to extract.
@@ -952,13 +844,6 @@ async def ainvoke(
 
     Arguments are identical to :func:`invoke` — see it for full documentation.
     """
-    for key in inputs:
-        if key in _INVOKE_KWARG_TYPOS:
-            raise TypeError(
-                f"ainvoke() got unexpected keyword argument '{key}'. "
-                f"Did you mean: {_INVOKE_KWARG_TYPOS[key]}"
-            )
-
     # Split the positional ConfigOverride out (config_override= keyword removed, #528), then
     # resolve the return type / hooks from the remaining positional hooks. See `invoke`.
     # (The guard's ancestor policy is computed inside `_build_invoke_setup`, not here. #826.)

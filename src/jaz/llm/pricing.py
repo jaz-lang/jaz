@@ -13,7 +13,7 @@ To refresh from upstream and re-filter::
         json.dump({k:v for k,v in d.items() \\
           if isinstance(v,dict) and v.get('litellm_provider') in {'openai','anthropic'}}, \\
         sys.stdout, indent=2)" \\
-      > src/jaz/providers/model_prices.json
+      > src/jaz/llm/model_prices.json
 
     (Upstream's ``sample_spec`` template entry is intentionally dropped — it is
     not a real model and would otherwise leak into ``get_all_models()`` and be
@@ -57,16 +57,20 @@ from typing import Any
 
 # Load bundled JSON at import time
 _PRICING_DATA: dict[str, Any] = json.loads(
-    files("jaz.providers").joinpath("model_prices.json").read_text()
+    files("jaz.llm").joinpath("model_prices.json").read_text()
 )
 
 # Map our public ``service_tier`` argument to LiteLLM JSON key suffixes.
-# OpenAI's API uses ``service_tier="batch"`` (singular); LiteLLM's JSON
-# uses ``_batches`` (plural). We normalize here.
+# There is deliberately no ``batch`` entry: batch pricing is billed through
+# OpenAI's separate Batch API endpoint, not selected by ``service_tier`` (the
+# SDK's is Literal["auto","default","flex","scale","priority"]). A former
+# ``"batch": "batches"`` mapping applied the Batch API's ~50% discount to
+# standard-rate requests, under-reporting cost — the direction ``cost_budget``
+# cannot tolerate. See design/design_features/litellm_sole_backend_v1.md (fix 1).
+# Any unrecognized tier falls back to "" (standard) via ``.get(tier, "")``.
 _TIER_SUFFIX = {
     "priority": "priority",
     "flex": "flex",
-    "batch": "batches",
     "standard": "",
     "default": "",
     "auto": "",

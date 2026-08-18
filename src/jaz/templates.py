@@ -2,12 +2,12 @@
 
 Lets a caller write::
 
-    jaz.invoke(task=t"Analyze the {data}")
+    invoke(task=t"Analyze the {data}")
 
 as shorthand for the equivalent explicit form (the t-string is passed as the
 ``task`` input value)::
 
-    jaz.invoke(task="Analyze the `data`", data=data)
+    invoke(task="Analyze the `data`", data=data)
 
 A literal *f-string* cannot do this: it is evaluated eagerly, so by the time
 ``invoke`` runs only ``str(data)`` survives — both the variable name and the live
@@ -310,7 +310,7 @@ def normalize_inputs(inputs: dict[str, object]) -> dict[str, object]:
     resolution being single-level:
 
     - **Override + a ``__jaz_get__`` value drops the payload.** ``t"{lib!r}"`` (where ``lib``
-      carries ``__jaz_get__``, e.g. a :class:`~jaz.Library`) minus the override binds the
+      carries ``__jaz_get__``, e.g. a :class:`~jaz.library.Library`) minus the override binds the
       payload, but *with* the override the sibling becomes a ``Display`` directive wrapping
       ``lib``; :func:`resolve_inputs` unwinds only that outer layer, so the REPL binds the
       ``lib`` *wrapper*, not ``lib.__jaz_get__()`` (and the header renders ``repr(lib)``).

@@ -1,6 +1,6 @@
 """The interaction protocol: the assistant message **is** the code.
 
-Registered as ``"default"`` and the only protocol JAZ ships. There is no XML framing, no
+Registered as ``"code_only"`` and the only protocol JAZ ships. There is no XML framing, no
 ``<repl_code>`` tag, and no delimiter of any kind — the whole assistant message is executed
 verbatim as REPL input, and reasoning goes in leading comments.
 
@@ -31,7 +31,7 @@ escape-your-own-output failure the XML protocol showed on SWE-bench — numerica
 XML did there (8.9% vs 4.7% of turns; Fisher p=0.51, not significant, but plainly not zero).
 Over-escaping is provoked by the task shape (writing code that contains code); removing the
 delimiter narrows which shapes provoke it rather than eliminating it. See the comment above
-:class:`DefaultProtocol` for the measurement with intervals and ``logs/protocol_repro/`` for
+:class:`CodeOnlyProtocol` for the measurement with intervals and ``logs/protocol_repro/`` for
 traces.
 
 Known costs (accepted)
@@ -42,7 +42,7 @@ Known costs (accepted)
   intended trade, but it falls hardest on smaller models.
 - **No per-exec timeout attribute.** ``<repl_code timeout="30">``'s successor is not a protocol
   concern at all: the REPL reads a ``# timeout: <seconds>`` comment among the lines that open the
-  input (see :meth:`jaz.repl.python_repl.PythonREPL.exec`), so the request travels *inside* the
+  input (see :meth:`PythonREPL.exec`), so the request travels *inside* the
   code rather than in framing this protocol no longer has. ``parse`` therefore still returns
   ``exec_timeout_override=None`` — the seam stays open for a protocol that does carry one
   out-of-band, and the pragma outranks it when both are present.
@@ -56,43 +56,45 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..exceptions import LLMResponseParseError, _JazInternalError
+from ..exceptions import _JazInternalError
 from ..prompts import get_system_prompt, get_user_prompt, render_input_section
 from ..repl._ast_utils import parse_allowing_toplevel_return
 from ..repl.types import Continue
 from ..string_utils import abbreviate_string
 from ..template_loader import _jinja_env
-from .base import InteractionProtocol, ParsedCode
+from .base import BaseProtocol, ParsedCode
 from .registry import register_protocol
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .._display import DisplayText
+    from .._invoke_tool import InvokeTool
     from .._llm_client import LLMResponse
-    from ..library import Library
-    from ..providers.base import MessageDict
-    from ..repl.base import REPL
+    from ..llm.base import MessageDict
+    from ..repl.base import BaseREPL
     from ..repl.types import ExecResult
 
 
 @dataclass(frozen=True)
 class REPLHistoryEntry:
-    """One ``__repl_history__`` entry — **this** protocol's history-record shape.
+    """One ``__history__`` entry — **this** protocol's history-record shape.
 
     The entry type belongs to the protocol, not to the core or the REPL: it is exactly what
-    :meth:`DefaultProtocol.build_history_entry` projects a turn into, and a custom protocol may
+    :meth:`CodeOnlyProtocol.build_history_entry` projects a turn into, and a custom protocol may
     record an entirely different shape. (Core stays schema-agnostic — the driver holds a
     ``list[object]`` and appends whatever ``build_history_entry`` returns; the REPL only *surfaces*
-    that list as ``__repl_history__`` by reference. Per ``design/design_features/basics.md``'s
+    that list as ``__history__`` by reference. Per ``design/design_features/basics.md``'s
     Harness-as-Language / FAC view, a REPL session's own history is a first-class, agent-visible
     projection of the loop history into the namespace, but the projection is this seam's call.)
 
-    ``__repl_history__`` is a plain list of one entry per iteration in order — ``[0]`` first, ``[-1]``
-    most recent — with **no index-0 init snapshot** (#568): the old ``REPLHistoryInit(inputs)``
-    duplicated ``__inputs__`` and would have leaked withheld inputs back through history, so callers
-    that used ``__repl_history__[1:]`` now use ``__repl_history__`` directly.
+    ``__history__`` is a plain list of one entry per iteration in order — ``[0]`` first, ``[-1]``
+    most recent — with no index-0 init snapshot, so ``__history__[0]`` is the first iteration.
     """
+
+    # No index-0 init snapshot: the old ``REPLHistoryInit(inputs)`` (removed in #568) duplicated
+    # ``__inputs__`` and would have leaked withheld inputs back through history; callers that used
+    # ``__history__[1:]`` now use ``__history__`` directly.
 
     # The full LLM response that produced this turn — the raw model output, NOT the parsed code.
     # This is the executive call (was ``repl_input``): the real consumers (sweb/appworld
@@ -128,10 +130,11 @@ class REPLHistoryEntry:
     # ``+---``/``| `` markup rather than ``summarize_exception``'s indented form, but every child's
     # type+message is still present in ``repl_output``.)
     #
-    # The invariant holds *uniformly*, including a parse-failure iteration: even though no code ran
-    # there, ``Agent._parse_error_result`` populates ``output`` with the rendered error
-    # (``summarize_exception(e)``) rather than leaving it empty, precisely so ``repl_output`` is a
-    # valid pointer for every entry (see that function + the ``Continue`` contract). A meta-agent that
+    # The invariant holds *uniformly*, including a turn whose code never ran: the REPL's own
+    # did-not-execute paths populate ``output`` with the rendered error (``summarize_exception(e)``)
+    # rather than leaving it empty, precisely so ``repl_output`` is a valid pointer for every entry
+    # (see the ``Continue`` contract). ``parse`` no longer contributes such a turn — it has no
+    # failure mode, and an empty message is empty code. A meta-agent that
     # instead wants to re-derive the text from the raw ``repl_exception`` — e.g. from *inside* its own
     # sandboxed REPL, where ``from jaz.string_utils import summarize_exception`` is usually denied by
     # the default ``allowed_imports`` — can reconstruct the one-liner import-free as
@@ -145,6 +148,60 @@ WHOLE_MESSAGE_FENCE_REGEX = re.compile(
 )
 # A fence *somewhere* in the message: the "chatty preamble, then a fenced block" case.
 EMBEDDED_FENCE_REGEX = re.compile(r"```[a-zA-Z0-9_+-]*\n(.*?)\n?```", re.DOTALL)
+
+
+# The wire-format instruction block — the *request* half of this codec, owned here beside `parse`
+# (its accept half) so the two cannot desync (#639). This was previously hardcoded in
+# `system_prompt.jinja2`; the shipped template now splices it in as `{{ format_instructions }}`.
+# The text must stay in step with what `parse` accepts: raw code, no fences, prose as comments.
+# Kept byte-identical to the block it replaced so the rendered system prompt is unchanged.
+# The wire-format instructions the protocol owns. The XML framing lives in the template
+# (``<response_format>`` around ``{{ format_instructions }}``), not here, so the protocol
+# supplies only the instruction text (#639).
+_FORMAT_INSTRUCTIONS = """\
+- Respond with ONLY code. Your entire response will be sent verbatim to the REPL and executed as code.
+  Anything in your response that is not valid code is a syntax error.
+  - All natural language prose MUST be written as *comments* in your code.
+  - Do NOT wrap your code in markdown fences or XML tags.
+- Write a brief plan for your next step in comments on the first few lines of your response/code:
+
+    # <brief plan for next step>
+    code_for_next_step
+"""
+
+
+# The ``__history__`` description — the *describe* half of this codec's record seam, owned here
+# beside `build_history_entry` (its write half) for the same reason `_FORMAT_INSTRUCTIONS` sits
+# beside `parse`: the field names below are exactly `REPLHistoryEntry`'s, so the two must be edited
+# together. It previously lived in `python_repl_description.jinja2`, where a swapped protocol left
+# the REPL describing a record it does not produce.
+#
+# The text states only the record's SHAPE. Its framing — a lead-in sentence and the enclosing
+# `<__history__ type="list">` element — belongs to `system_prompt.jinja2`, the same division
+# `{{ format_instructions }}` already had: the template owns placement and framing, the protocol
+# owns the words that have to track `REPLHistoryEntry`. Hence no opening announcement of the
+# variable here, and a flat field list rather than one nested under such a bullet.
+#
+# EXECUTIVE CALL (user): the block renders in its own element AFTER `</repl_spec>`, not inside it.
+# It previously sat at the tail of `<repl_spec>`, on the reasoning that it documents a REPL
+# *namespace* variable and so belongs with the REPL's spec. That was reversed: as its own element
+# the block is a peer of `<invoke type="function">` — the other named thing the agent is handed —
+# and `<repl_spec>` is left as purely the REPL's own description. No behavioural evidence either
+# way was collected. Nor does any measurement in this repo bear on it: the `return`-framing result
+# in python_repl_description.jinja2 compares two WORDINGS at a fixed position, not two positions,
+# so do not cite it as a prompt-placement effect (an earlier draft of this comment did).
+#
+# `repl_output` is described as `str` rather than `REPLHistoryEntry`'s true `str | None`, matching
+# the wording that shipped: the None case is a terminal turn, which by definition is the last one
+# and is not in `__history__` while the agent is still reading it.
+_REPL_HISTORY_DESCRIPTION = """\
+`__history__` is a list with one entry per REPL iteration, in order (`__history__[0]` is your first
+iteration and `__history__[-1]` the most recent). Each entry has:
+- `.llm_response (str)`: Your full response for that iteration containing your code
+- `.repl_output (str)`: The printed output from that iteration, including any error traceback
+- `.repl_exception (BaseException | None)`: The exception object raised if that iteration hit
+  a recoverable error, else None
+"""
 
 
 def _is_valid_repl_source(source: str) -> bool:
@@ -219,8 +276,8 @@ def _is_valid_repl_source(source: str) -> bool:
 # — numerically more often than XML there (not significantly). Over-escaping is provoked by the
 # TASK (writing code that contains code), not only by the wire format; the protocol shifts which
 # shapes provoke it, not whether it can happen.
-@register_protocol("default")
-class DefaultProtocol(InteractionProtocol):
+@register_protocol("code_only")
+class CodeOnlyProtocol(BaseProtocol):
     """The protocol: the assistant message is the code (see the module docstring).
 
     Its rendering settings are constructor parameters — the constructor is the only declaration
@@ -228,7 +285,7 @@ class DefaultProtocol(InteractionProtocol):
 
     - ``*_template``: which Jinja template renders the system prompt, the user prompt, and the
       two truncation-advice messages (``None`` = append no advice).
-    - ``max_input_length`` / ``max_output_length``: truncation ceilings for rendered inputs and
+    - ``max_invoke_input_length`` / ``max_repl_output_length``: truncation ceilings for rendered inputs and
       for REPL output.
     - ``truncation_prefix_ratio``: how a truncated value is split between its retained head and
       tail. Must stay below 1.0 — see ``render_observation``.
@@ -251,10 +308,10 @@ class DefaultProtocol(InteractionProtocol):
     #
     # The one genuine behaviour change: a caller who passes a pre-built protocol *instance* as
     # `protocol.name` now gets the params that instance was built with, rather than having
-    # `config.protocol.*` silently override them. That matches how an `LLM` instance tag already
+    # `config.protocol.*` silently override them. That matches how a `BaseLLM` instance tag already
     # behaves ("you built it, you own it") and is the more predictable of the two.
     #
-    # `max_output_length` moved here from `REPLConfig` in the same pass: truncation is a
+    # `max_repl_output_length` moved here from `REPLConfig` in the same pass: truncation is a
     # *rendering* decision and rendering is what the codec owns. It was never read by the REPL —
     # only by this class and by `ReplayHook`, which reproduces this class's abbreviation.
     # These defaults are literals here, and `ProtocolConfig`'s leaves are unset. They used to be
@@ -262,7 +319,7 @@ class DefaultProtocol(InteractionProtocol):
     # runtime purely to learn what it itself defaults to — the dependency ran backwards. It also
     # made a *registered* protocol's own defaults unreachable: `Config.protocol_params` passed
     # every leaf explicitly, including ones nobody set, so `ProtocolConfig`'s value always won and
-    # only `DefaultProtocol` could express a default at all. That was documented as a known
+    # only `CodeOnlyProtocol` could express a default at all. That was documented as a known
     # limitation on `protocol_params`; owning the values here removes it.
     def __init__(
         self,
@@ -276,22 +333,37 @@ class DefaultProtocol(InteractionProtocol):
         # template.
         input_truncation_advice_template: str | None = None,
         repl_output_truncation_advice_template: str | None = None,
-        max_input_length: int = 10000,
-        max_output_length: int = 10000,
+        max_invoke_input_length: int = 50000,
+        max_repl_output_length: int = 50000,
         # 0.5 (an even head/tail split), not the 0.8 this defaulted to historically: 64 of the 65
         # eval configs that set it override to exactly 0.5 and the 65th to 0.0, so nothing in the
         # repo wanted 0.8. Weighting the head assumes the informative part of an over-long value
         # is at the front — true for prose and stack traces, false for REPL output, where the
         # result usually lands at the end.
         truncation_prefix_ratio: float = 0.5,
+        # Whether the system prompt describes `__history__` (the record this protocol writes).
+        # A prompt-only switch: it never affects `build_history_entry`, and the core loop records
+        # history regardless. It exists because *access* to `__history__` can be revoked at runtime
+        # by a hook that core cannot see when the prompt is built — the evals `DisableREPLHistory`
+        # ablation drops the binding each turn — and a prompt that documents a name the agent
+        # cannot reference is worse than one that stays quiet. A host that unbinds history that way
+        # sets this False; see evals/eval_harness.py, which does exactly that.
+        describe_repl_history: bool = True,
+        # An explicit agent-facing description of the recursive ``invoke`` tool, overriding the
+        # default (which introspects the bound closure's signature/docstring — see
+        # ``BaseProtocol.get_subinvoke_description``). Set it to advertise a NARROWER surface than
+        # the closure supports — e.g. an inputs-only signature under a ``restrict_invoke_args``
+        # guard that vetoes positional-hook ``invoke`` calls at runtime. ``None`` derives the
+        # description from the closure; an override is the author's to keep in step with that guard.
+        subinvoke_description: str | None = None,
     ) -> None:
         # Range checks live with the settings they constrain, for the same reason the values
         # do: `Config` used to make these on the protocol's behalf, so a protocol constructed
         # directly was unchecked and a *registered* protocol got the default's rules applied to
         # settings it may not even have.
         for name, value in (
-            ("max_input_length", max_input_length),
-            ("max_output_length", max_output_length),
+            ("max_invoke_input_length", max_invoke_input_length),
+            ("max_repl_output_length", max_repl_output_length),
         ):
             if value <= 0:
                 raise ValueError(f"protocol.{name} must be positive")
@@ -311,6 +383,7 @@ class DefaultProtocol(InteractionProtocol):
                 "repl_output_truncation_advice_template",
                 repl_output_truncation_advice_template,
             ),
+            ("subinvoke_description", subinvoke_description),
         ):
             if value is not None and (not isinstance(value, str) or not value):
                 raise ValueError(f"{name} must be a non-empty string or None")
@@ -320,11 +393,13 @@ class DefaultProtocol(InteractionProtocol):
         self.repl_output_truncation_advice_template = (
             repl_output_truncation_advice_template
         )
-        self.max_input_length = max_input_length
-        self.max_output_length = max_output_length
+        self.max_invoke_input_length = max_invoke_input_length
+        self.max_repl_output_length = max_repl_output_length
         self.truncation_prefix_ratio = truncation_prefix_ratio
+        self.describe_repl_history = describe_repl_history
+        self.subinvoke_description = subinvoke_description
 
-    def parse(self, response_content: str | None, repl_language: str) -> ParsedCode:
+    def parse(self, llm_response: LLMResponse, repl_language: str) -> ParsedCode:
         """Decode the response, preferring the reading that needs no delimiter at all.
 
         The layering matters more than any single rule: **the unambiguous reading is tried
@@ -339,60 +414,88 @@ class DefaultProtocol(InteractionProtocol):
            preamble, then a fence" shape).
         4. Otherwise → return the message verbatim anyway.
 
-        Step 4 is deliberate rather than a parse error. A truncated response, or one with a prose
-        preamble, then reaches the REPL and surfaces as a ``SyntaxError`` inside a recoverable
-        ``Continue`` — exactly where and how the XML protocol surfaces the same input. Raising
-        ``LLMResponseParseError`` here instead would move the failure from exec-time to parse-time
-        and change which history fields record it, for no gain to the agent.
+        Step 4 is deliberate: ``parse`` never fails. A truncated response, one with a prose
+        preamble, or one carrying no content at all reaches the REPL and surfaces there — a
+        ``SyntaxError`` inside a recoverable ``Continue`` for the first two, and a no-op turn for
+        an empty one. Failing here instead would move the failure from exec-time to parse-time and
+        change which history fields record it, for no gain to the agent.
+
+        An empty or whitespace-only message is therefore empty *code*, not an error. The agent is
+        not told its turn produced nothing; it sees a blank observation and continues, and the turn
+        still costs an iteration. That is the accepted trade for a protocol with no failure mode —
+        see ``Agent._record_llm_response`` for how rare a content-less completion is in practice.
 
         The parse-based steps apply only to Python. For any other REPL language there is no
         cheap validity oracle available here, so the message is used verbatim — which is the
         instructed format regardless, so only the fence-recovery affordance is lost.
         """
-        if response_content is None:
-            raise LLMResponseParseError("LLM returned empty response")
+        # CodeOnlyProtocol treats a content-less completion as empty code, so it flattens
+        # ``content is None`` to ``""`` here — the coercion the loop used to do before parse
+        # (#1141). Now that parse sees the whole response (#1146), a protocol that wants to tell a
+        # refusal from empty code reads ``llm_response.content`` / ``.raw_response`` instead.
+        content = llm_response.content or ""
 
         # No language-specific oracle: trust the instructed format, and let the REPL judge.
         if repl_language != "python":
-            return ParsedCode(response_content.strip("\n\r"), None)
+            return ParsedCode(content.strip("\n\r"), None)
 
-        if _is_valid_repl_source(response_content):
-            return ParsedCode(response_content.strip("\n\r"), None)
+        if _is_valid_repl_source(content):
+            return ParsedCode(content.strip("\n\r"), None)
 
         for regex in (WHOLE_MESSAGE_FENCE_REGEX, EMBEDDED_FENCE_REGEX):
-            match = regex.search(response_content)
+            match = regex.search(content)
             if match is not None and _is_valid_repl_source(match.group(1)):
                 return ParsedCode(match.group(1).strip("\n\r"), None)
 
-        return ParsedCode(response_content.strip("\n\r"), None)
+        return ParsedCode(content.strip("\n\r"), None)
+
+    def format_instructions(self) -> str:
+        """Return the wire-format instruction block (see :meth:`BaseProtocol.format_instructions`).
+
+        A constant: this protocol's request format does not vary with its rendering settings. It
+        is the request half of the codec whose accept half is :meth:`~CodeOnlyProtocol.parse` — the two are edited
+        together here so an instruction to "respond with ONLY code" can never drift from what
+        ``parse`` actually accepts.
+        """
+        return _FORMAT_INSTRUCTIONS
+
+    def describe_history_entry(self) -> str:
+        """Return the ``__history__`` description (see :meth:`BaseProtocol.describe_history_entry`).
+
+        Describes the :class:`REPLHistoryEntry` records this protocol writes. Returns ``""`` when
+        constructed with ``describe_repl_history=False``.
+        """
+        # The describe half of the seam whose write half is `build_history_entry`: the field list
+        # below is exactly `REPLHistoryEntry`'s, and the two are edited together here so the prompt
+        # cannot name a field the record does not carry.
+        return _REPL_HISTORY_DESCRIPTION if self.describe_repl_history else ""
 
     def render_observation(
         self,
         exec_result: Continue,
         iteration: int,
-        repl: REPL,
     ) -> list[MessageDict]:
         """Render a continuing REPL result into the next turn's user message(s).
 
         Returns the observation as a user message whose content is the (abbreviated) ``output`` and
-        **nothing else** (#928): no ``<repl_output>`` wrapper, no separate ``<error>`` block, no
+        **nothing else**: no ``<repl_output>`` wrapper, no separate ``<error>`` block, no
         ``**REPL output (iteration #N):**`` header, and no error-flag line — plus, *only when the
         output was truncated*, a **second** user message with the truncation advice.
 
         The framing is gone entirely rather than merely simplified because ``output`` already holds
-        the whole agent-facing text (#875-A: stdout on success; stdout + traceback, or the rendered
+        the whole agent-facing text (stdout on success; stdout + traceback, or the rendered
         parse error, on a recoverable error). Every wrapper around it was restating in markup what
         the text says on its own — including the success/error split, which the traceback in
         ``output`` already announces, so ``exception`` stays pure metadata with no rendered surface
         at all. The iteration number went with the header: the turn's position is implicit in the
-        conversation, and ``__repl_history__`` is the addressable form for an agent that needs it.
+        conversation, and ``__history__`` is the addressable form for an agent that needs it.
         """
         output = exec_result.output
         if not isinstance(output, str):
             raise _JazInternalError("REPL output should be a string")
         abbreviated_output, output_truncated = abbreviate_string(
             output,
-            max_length=self.max_output_length,
+            max_length=self.max_repl_output_length,
             prefix_ratio=self.truncation_prefix_ratio,
         )
 
@@ -421,8 +524,16 @@ class DefaultProtocol(InteractionProtocol):
         # Truncation advice is a **separate user message** (#928) so the observation above stays the
         # raw output. It is a display concern the protocol owns (the LLM<->REPL codec), not the REPL:
         # core passes no generic vars dict and no history toggle — the core default template mentions
-        # ``__repl_history__`` unconditionally, and an eval that hides history bakes the history-off
+        # ``__history__`` unconditionally, and an eval that hides history bakes the history-off
         # variant into its own truncation meta-template at config time (#898).
+        #
+        # ``iteration`` is still passed but no shipped template uses it any more: the advice points
+        # at ``__history__[-1]``, which names the current turn directly rather than deriving an
+        # index from the turn number, so it holds without the reader knowing the base or trusting
+        # one-entry-per-iteration (#719 — see the iteration-numbering note in ``agent.invoke``).
+        # Kept in the render context for out-of-tree templates, which are authorable: the template
+        # is selected by the public ``repl_output_truncation_advice_template`` setting, and the
+        # evals bake their own variants.
         #
         # ``error_truncated`` is deliberately no longer passed: with no separate error summary there
         # is nothing it could describe, so the corresponding branch was deleted from the shipped
@@ -443,7 +554,7 @@ class DefaultProtocol(InteractionProtocol):
     def build_history_entry(
         self, llm_response: LLMResponse | None, exec_result: ExecResult
     ) -> REPLHistoryEntry:
-        """Project one turn into its ``__repl_history__`` entry (the **record** seam).
+        """Project one turn into its ``__history__`` entry (the **record** seam).
 
         The default entry records the response *text* (``llm_response.content`` — a missing
         response object, or an empty completion, projects to ``""``), the REPL ``output``, and
@@ -459,12 +570,12 @@ class DefaultProtocol(InteractionProtocol):
 
         ``repl_exception`` is populated only for a recoverable ``Continue`` — the raw exception
         object passed straight through (``Continue`` carries the exception, not a pre-baked
-        summary, #590 follow-up); a plain success, a terminal ``Return``, and a terminal ``Raise``
+        summary); a plain success, a terminal ``Return``, and a terminal ``Raise``
         all record ``repl_exception=None`` (the raise's exception travels out of the loop, not
         into history). The object is kept rather than a summarized string because that text is
         already fully contained in ``repl_output`` (an error ``Continue``'s ``output`` is
         ``stdout + traceback``, whose final line is exactly what ``summarize_exception`` would
-        emit) — mirroring :meth:`render_observation`, which is the sibling seam that *does* render
+        emit) — mirroring :meth:`~CodeOnlyProtocol.render_observation`, which is the sibling seam that *does* render
         the exception to text (via ``summarize_exception``) for the in-band observation. Keeping
         both on this protocol is why a custom protocol can't desync its two representations.
         """
@@ -487,13 +598,21 @@ class DefaultProtocol(InteractionProtocol):
             repl_exception=repl_exception,
         )
 
+    def get_subinvoke_description(self, invoke_tool: InvokeTool) -> str:
+        # Author-supplied override wins; otherwise fall back to the base's closure introspection.
+        # An override advertises a narrower surface than the closure supports (see the
+        # `subinvoke_description` constructor param) without swapping the executable tool.
+        if self.subinvoke_description is not None:
+            return self.subinvoke_description
+        return super().get_subinvoke_description(invoke_tool)
+
     def render_initial_message_list(
         self,
         inputs: Mapping[str, object],
         scope: Mapping[str, object],
-        repl: REPL,
+        repl: BaseREPL,
         *,
-        jaz_library: Library | None,
+        invoke_tool: InvokeTool | None,
         depth: int,
         recursion_available: bool,
         repl_language: str,
@@ -501,10 +620,12 @@ class DefaultProtocol(InteractionProtocol):
     ) -> list[MessageDict]:
         """Build the [system, user] opener.
 
-        ``inputs`` (explicit `**inputs` kwargs) and ``scope`` (resolved ``jaz.scope``)
-        arrive as SEPARATE mappings (#727), so the two sections render directly from
-        their own dict — no merged namespace, no ``scoped_keys`` re-split. There is no
-        separate ``task`` argument anymore: the prompt is an ordinary input (#538)."""
+        ``inputs`` (explicit ``**inputs`` kwargs) and ``scope`` (resolved ``jaz.scope``)
+        arrive as SEPARATE mappings, so the two sections render directly from their own
+        dict — no merged namespace, no ``scoped_keys`` re-split. There is no separate
+        ``task`` argument anymore: the prompt is an ordinary input."""
+
+        # Separate inputs/scope mappings is #727; ``task`` as an ordinary input is #538.
         # Scoped inputs render in the SYSTEM prompt (ambient/global, like tool
         # libraries); render the whole `scope` mapping here and hand it to
         # get_system_prompt. Their truncated-name list flows into get_user_prompt so the
@@ -513,13 +634,13 @@ class DefaultProtocol(InteractionProtocol):
         # the same blocks-then-sentence shape the user prompt uses for explicit inputs.
         scoped_inputs_str, scoped_shown, scoped_truncated = render_input_section(
             scope,
-            max_input_length=self.max_input_length,
+            max_invoke_input_length=self.max_invoke_input_length,
             prefix_ratio=self.truncation_prefix_ratio,
         )
         user_prompt = get_user_prompt(
             user_prompt_template=self.user_prompt_template,
             inputs=inputs,
-            max_input_length=self.max_input_length,
+            max_invoke_input_length=self.max_invoke_input_length,
             input_truncation_advice_template=self.input_truncation_advice_template,
             # #568: the closing inputs sentence's wording is owned by the (config-selectable)
             # user_prompt_template, not by a REPL capability — a withheld-inputs variant flips it.
@@ -529,15 +650,39 @@ class DefaultProtocol(InteractionProtocol):
             # propagation rule, so they have to appear or vanish together.
             recursion_available=recursion_available,
         )
+        # The protocol owns how the recursive `invoke` tool is described to the agent (default:
+        # introspect the closure; override via `subinvoke_description`). Render it here and hand
+        # the STRING to get_system_prompt, which stays codec-agnostic. `None` when recursion is off.
+        subinvoke_description = (
+            self.get_subinvoke_description(invoke_tool)
+            if invoke_tool is not None
+            else None
+        )
         system_prompt = get_system_prompt(
             system_prompt_template=self.system_prompt_template,
-            jaz_library=jaz_library,
+            subinvoke_description=subinvoke_description,
             depth=depth,
             recursion_available=recursion_available,
             repl_language=repl_language,
             repl=repl,
             scoped_inputs_str=scoped_inputs_str,
             scoped_names=scoped_shown,
+            # The protocol owns the wire-format block and hands it to the template (#639);
+            # the template only decides where it lands.
+            format_instructions=self.format_instructions(),
+            # Same arrangement for the `__history__` block, with one extra gate: the *record* is
+            # this protocol's, but the *name* exists only if the REPL surfaces the driver's list,
+            # which is a REPL capability — so a history-less REPL never advertises a name it does
+            # not bind. Read off the CLASS, not the instance, because that is what the code doing
+            # the binding reads (`_agent.py`: `type(self.repl_template).maintains_repl_history`)
+            # and what `BaseREPL` documents it as ("a static *capability*, not session state").
+            # An instance attribute would let the prompt and the binder disagree silently — the
+            # loop building history while the prompt says there is none.
+            history_description=(
+                self.describe_history_entry()
+                if type(repl).maintains_repl_history
+                else ""
+            ),
         )
         return [
             {"role": "system", "content": system_prompt},

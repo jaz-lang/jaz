@@ -3,25 +3,27 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from typing import Any, Self
 
-from jaz.library.core import Library
+from jaz._invoke_tool import InvokeTool
 
 from .types import ExecResult
 
 
-class REPL(ABC):
+class BaseREPL(ABC):
     """Base contract for REPL implementations used by LM agents.
 
     The REPL knows nothing about the return type or its validation. Return-*type* checking,
     return-*value* validation, and REPL-*input* validation all live in hooks (``ReturnType`` /
-    ``ValidateReturn`` / ``ValidateREPLInput``) that act on the effect path (#528/#568); the REPL
-    only produces a ``Return`` carrying the value and the hooks decide whether it's acceptable.
+    ``ValidateReturn`` / ``ValidateREPLInput``) that act on the effect path; the REPL only
+    produces a ``Return`` carrying the value and the hooks decide whether it's acceptable.
     """
+
+    # The hooks-on-the-effect-path split is #528/#568.
 
     # REPL-specific description shown in the system prompt
     # Subclasses should override this with their specific instructions
     description: str
 
-    # Whether this REPL type surfaces ``__repl_history__`` in its namespace. A static
+    # Whether this REPL type surfaces ``__history__`` in its namespace. A static
     # *capability* (not session state): the core agent loop only builds and tracks a
     # history list for REPLs that advertise support, so a REPL that keeps no history
     # (e.g. a non-Python REPL) is skipped cleanly rather than
@@ -66,7 +68,7 @@ class REPL(ABC):
         Derived from ``__init__``'s declared parameters, exactly as for an LLM backend or a
         protocol — so a REPL declares its config simply by declaring its constructor.
         """
-        from ..providers.base import declared_init_keys
+        from ..llm.base import declared_init_keys
 
         return declared_init_keys(cls)
 
@@ -74,7 +76,7 @@ class REPL(ABC):
     def initialize(
         self,
         inputs: dict[str, object],
-        jaz_library: Library | None,
+        invoke_tool: InvokeTool | None,
         allowed_builtins: dict[str, object] | None = None,
         session_id: str = "",
         initial_repl_history: list[object] | None = None,
@@ -94,18 +96,19 @@ class REPL(ABC):
 
         Implementations must not bind per-invoke state onto ``self``. Returning ``self`` would
         make the object single-use — a second call would silently replace the first run's
-        namespace, library binding and session id — which rules out holding one configured REPL
+        namespace, invoke-tool binding and session id — which rules out holding one configured REPL
         and running many invokes from it.
 
         Arguments:
             inputs: A dictionary of initial inputs to the REPL.
-            jaz_library: The JAZ Library bound in the REPL, or None.
+            invoke_tool: The recursive sub-invoke primitive to bind in the REPL under the
+                bare name ``invoke``, or None to withhold it (recursion disabled).
             allowed_builtins: A dictionary of allowed built-in functions and variables.
             session_id: Unique session identifier for this REPL instance.
             initial_repl_history: An empty list container the driver passes in to own
-                ``__repl_history__``, or ``None`` when history is disabled. A REPL that
+                ``__history__``, or ``None`` when history is disabled. A REPL that
                 supports history surfaces this exact list object in its namespace as
-                ``__repl_history__`` (by reference); the core agent loop then retains the
+                ``__history__`` (by reference); the core agent loop then retains the
                 reference and is the single writer of subsequent (iteration) entries. REPLs
                 without a Python namespace (a non-Python REPL) ignore it (leaving it empty),
                 which signals to the driver that the REPL keeps no history.
@@ -123,16 +126,22 @@ class REPL(ABC):
         # TODO: Fix static types
         """Execute REPL input and mutate state in place.
 
-        This function should *never* raise an error. Instead, all errors should
-        be captured and returned, displayed to the user of the REPL. The result
-        category in the case of an error is EXECUTE.
+        Errors in the executed code should be captured and returned as a recoverable
+        :class:`~jaz.repl.Continue` (its ``exception`` set, its ``output`` shown to the
+        agent) — with one carve-out: an exception that must escape the invoke (a
+        :class:`~jaz.exceptions.FatalError`-category error, a non-``Exception``
+        signal, or an enclosing exec's timeout/memory breach) **re-raises** out of
+        this call instead of becoming feedback, so it propagates past the agent.
 
         Arguments:
             src: The REPL input to execute.
             input_id: The unique identifier for the REPL input.
         Returns:
-            exec_result: A tuple with result_category, output, and optional
-            return value or error. The REPL state is mutated in place.
+            An :class:`~jaz.repl.ExecResult` — exactly one of :class:`~jaz.repl.Continue`
+            (ran, session continues; carries ``output`` and an optional recoverable
+            ``exception``), :class:`~jaz.repl.Return` (finished by returning
+            ``return_value``), or :class:`~jaz.repl.Raise` (finished by raising
+            ``exception``). The REPL state is mutated in place.
         """
 
     async def aexec(

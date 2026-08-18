@@ -5,14 +5,16 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jaz"
-version = "0.2.0a1"
+name = "jaz-lang"
+version = "0.2.0a2"
 description = "JAZ: The language of building and optimizing LLM-agents"
 authors = [
     { name = "Zhening Li", email = "zli11010@mit.edu" },
+    { name = "Jonathan Li", email = "jonathan.li.connect@gmail.com" },
+    { name = "Amitayush Thakur", email = "amitayusht@gmail.com" },
 ]
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "jinja2>=3.1",
@@ -21,6 +23,7 @@ dependencies = [
     "beartype>=0.18.0",
     "typing-extensions>=4.13.0",
     "pathspec>=0.12",
+    "litellm>=1.87.0",
 ]
 
 [project.scripts]
@@ -32,6 +35,9 @@ tracing = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp-proto-http>=1.20.0",
 ]
+tokens = [
+    "transformers>=4.44",
+]
 
 [project.urls]
 Homepage = "https://github.com/jaz-lang/jaz"
@@ -39,7 +45,7 @@ Homepage = "https://github.com/jaz-lang/jaz"
 [tool.setuptools.package-data]
 jaz = [
     "templates/*.jinja2",
-    "providers/*.json",
+    "llm/*.json",
 ]
 
 [tool.pytest.ini_options]

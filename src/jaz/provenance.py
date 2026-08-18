@@ -2,7 +2,7 @@
 
 Provenance answers a question the raw message can't: is this the original system prompt,
 the task, an assistant turn, a REPL observation, or a hook-inserted summary? Consumers read
-it instead of guessing from role/position — ``ConversationHistory`` to log a message's
+it instead of guessing from role/position — ``ATIFTrace`` to log a message's
 true origin, ``SlidingWindow`` to pin the load-bearing prefix (system + task). The guess
 breaks the moment a persistent edit (compaction) reorders or inserts messages; explicit
 provenance does not.
@@ -12,7 +12,10 @@ provenance does not.
 :func:`jaz.hooks.effects.apply_message_edits` and every ``messages.append(...)`` for free
 (the dict moves by reference) — there is no parallel list to keep aligned. It must never
 reach a provider: the model-facing message list is projected to wire form via
-:func:`to_wire_messages` at the single egress point (``Agent._compose_shown_messages``).
+:func:`to_wire_messages` at the single egress point (``Agent._compose_shown_messages``),
+which strips every key in :data:`RESERVED_KEYS` the configured backend has not declared it
+consumes (``BaseLLM.consumes_internal_keys`` — provenance is declared by none, so it is always
+stripped; the token sidecar of ``jaz.tokens`` survives only for token-native backends).
 :class:`MessageProvenance` is deliberately a plain dataclass (**not** JSON-serializable by
 default) — a *missed* strip **may** then raise at ``json.dumps`` rather than silently leaking
 an internal key to the model. This is a best-effort backstop, not a guarantee: a serializer
@@ -32,11 +35,13 @@ provider signature forbids sending an un-unwrapped message) but retypes the buff
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from jaz.providers import MessageDict
+from jaz.llm import MessageDict
+from jaz.tokens import TOKENS_KEY
 
 
 class MessageKind(StrEnum):
@@ -44,7 +49,7 @@ class MessageKind(StrEnum):
 
     ``SEED`` is *every* message in the initial rendered message list — the whole thing
     the protocol produces before any turn runs, not just the system + user prompt. For
-    ``DefaultProtocol`` that is ``[system, user]`` (the user message being today's
+    ``CodeOnlyProtocol`` that is ``[system, user]`` (the user message being today's
     ``<task>`` + ``<inputs>`` + ``<return_type>``, still true once a pending refactor
     collapses that to just ``<inputs>``); a custom protocol may also seed extra context
     such as few-shot ``assistant`` examples, and those are seed too. This is the
@@ -71,13 +76,30 @@ class MessageProvenance:
 
     Frozen so a surviving message can share one instance across turns/edits by reference.
     Intentionally not JSON-serializable (see the module docstring): serialize it explicitly
-    where a human-facing record is wanted (e.g. ``ConversationHistory``), and strip it
+    where a human-facing record is wanted (e.g. ``ATIFTrace``), and strip it
     via :func:`to_wire_messages` everywhere else.
     """
 
     kind: MessageKind
     iteration: int | None = None  # iteration when created; None for the seed
     persistent: bool | None = None  # for ADDED: persistent vs transient
+    # A unique, stable per-message id -- the identity primitive #599 left open. Provenance's
+    # (kind, iteration) narrows identity but can't tell two same-content messages stamped in one
+    # iteration apart; the id can. Read it explicitly (``provenance_of(m).id``) where message
+    # identity is needed -- ATIF's ``extra.edits`` names a dropped message by its id (#1089). It is
+    # deliberately NOT folded into value-equality (``compare=False``): equality/hashing stay on
+    # (kind, iteration, persistent) so a surviving message can share one frozen instance across
+    # edits by reference. A consumer that instead diffs messages by dict equality therefore does
+    # not see the id -- intentional; message-identity consumers read .id directly.
+    #
+    # Unique per *message*, not per instance: an instance is meant to be shared across TIME (one
+    # message through edits), never across two messages. All stamp sites build a fresh instance per
+    # message, so the invariant holds; stamping one instance onto two messages would give them the
+    # same id.
+    #
+    # A fresh uuid per message per run (uuid4 hex, like session_id's), so it is an identity handle,
+    # not a stable key for diffing trace JSON across runs -- two identical runs get different ids.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Project to a JSON-compatible dict for a human-facing record.
@@ -85,9 +107,10 @@ class MessageProvenance:
         Explicit opt-in, not automatic ``json.dumps`` support: this dataclass stays
         deliberately non-serializable by default (see the module docstring) so a missed
         strip stays visible; call this only where a serialized record is actually wanted
-        (e.g. :class:`~jaz.hooks.builtin.conversation_history.ConversationHistory`).
+        (e.g. :class:`~jaz.hooks.builtin.atif_trace.ATIFTrace`).
         """
         return {
+            "id": self.id,
             "kind": self.kind.value,
             "iteration": self.iteration,
             "persistent": self.persistent,
@@ -111,16 +134,33 @@ def set_provenance(message: MessageDict, provenance: MessageProvenance) -> None:
     message[PROVENANCE_KEY] = provenance
 
 
-def to_wire_messages(messages: list[MessageDict]) -> list[MessageDict]:
-    """Provider-ready copies with :data:`PROVENANCE_KEY` removed.
+# Every reserved sidecar key that may ride inside a MessageDict. provenance.py owns this
+# set because it already owns the sidecar channel and the egress choke point below; a new
+# sidecar key added elsewhere MUST be registered here or it will leak to providers. The
+# import direction is acyclic: jaz.tokens keeps zero runtime jaz imports (see its module
+# comment), so provenance can import its key while jaz.llm imports jaz.tokens.
+RESERVED_KEYS: frozenset[str] = frozenset({PROVENANCE_KEY, TOKENS_KEY})
 
-    Only messages that actually carry provenance are copied; the rest pass through by
-    reference, so an un-stamped buffer is returned untouched. This is the single choke point
-    that keeps the internal provenance key out of every provider payload.
+
+def to_wire_messages(
+    messages: list[MessageDict], keep: frozenset[str] = frozenset()
+) -> list[MessageDict]:
+    """Provider-ready copies with reserved sidecar keys removed, except those in ``keep``.
+
+    ``keep`` is the consuming backend's :attr:`jaz.llm.llm.BaseLLM.consumes_internal_keys` —
+    a token-native backend declares the token sidecar so its stamps survive to
+    ``complete()``; for every other backend the default empty set strips all of
+    :data:`RESERVED_KEYS`. Only messages that carry a key to strip are copied; the rest
+    pass through by reference, so an un-stamped buffer is returned untouched. This is the
+    single choke point that keeps internal keys out of every provider payload.
     """
+    # Keying the strip by backend declaration (rather than a boolean or a second egress
+    # function) preserves both properties that matter: text backends still get a provably
+    # clean list — their wire form is byte-identical to the pre-allowlist behavior — and
+    # there is still exactly one egress path to audit. `keep` of an unreserved key is inert:
+    # only reserved keys are ever stripped in the first place.
+    strip = RESERVED_KEYS - keep
     return [
-        {k: v for k, v in m.items() if k != PROVENANCE_KEY}
-        if PROVENANCE_KEY in m
-        else m
+        {k: v for k, v in m.items() if k not in strip} if strip & m.keys() else m
         for m in messages
     ]

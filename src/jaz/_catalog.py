@@ -189,7 +189,7 @@ def render_catalog(
 def as_catalog(value: object) -> object:
     """Attach the ``Catalog`` render mode permanently to ``value``; returns ``value``.
 
-    Sugar for ``jaz.describe(value, jaz.Catalog)``: from now on this value renders as
+    Sugar for ``describe(value, jaz.Catalog)``: from now on this value renders as
     its tool catalog in any ``jaz.invoke`` prompt header, rooted at whatever kwarg
     name it is passed under. ``jaz.Display(value, jaz.Catalog)`` does the same for a
     single call without attaching anything, but it is experimental and warns on use.

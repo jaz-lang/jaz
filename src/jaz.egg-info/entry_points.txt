@@ -1,2 +1,0 @@
-[console_scripts]
-jaz = jaz.console:main

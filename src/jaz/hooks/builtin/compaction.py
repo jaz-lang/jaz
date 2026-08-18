@@ -8,7 +8,7 @@ one, then emits a persistent ``DropMessages`` + ``AddMessages``.
 
 Contrast with the other context hooks:
 - ``SlidingWindow`` *drops* old turns (transient; the information is simply lost).
-- ``ContextWindow`` only *warns* the agent.
+- ``ContextWindowWarning`` only *warns* the agent.
 - ``Compaction`` *replaces* a span with a summary — lossy but information-preserving,
   and it persists into the carried buffer.
 
@@ -40,19 +40,20 @@ budgeting/tracking of its calls is the caller's responsibility.
   ``RecursionLimit`` is installed, an agent compacting at its recursion cap has no spare level
   for the summary, so the summary invoke fails (caught → compaction skipped that turn, never
   fatal). With no ``RecursionLimit`` (the default) recursion is unbounded and this never bites.
-- ``summarizer`` / ``summary_prompt`` don't round-trip through config serialization; use
-  this as a scoped/``local_hooks`` hook, not a serialized baseline.
+- ``summary_prompt`` appears in ``repr()`` — what observability consumers render — only when the
+  caller overrode it. The 440-character default would otherwise be repeated in every trace
+  record, and ATIF and OTel do not truncate.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
+from jaz.llm import MessageDict
 from jaz.provenance import MessageKind, provenance_of
-from jaz.providers import MessageDict
 
 from ...repl.python_repl import PythonREPL
 from ..dispatcher import Effect, Hook
@@ -121,7 +122,7 @@ class Compaction(Hook):
     Example::
 
         with Compaction(fraction=0.7):
-            jaz.invoke(...)
+            invoke(...)
     """
 
     # Mechanics kept out of the docstring: handles `LLMQueryEnter`, and emits a **persistent**
@@ -162,6 +163,33 @@ class Compaction(Hook):
         self.summarizer = summarizer
         self.summary_prompt = summary_prompt or _DEFAULT_SUMMARY_PROMPT
         self.min_compact = min_compact
+
+    def __repr__(self) -> str:
+        # `summarizer` is rendered as-is, like every other param: the default `None` reads
+        # perfectly, and a caller who passes a named function is better served seeing its name
+        # than a boolean. A bare lambda contributes a memory address; accepted, since None and a
+        # named function are the common, informative cases. (This is the last hook field in-tree
+        # with a callable type — the governance hooks' `warning_text` is a plain `str | None`.)
+        #
+        # `summary_prompt` is the one field that earns special treatment, and not because it is
+        # long — the rule elsewhere is that length is the consumer's problem. It is because the
+        # value is a 440-character *constant* on all but a handful of instances: rendering it
+        # unconditionally would stamp the same boilerplate into every InvokeEnter record, and
+        # only the loggers truncate (ATIF and OTel write the string whole). So it appears only
+        # when the caller overrode it, where the text is genuinely worth reading. A varying field
+        # list is normal for a repr; a flag was tried and rejected for hiding the custom text.
+        #
+        # The identity check is reliable: `__init__` normalizes a `None` prompt to this exact
+        # module-level default object, so `is not` is true only when the caller passed one.
+        parts = [
+            f"fraction={self.fraction!r}",
+            f"keep_recent={self.keep_recent!r}",
+            f"summarizer={self.summarizer!r}",
+        ]
+        if self.summary_prompt is not _DEFAULT_SUMMARY_PROMPT:
+            parts.append(f"summary_prompt={self.summary_prompt!r}")
+        parts.append(f"min_compact={self.min_compact!r}")
+        return f"Compaction({', '.join(parts)})"
 
     def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
         # Re-entrancy guard: don't compact the built-in summarizer's own nested invoke
@@ -209,7 +237,7 @@ class Compaction(Hook):
 
     # --- span selection -------------------------------------------------------
 
-    def _compaction_span(self, messages: list[MessageDict]) -> list[int]:
+    def _compaction_span(self, messages: Sequence[MessageDict]) -> list[int]:
         """Indices to compact: everything between the pinned seed and the recent tail.
 
         Pins the seed (system prompt + task, plus any protocol-seeded prefix) by
@@ -262,17 +290,20 @@ class Compaction(Hook):
             # reconstruct it from, and reusing the object means the summary provably runs on
             # the same model rather than on a rebuild that might differ.
             with jaz.ConfigOverride(llm=config.llm, repl=repl):
-                summary = jaz.invoke(jaz.ReturnType(str), task=prompt)
+                # jaz.hooks.ReturnType, the blessed path — the flat jaz.ReturnType
+                # alias is demoted and warns (NonPublicAPIWarning) on every access,
+                # which this line used to emit once per compaction.
+                summary = jaz.invoke(jaz.hooks.ReturnType(str), task=prompt)
         finally:
             _in_summarization.reset(token)
         return summary or ""
 
     @staticmethod
     def _max_input_tokens(config: Config) -> int | None:
-        # Mirrors ContextWindow._compute_max_input_tokens: size the window from the
+        # Mirrors ContextWindowWarning._compute_max_input_tokens: size the window from the
         # invoke's EFFECTIVE config (carried on the event), not ambient get_config().
         # TODO(#718): reaching max_input_tokens via get_model_info is still duplicated with
-        # ContextWindow; expose it directly on LLM.
+        # ContextWindowWarning; expose it directly on LLM.
         info = config.llm.get_model_info()
         if not info:
             return None
@@ -349,5 +380,5 @@ def _abbrev_ref(ref: str) -> str:
 #: Deprecated alias for the pre-rename spelling — see the rationale block in
 #: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
 #: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_every_renamed_hook_has_an_alias``).
+#: (``test_legacy_hook_names_still_importable``).
 CompactionHook = Compaction

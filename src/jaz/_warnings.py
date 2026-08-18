@@ -2,7 +2,7 @@
 
 A package advertises its supported surface via ``__all__``. Several names outside
 ``__all__`` remain *reachable* (``jaz.Agent``, ``jaz.hooks.HookDispatcher``, the flat hook
-vocabulary, the REPL extension API, ...) for back-compat, but they are unsupported and may
+vocabulary, ...) for back-compat, but they are unsupported and may
 change or be removed. Accessing one of those emits
 :class:`jaz.exceptions.NonPublicAPIWarning` so callers learn they're off the supported
 path — while the name still resolves.

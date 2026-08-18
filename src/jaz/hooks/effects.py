@@ -2,8 +2,26 @@
 
 An effect is what a hook handler returns to influence the run — see :class:`jaz.hooks.Hook`.
 Each class below documents the events it is valid at and how multiple instances of it compose;
-an effect returned at an event that does not accept it is ignored. The effects every hook
+an effect returned at an event that does not accept it raises
+:class:`~jaz.exceptions.InvalidEffectError` (out-of-stage effects are hook bugs and fail
+loudly, never silently no-op). The effects every hook
 returns at an event are composed together before they are applied.
+
+Where each effect composes, per pipeline stage (see :mod:`jaz.hooks.events` for the
+``Enter → Send → Complete → Exit`` pipeline itself)::
+
+    Enter    (edit the proposal)     InvokeEnter:   AddInputs, DropInputs, DisableRecursion
+                                     LLMQueryEnter: AddMessages, DropMessages
+                                     REPLExecEnter: AddVariables, DropVariables
+    Send     (supply the result,     LLMQuerySend:  SupplyLLMResponse
+              skipping the work)     REPLExecSend:  SupplyExecResult
+                                     InvokeSend:    (no supplier exists)
+    Complete (transform the raw      InvokeComplete / REPLExecComplete: ModifyExecResult
+              result)                LLMQueryComplete: (no modifier exists)
+    Exit     (observation-only)      no effects, at any span
+
+:class:`Abort` is additionally valid at every ``Enter``/``Send``/``Complete`` above, and
+:class:`BlackboardWrite` at every event including ``Exit``.
 
 **Experimental.** The hook system is an experimental feature; its interfaces may change
 in a future release.
@@ -18,16 +36,17 @@ from jaz.exceptions import (
     MessageEditIndexError,
     ReturnValueConflictError,
 )
-from jaz.providers import MessageDict
+from jaz.llm import MessageDict
 from jaz.repl.types import Continue, ExecResult, Raise, Return
 
 # The public effect surface (`jaz.hooks.effects`) — the typed values a hook handler
 # returns to influence execution. `Effect` is the base for annotating handler returns.
 __all__ = [
     "Effect",
-    "OverrideResult",
-    "ModifyResult",
+    "SupplyExecResult",
+    "ModifyExecResult",
     "Abort",
+    "BlackboardWrite",
     "DisableRecursion",
     "AddInputs",
     "DropInputs",
@@ -35,7 +54,7 @@ __all__ = [
     "DropVariables",
     "DropMessages",
     "AddMessages",
-    "OverrideResponse",
+    "SupplyLLMResponse",
 ]
 
 
@@ -44,7 +63,9 @@ class Effect:
     """Base class for all effects — the values a hook handler returns to influence the run.
 
     Each subclass documents the events it is valid at and how multiple instances of it
-    compose. An effect returned at an event that does not accept it is ignored.
+    compose. An effect returned at an event that does not accept it raises
+    :class:`~jaz.exceptions.InvalidEffectError` — out-of-stage effects fail loudly rather
+    than silently no-op.
 
     Effects are frozen: a hook constructs one to *declare* an intent, and it is only ever read
     from there on.
@@ -61,21 +82,22 @@ class Effect:
 # Each carries a *complete* ``ExecResult`` (``Continue`` | ``Return`` | ``Raise``), replacing
 # the former field-carrying ``ContinueEffect`` / ``ReturnEffect`` pair:
 #
-#   ``OverrideResult(result)``  supplies a result in place of running the code — valid at
-#     ``REPLExecEnter`` (where work is *pending*). It is the enter-point "supply instead"
-#     effect.
-#   ``ModifyResult(result)``    transforms the result that ran — valid at ``REPLExecExit``
-#     (where a result *exists*). It is the exit-point "transform" effect.
+#   ``SupplyExecResult(result)``  supplies a result in place of running the code — valid at
+#     ``REPLExecSend`` (the committed input is in view; work is *pending*). It is the
+#     supply-stage "supply instead" effect.
+#   ``ModifyExecResult(result)``    transforms the result that ran — valid at
+#     ``REPLExecComplete`` (where a raw result *exists*). It is the transform-stage effect.
 #
 # Both **fold** by the same precedence (``_fold_carried_results``): carried ``Continue``s
 # concatenate their outputs and group their exceptions; carried ``Return``s cannot merge (two
 # distinct values conflict, identical ones coalesce); carried ``Raise``s group their
-# exceptions. At the exit
-# boundary the carried results fold onto the executed ``original``; at the enter boundary there
+# exceptions. At the transform
+# boundary the carried results fold onto the executed ``original``; at the supply boundary there
 # is no original, so the suppliers fold among themselves. This preserves the merge semantics the
-# former ``ContinueEffect`` had. ``Override<X>`` supplies and skips the work that would produce
-# ``X`` (an *enter* effect); ``Modify<X>`` transforms the ``X`` that already exists (an *exit*
-# effect) — the same naming convention as ``OverrideResponse``.
+# former ``ContinueEffect`` had. The naming convention is uniform across the effect surface:
+# ``Supply<X>`` supplies ``X`` and skips the work that would produce it (a *Send*-stage effect),
+# while ``Modify<X>`` transforms the ``X`` that already exists (a *Complete*-stage effect) — the
+# same supply-vs-modify split as ``SupplyLLMResponse`` at the LLM-query boundary.
 #
 # The two boundaries once diverged — supply required its results to be *equal* (a supply "names
 # THE result", so two distinct supplies raised ``ResultConflictError``) while transform
@@ -84,27 +106,30 @@ class Effect:
 # transforms do, not crash on a hard internal error; distinct ``Return`` *values* still conflict
 # at both boundaries (they genuinely can't merge).
 #
-# Termination is a *separate* effect, ``Abort`` (below), NOT one of these: it un-bundles
-# "stop the loop" from "supply/transform a result" (#481). ``Abort`` resolves to a terminal
-# ``Raise`` and is valid at **every live event** (not just the result boundaries), so
-# loop/budget control has an always-present home and never rides a conditional exit. Where it
-# co-occurs at a result boundary, ``Abort`` has the highest precedence (termination trumps
-# supply/transform). See ``resolve_override_results`` / ``resolve_modify_results``.
+# Termination is a *separate* effect, ``Abort`` (below), NOT one of these: it
+# un-bundles "stop the loop" from "supply/transform a result" (#481). ``Abort``
+# raises its carried exception from the span context manager and is valid at **every
+# control event** (not just the result boundaries), so loop/budget control has an
+# always-present home and never rides a conditional exit. Where it co-occurs at a result
+# boundary, ``Abort`` has the highest precedence structurally: the span CM raises before
+# the supply/transform fold runs (termination trumps supply/transform), so the resolvers
+# below only ever see genuine results.
 
 
 @dataclass(frozen=True)
-class OverrideResult(Effect):
+class SupplyExecResult(Effect):
     """Supply a result in place of running the turn's code.
 
-    Valid at :class:`REPLExecEnter` only — a result must not yet exist to be supplied.
-    The code is not executed and the carried ``result`` becomes the turn's outcome.
+    Valid at :class:`REPLExecSend` only — the committed input is in view and a result must
+    not yet exist to be supplied. The code is not executed and the carried ``result``
+    becomes the turn's outcome.
 
     Composition: multiple supplies fold. Kind precedence is :class:`Raise` > :class:`Return` >
     :class:`Continue` — when supplies of different kinds meet, the highest present wins and the
     lower ones drop. Within one kind: two :class:`Continue` results concatenate their outputs
     and group their exceptions; two distinct :class:`Return` values raise
     :class:`~jaz.exceptions.ReturnValueConflictError` (identical values coalesce); two
-    :class:`Raise` results group their exceptions. An :class:`Abort` supersedes the whole fold.
+    :class:`Raise` results group their exceptions. A :class:`Abort` supersedes the whole fold.
 
     Because only the ``output`` field of :class:`Continue` is shown to the agent, a supplied
     :class:`Continue` should render any error into its ``output`` field, otherwise the agent
@@ -114,9 +139,9 @@ class OverrideResult(Effect):
         result: The :class:`Continue` / :class:`Return` / :class:`Raise` to use instead of executing.
     """
 
-    # This is the enter-boundary "supply instead" slot for sandbox/approval hooks generally.
+    # This is the supply-boundary "supply instead" slot for sandbox/approval hooks generally.
     # ``ValidateREPLInput`` emits it: on a rejected REPL input it supplies a ``Continue``
-    # (recoverable), or a ``Raise`` at the failure cap. See ``resolve_override_results``.
+    # (recoverable), or a ``Raise`` at the failure cap. See ``resolve_supply_results``.
     #
     # The ``Continue`` merge is what lets two such hooks reject the SAME input without one of
     # them losing or the fold raising — their outputs concatenate and their exceptions group.
@@ -127,18 +152,18 @@ class OverrideResult(Effect):
 
 
 @dataclass(frozen=True)
-class ModifyResult(Effect):
+class ModifyExecResult(Effect):
     """Replace a result that already exists with the carried one.
 
-    Valid at :class:`REPLExecExit` and :class:`InvokeExit` — both are transform boundaries, so
-    a result must exist to replace.
+    Valid at :class:`REPLExecComplete` and :class:`InvokeComplete` — both are transform
+    boundaries, so a result must exist to replace.
 
     Composition: multiple transforms fold by carried kind. Kind precedence is :class:`Raise` >
     :class:`Return` > :class:`Continue` — when transforms of different kinds meet, the highest
     present wins and the lower ones drop. Within one kind: a :class:`Continue` concatenates its
     ``output`` onto the original's and groups its exception; two distinct :class:`Return` values
     raise :class:`~jaz.exceptions.ReturnValueConflictError` (identical values coalesce); two
-    :class:`Raise` results group theirs. An :class:`Abort` supersedes the fold.
+    :class:`Raise` results group theirs. A :class:`Abort` supersedes the fold.
 
     Because only the ``output`` field of :class:`Continue` is shown to the agent, a carried
     :class:`Continue` should render any error into its ``output`` field, otherwise the agent
@@ -165,35 +190,62 @@ class ModifyResult(Effect):
 
 @dataclass(frozen=True)
 class Abort(Effect):
-    """Terminate the invoke, surfacing ``error`` as a :class:`Raise` out of ``jaz.invoke()``.
+    """Abort **this invoke**: ``error`` propagates out of ``jaz.invoke()`` as a raised exception.
 
-    Valid at every event that accepts effects — :class:`InvokeEnter`, :class:`InvokeExit`,
-    :class:`LLMQueryEnter`, :class:`REPLExecEnter`, :class:`REPLExecExit`. Not at
-    :class:`LLMQueryRetry`, which accepts nothing.
+    Valid at every control event — the ``*Enter``, ``*Send``, and ``*Complete`` events of all
+    three spans. The ``*Exit`` events are observation-only and accept no effects.
+
+    At :class:`LLMQueryComplete` the query has already completed and been paid for; the
+    abort stops the turn before the agent acts on the response, so the code the model
+    proposed never runs.
+
+    ``Abort`` is a *mechanism*, and its scope is exactly the invoke it fires in: the
+    invoke ends by raising the carried exception, and the aborting invoke's spans close with
+    an ``Aborted`` outcome on their ``*Exit`` events. How far the stop travels is decided
+    by the carried exception's *category*, not by this effect: a parent invoke observes an
+    aborted child as an ordinary recoverable error in its REPL (a raising call it can catch
+    and proceed past) — UNLESS the carried exception is
+    :class:`~jaz.exceptions.FatalError`-category, which no agent contains: the framework
+    re-raises it past every agent in the tree, and only human-authored code (the top-level
+    caller included) catches it normally. The containment boundary is authorship, not tree
+    depth.
 
     Composition: it has the **highest precedence** wherever it co-occurs with the result
-    effects, superseding both :class:`OverrideResult` and :class:`ModifyResult`. Multiple
+    effects, superseding both :class:`SupplyExecResult` and :class:`ModifyExecResult`. Multiple
     aborts group their exceptions into an ``ExceptionGroup``.
 
-    An abort resolves to a plain :class:`Raise`, so downstream it is indistinguishable from an agent
-    ``raise`` — it carries no separate provenance.
-
     Attributes:
-        error: The exception to terminate the invoke with.
+        error: The exception to abort the invoke with.
     """
 
+    # Naming (span_event_lifecycle.md, revised by user decision): the effect KEEPS ``Abort``;
+    # the shared-stem conflation with the escalation category was resolved by renaming the
+    # *exception* to :class:`~jaz.exceptions.FatalError`, not by renaming the effect. DOM
+    # ``AbortController.abort(reason)`` is this effect's exact precedent — an operation-scoped
+    # stop with a reason payload, containable by the parent — so the mechanism owns the word
+    # "abort"; "fatal" is what the codebase's own ``is_fatal`` predicate already called the
+    # category, making the error's new name tautological. (The rejected alternative — an
+    # invoke-scoped rename of this effect — moved the wrong name: it is the *category* whose
+    # old abort-stem name baked in a claim it couldn't keep; see the rename comment under
+    # ``FatalError``.) No back-compat aliases either way — pre-release.
+    #
     # Loop and budget hard-stops emit it at the always-present ``LLMQueryEnter`` (once per turn,
-    # before the LLM call), so a stop is never tied to the *conditional* ``REPLExecExit``, which
-    # is skipped on a parse-failure turn that has no execution.
+    # before the LLM call), so a stop is never tied to the *conditional* ``REPLExecComplete``,
+    # which is skipped on a parse-failure turn that has no execution.
     #
     # Termination is a first-class, self-scoping effect rather than a mode of the result effects
     # (#481): un-bundling "stop the loop" from "supply/transform a result" is what lets it be
     # valid at events that have no result at all — it references no existing result, which is
-    # why it is accepted at every effect-bearing event.
+    # why it is accepted at every control event.
     #
-    # It is NOT the only way to stop the loop: an ``OverrideResult`` / ``ModifyResult`` carrying
-    # a ``Return`` or a ``Raise`` ends the invoke too. What is unique to ``Abort`` is that it can
-    # stop from events that have no result to carry one (``InvokeEnter``, ``LLMQueryEnter``).
+    # It is NOT the only way to stop the loop: a ``SupplyExecResult`` / ``ModifyExecResult``
+    # carrying a ``Return`` or a ``Raise`` ends the invoke too. What is unique to
+    # ``Abort`` is that it can stop from events that have no result to carry one
+    # (``InvokeEnter``, ``LLMQueryEnter``, ``LLMQueryComplete``).
+    #
+    # ``LLMQueryRetry`` is the remaining hold-out. It is split into its own change rather than
+    # bundled here because it raises a distinct question — aborting mid-retry pre-empts a
+    # retry policy the LLM client owns.
 
     error: Exception
 
@@ -217,7 +269,7 @@ class DisableRecursion(Effect):
     # plus ``Abort``'s own docstring.
     #
     # Emitted by ``RecursionLimit`` on the cap-leaf invoke (``event.depth == max_depth``) for
-    # affordance removal: the primitive honors it by binding the REPL with ``jaz_library=None``.
+    # affordance removal: the primitive honors it by binding the REPL with ``invoke_tool=None``.
     # It also publishes the inverse as ``can_recurse`` on ``LLMQueryEnter``, so the must-exit
     # warnings gate their "you may delegate" guidance correctly.
     #
@@ -355,7 +407,7 @@ class AddVariables(Effect):
     divergent value for the same name raises :class:`~jaz.exceptions.REPLInputConflictError`.
     Binding a name already present in the *variable* namespace also raises rather than
     clobbering it. A name that lives only in ``__builtins__`` — an allowed builtin such as
-    ``len``, or a framework magic such as ``__repl_history__`` — does not count as already
+    ``len``, or a framework magic such as ``__history__`` — does not count as already
     bound, so adding it succeeds and shadows what was there. Naming ``__builtins__`` itself
     raises :class:`~jaz.exceptions.SandboxKeyError`.
 
@@ -380,7 +432,7 @@ class AddVariables(Effect):
     #
     # The namespace-level Add of the symmetric family and the direct counterpart of
     # ``DropVariables``: where that deletes names from ``repl_state_locals`` before the turn,
-    # this writes them. A hook typically binds once (emit on ``event.iteration == 1``).
+    # this writes them. A hook typically binds once (emit on ``event.iteration == 0``, the first turn).
     #
     # Drops run before adds (``Agent.do_one_repl_iteration``), matching
     # ``_apply_input_effects``. Add-first used to make the documented re-bind recipe impossible:
@@ -392,7 +444,7 @@ class AddVariables(Effect):
     # The already-present check is ``name in self.repl_state_locals``, which is the *variable*
     # namespace only — ``__builtins__`` is a separate dict, so a name living there is invisible
     # to the guard and gets shadowed rather than rejected. Measured: adding ``len`` or
-    # ``__repl_history__`` binds, while adding an existing variable raises. The docstring says
+    # ``__history__`` binds, while adding an existing variable raises. The docstring says
     # "shadows" rather than "is not checked" because the outcome, not the mechanism, is what a
     # hook author is deciding about.
 
@@ -406,7 +458,7 @@ class DropVariables(Effect):
     Valid at :class:`REPLExecEnter` only. Each listed name is deleted before the turn's code
     executes, so referencing it raises an ordinary ``NameError``. It reaches any name bound in
     the namespace, whatever put it there — an invoke input, a variable an earlier turn assigned,
-    or a framework magic such as ``__repl_history__``.
+    or a framework magic such as ``__history__``.
 
     The prompt is untouched. If the dropped name happened to come from an invoke input, that
     input still renders in the user prompt; un-passing an input is :class:`DropInputs`, which
@@ -418,8 +470,10 @@ class DropVariables(Effect):
 
     Dropping a name that is not bound raises :class:`~jaz.exceptions.MissingDropTargetError`.
     Pass ``allow_missing=True`` to ignore names that are not bound rather than raising;
-    if an unbound name is dropped by both ``DropVariables(..., allow_missing=False)`` and ``DropVariables(..., allow_missing=False)``,
-    then the drop is ignored and will not raise. Naming ``__builtins__`` always raises
+    if an unbound name is dropped by both a ``DropVariables(..., allow_missing=True)`` and a
+    ``DropVariables(..., allow_missing=False)``,
+    then the drop is ignored and will not raise — one tolerant drop exempts the name for
+    every hook naming it. Naming ``__builtins__`` always raises
     :class:`~jaz.exceptions.SandboxKeyError`, which ``allow_missing`` cannot suppress.
 
     Drops are applied before any :class:`AddVariables`, so pairing the two re-binds a name, and
@@ -433,7 +487,7 @@ class DropVariables(Effect):
 
     Examples:
         # Hide the framework REPL-history list from the agent this turn.
-        DropVariables({"__repl_history__"})
+        DropVariables({"__history__"})
         # Defensively unbind an input that another effect may already have un-passed.
         DropVariables({"maybe_unpassed"}, allow_missing=True)
     """
@@ -441,7 +495,7 @@ class DropVariables(Effect):
     # The docstring used to say this "unbinds the REPL name only — it does not un-pass an invoke
     # input", pointing at ``DropInputs`` "to remove it everywhere". That framed the two as one
     # operation at two strengths, which they are not: this acts on the REPL namespace (any name,
-    # whatever bound it — an input, an agent assignment, ``__repl_history__``), while
+    # whatever bound it — an input, an agent assignment, ``__history__``), while
     # ``DropInputs`` acts on the invoke's *inputs* and is only valid at ``InvokeEnter``. A
     # per-turn hook cannot reach for it as "the stronger version", and most names this drops were
     # never inputs at all.
@@ -515,7 +569,7 @@ class DropMessages(Effect):
     Attributes:
         indices: Positions to drop from the message list.
         persistent: ``False`` (default) applies the drop to this turn's message list only;
-            ``True`` makes the drop survives into later turns.
+            ``True`` makes the drop survive into later turns.
     """
 
     # Contrast an arbitrary message transform, which is order-dependent and can act on messages
@@ -656,32 +710,37 @@ def apply_message_edits(
 
 
 @dataclass(frozen=True)
-class OverrideResponse(Effect):
+class SupplyLLMResponse(Effect):
     """Supply a pre-computed LLM response, skipping the API call.
 
-    Valid at :class:`LLMQueryEnter` only. The content, token counts, and cost are used exactly
-    as if they came from a live call, including cost tracking and budget enforcement — so
-    :class:`LLMQueryExit` still fires.
+    Valid at :class:`LLMQuerySend` only — the supplier sees the committed post-edit message
+    list. The content, token counts, and cost are used exactly as if they came from a live
+    call, including cost tracking and budget enforcement — the query completes normally, so
+    :class:`LLMQueryComplete` and :class:`LLMQueryExit` still fire.
 
     Composition: identical overrides compose to one; two *distinct* overrides raise
-    :class:`~jaz.exceptions.OverrideConflictError`.
+    :class:`~jaz.exceptions.LLMResponseConflictError`.
 
     Attributes:
         content: The response text, or ``None``.
         prompt_tokens: Input token count to record, if known.
         completion_tokens: Output token count to record, if known.
-        total_tokens: Combined token count to record, if known.
-        cost: Cost to record for this call, if known.
+        cost_usd: Cost in US dollars to record for this call, if known.
     """
+
+    # Mirrors `LLMResponse`'s metric fields, so it tracks that type's ATIF v1.7 alignment:
+    # `cost` became `cost_usd` and `total_tokens` was dropped (see the comment on
+    # `LLMResponse`). A supplied total had nowhere to land once the response itself has no
+    # such field, and keeping a second spelling of one concept here is what let jaz's old
+    # client/provider split drift apart in the first place.
 
     content: str | None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
-    total_tokens: int | None = None
-    cost: float | None = None
+    cost_usd: float | None = None
 
 
-# Composition helpers for Abort / OverrideResult / ModifyResult
+# Composition helpers for Abort / SupplyExecResult / ModifyExecResult
 
 
 def _combine_exceptions(excs: list[BaseException], message: str) -> BaseException:
@@ -698,32 +757,15 @@ def _combine_exceptions(excs: list[BaseException], message: str) -> BaseExceptio
     return BaseExceptionGroup(message, excs)
 
 
-def _abort_raise(
-    abort_errors: list[Exception], original: ExecResult | None
-) -> ExecResult:
-    """Resolve ``Abort`` effects (+ an original ``Raise``) into a single terminal ``Raise``.
-
-    ``Abort`` supersedes any supply/transform at a result boundary (termination trumps),
-    so both resolvers call this first when any abort is present. An original ``Raise``'s exception
-    is grouped with the aborts'. (No ``output`` to carry — ``Raise`` has none, #903.)
-    """
-    excs: list[BaseException] = list(abort_errors)
-    if isinstance(original, Raise):
-        excs.append(original.exception)
-    # ExceptionGroup's message is agent-facing (shows in summarize_exception / str(group));
-    # keep it generic and free of internal effect/implementation names.
-    return Raise(exception=_combine_exceptions(excs, "Multiple errors occurred"))
-
-
 def _fold_carried_results(
     carried: list[ExecResult], *, original: ExecResult | None
 ) -> ExecResult | None:
     """Precedence fold shared by both REPL-exec result boundaries.
 
     ``carried`` are the full ``ExecResult``s named by this boundary's effects (each
-    ``OverrideResult`` / ``ModifyResult`` ``.result``). ``original`` is the executed result at the
-    *transform* boundary (``REPLExecExit``), or ``None`` at the *supply* boundary
-    (``REPLExecEnter``, where nothing has run yet). The result *kind* is decided by precedence
+    ``SupplyExecResult`` / ``ModifyExecResult`` ``.result``). ``original`` is the executed result at the
+    *transform* boundary (``REPLExecComplete``), or ``None`` at the *supply* boundary
+    (``REPLExecSend``, where nothing has run yet). The result *kind* is decided by precedence
     ``Raise`` > ``Return`` > ``Continue`` (highest present wins; lower kinds drop):
 
     - any carried ``Raise`` → ``Raise``, grouping every carried ``Raise``'s exception (plus
@@ -787,7 +829,7 @@ def _fold_carried_results(
             _combine_exceptions(excs, "Multiple errors occurred") if excs else None
         )
         # No summary of the combined exception is appended. Each contributing ``Continue`` owes
-        # its own rendered exception in its own ``output`` (see ``ModifyResult``), so the joined
+        # its own rendered exception in its own ``output`` (see ``ModifyExecResult``), so the joined
         # text already names every composed error; the only thing a summary would add is the
         # synthetic group *wrapper* ("Multiple errors occurred"), which is this fold's bookkeeping
         # rather than anything the agent needs. Appending it would restate every child a second
@@ -797,21 +839,24 @@ def _fold_carried_results(
     return None
 
 
-def resolve_override_results(
+def resolve_supply_results(
     *,
-    override_effects: list[OverrideResult],
-    abort_errors: list[Exception],
+    supply_effects: list[SupplyExecResult],
 ) -> ExecResult | None:
-    """Resolve ``OverrideResult`` (+ ``Abort``) at ``REPLExecEnter`` — the *supply* boundary.
+    """Resolve ``SupplyExecResult`` at the *supply* boundary (``REPLExecSend``).
 
     No execution has run yet, so there is no original result; the suppliers' carried results
     fold **among themselves** via ``_fold_carried_results`` (``original=None``) — the same
     precedence/merge the *transform* boundary uses. Two hooks vetoing the same input with
     recoverable ``Continue``s therefore merge (outputs concatenated, exceptions grouped) rather
-    than conflicting — e.g. ``RestrictReturnValue`` co-installed with a ``ValidateREPLInput``.
+    than conflicting — e.g. the evals ``RestrictReturnValue`` co-installed with a ``ValidateREPLInput``.
     Distinct carried ``Return`` *values* still can't merge (``ReturnValueConflictError``): a
-    supplied return names THE value, and order-independence forbids picking a winner. ``Abort``
-    supersedes (termination trumps supply).
+    supplied return names THE value, and order-independence forbids picking a winner.
+
+    An ``Abort`` composed at the same boundary never reaches this fold: the span context
+    manager raises its carried exception first (termination trumps supply — structurally,
+    not by a precedence rule inside the fold; the former ``abort_errors`` parameter was the
+    legacy laundering channel that turned an abort into a terminal ``Raise`` result).
 
     (This folds rather than requiring suppliers to be *equal* — the earlier contract, which raised
     ``ResultConflictError`` on any two distinct supplies. Folding was adopted so that
@@ -819,31 +864,25 @@ def resolve_override_results(
     instead of a stack that installs two of them crashing on a hard internal error; see the
     ``resolve_modify_results`` origin-agnostic note for the mirror semantics.)
 
-    Returns the folded/abort result, or ``None`` when nothing was emitted (run the code).
+    Returns the folded result, or ``None`` when nothing was emitted (run the code).
     """
-    if abort_errors:
-        return _abort_raise(abort_errors, None)
-    return _fold_carried_results(
-        [eff.result for eff in override_effects], original=None
-    )
+    return _fold_carried_results([eff.result for eff in supply_effects], original=None)
 
 
 def resolve_modify_results(
     *,
-    modify_effects: list[ModifyResult],
-    abort_errors: list[Exception],
+    modify_effects: list[ModifyExecResult],
     original: ExecResult,
 ) -> ExecResult | None:
-    """Resolve ``ModifyResult`` (+ ``Abort``) at ``REPLExecExit`` — the *transform* boundary.
+    """Resolve ``ModifyExecResult`` at the *transform* boundary (``*Complete``).
 
-    ``original`` is the actual ``exec_result``. Each ``ModifyResult`` carries a full
+    ``original`` is the actual ``exec_result``. Each ``ModifyExecResult`` carries a full
     replacement ``ExecResult``; multiple **fold** by carried-result kind, preserving the merge
     semantics the former ``ContinueEffect`` had. The result *kind* is decided by precedence
-    ``Abort`` > carried ``Raise`` > carried ``Return`` > carried ``Continue`` (the highest
+    carried ``Raise`` > carried ``Return`` > carried ``Continue`` (the highest
     present wins; lower kinds drop):
 
-    - any ``Abort`` → ``Raise`` (see ``_abort_raise``);
-    - else any carried ``Raise`` → ``Raise``, grouping every carried ``Raise``'s exception
+    - any carried ``Raise`` → ``Raise``, grouping every carried ``Raise``'s exception
       (plus ``original``'s if it too is a ``Raise``) into an ``ExceptionGroup``;
     - else any carried ``Return`` → ``Return`` — values can't merge, so two *distinct* carried
       return values raise ``ReturnValueConflictError`` (identical values coalesce);
@@ -854,15 +893,18 @@ def resolve_modify_results(
       output contributes only its exception (the ``BudgetForcing`` shape);
     - else ``None`` (keep ``original``).
 
+    An ``Abort`` at the same boundary supersedes the whole fold structurally: the span
+    context manager raises its carried exception before calling this, so an abort can never
+    be downgraded by a co-composed transform (the Defect-3 revocation hole of
+    span_event_lifecycle.md, closed by construction rather than by a precedence rule here).
+
     Origin-agnostic, deliberately: the kind is decided by the effects present at *this*
     boundary, so a carried ``Continue`` composed onto an ``original`` terminal (``Return`` /
-    ``Raise`` from an enter override) *downgrades* it to a recoverable ``Continue`` — the exit
-    boundary's own effects are the last word (see ``span_repl_exec``).
+    ``Raise`` from a Send-time supply) *downgrades* it to a recoverable ``Continue`` — the
+    transform boundary's own effects are the last word (see ``span_repl_exec``).
 
     Returns the folded override, or ``None`` when nothing was emitted (keep ``original``).
     """
-    if abort_errors:
-        return _abort_raise(abort_errors, original)
     # Fold the carried replacements onto the executed result — the same precedence/merge the
     # supply boundary uses among its suppliers, but with a real ``original`` to fold onto.
     return _fold_carried_results([m.result for m in modify_effects], original=original)

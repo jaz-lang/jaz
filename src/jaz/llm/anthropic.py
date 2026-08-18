@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from ..credentials import resolve_credential
 from .base import Choice, CompletionResponse, Message, MessageDict, Usage
 from .exceptions import (
     APIError,
@@ -26,8 +27,7 @@ from .exceptions import (
     UnsupportedParamsError,
     is_content_policy_violation,
 )
-from .llm import LLM, LLMResponse
-from .registry import register_llm
+from .llm import BaseLLM, LLMResponse
 
 # https://docs.anthropic.com/en/api/messages
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
@@ -62,14 +62,25 @@ _PARAM_MAPPING = {
 }
 
 
-@register_llm("anthropic")
-class AnthropicLLM(LLM):
+# Dormant for v1: LiteLLM is the sole registered backend
+# (design/design_features/litellm_sole_backend_v1.md, #1082). This class stays in-tree and
+# importable — `AnthropicLLM(...)` still works if constructed directly — but carries no
+# `@register_llm` tag, so `backend: anthropic` no longer resolves; reach Anthropic via
+# `anthropic/…` on the litellm backend. Revive the built-in (for the deferred lean-core split) by
+# restoring the `@register_llm("anthropic")` decorator (the class stays exported from
+# `llm/__init__.py`).
+class AnthropicLLM(BaseLLM):
     """The Anthropic messages backend.
 
-    Reads ``ANTHROPIC_API_KEY`` from the environment when no ``api_key`` is configured, so a
-    recorded config never has to carry the key. Converts OpenAI-style messages to Anthropic's
-    format automatically.
+    Resolves its key from ``api_key``, else the ``ANTHROPIC_API_KEY`` environment
+    variable, else the stored credential for ``"anthropic"`` in ``~/.jaz/credentials.json``.
+    Converts OpenAI-style messages to Anthropic's format automatically.
     """
+
+    # Resolving the key at construction (see `__init__`) is what keeps it off a serialized
+    # config: `LLM.from_dict` rebuilds the backend from its authored params, and the key is
+    # read from the environment or the credentials store at that point — never carried in
+    # config, so it cannot leak into a persisted config record.
 
     def __init__(
         self,
@@ -80,7 +91,13 @@ class AnthropicLLM(LLM):
     ) -> None:
         # See OpenAILLM.__init__ on why `**retry` keeps `declared_init_keys` correct.
         super().__init__(**retry)
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        # Stored credential last, below the environment variable — see OpenAILLM for
+        # the precedence argument and why this resolves at construction, not per request.
+        self.api_key = (
+            api_key
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or resolve_credential("anthropic")
+        )
         self.base_url = (
             base_url or os.environ.get("ANTHROPIC_API_BASE") or ANTHROPIC_API_BASE
         ).rstrip("/")
@@ -112,7 +129,8 @@ class AnthropicLLM(LLM):
     ) -> CompletionResponse:
         if not self.api_key:
             raise AuthenticationError(
-                "Anthropic API key not found. Set ANTHROPIC_API_KEY environment variable.",
+                "Anthropic API key not found. Set the ANTHROPIC_API_KEY environment variable, "
+                "or store one from the jaz console with set_credential('anthropic').",
                 llm_provider="anthropic",
             )
 
@@ -195,7 +213,8 @@ class AnthropicLLM(LLM):
     ) -> CompletionResponse:
         if not self.api_key:
             raise AuthenticationError(
-                "Anthropic API key not found. Set ANTHROPIC_API_KEY environment variable.",
+                "Anthropic API key not found. Set the ANTHROPIC_API_KEY environment variable, "
+                "or store one from the jaz console with set_credential('anthropic').",
                 llm_provider="anthropic",
             )
 
@@ -424,7 +443,7 @@ class AnthropicLLM(LLM):
         # (unlike OpenAI's prompt_tokens, which is a superset that includes cached_tokens).
         # We normalize to the OpenAI/ATIF convention: Usage.prompt_tokens is the total
         # of non-cached input + cache creation + cache read. This keeps cost computation
-        # in providers/pricing.py correct (it subtracts cache buckets from prompt_tokens)
+        # in llm/pricing.py correct (it subtracts cache buckets from prompt_tokens)
         # and matches ATIF v1.7 MetricsSchema semantics.
         # See https://platform.claude.com/docs/en/api/messages/create#message.usage
         usage_data = data.get("usage")
@@ -448,7 +467,6 @@ class AnthropicLLM(LLM):
             usage = Usage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=output_tokens,
-                total_tokens=prompt_tokens + output_tokens,
                 cache_creation_input_tokens=cache_creation,
                 cache_read_input_tokens=cache_read,
                 extra=extra,

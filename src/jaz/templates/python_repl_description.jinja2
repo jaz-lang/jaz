@@ -20,44 +20,65 @@
 {% elif exec_timeout is not none %}
 - Your code is executed under a timeout of {{ exec_timeout }} seconds.
 {% endif %}
-{# Frame `return` around what it delivers, not around when it is forbidden: the prohibition-only
-   phrasing cost ~2 turns/run (gpt-5-mini, 12 trials/arm, one-turn task — 5/12 runs took >1 turn at
-   avg 2.83, vs 0/12 at avg 1.00). Matrix: tests/test_return_instruction_integration.py. #}
-- To indicate task completion, use a `return` statement with the final result.
+{# Frame `return` around what it delivers AND scope it to "no next step remains" — not around when it
+   is forbidden. Two findings drive this wording:
+   - Prohibition-only phrasing ("do NOT return unless ...") cost ~2 turns/run on a one-turn task
+     (gpt-5-mini, 12 trials/arm — 5/12 runs took >1 turn at avg 2.83, vs 0/12 at avg 1.00). So the
+     primary bullet stays delivery-framed with no "do not return until ..." prohibition.
+   - Framing completion as "everything is done" is ambiguous when one invoke covers a *sequence* of
+     steps: the agent reads finishing the current step as finishing everything and returns early,
+     abandoning the rest. Framing it forward-looking ("no next step remains") removes that read. On a
+     task-framed, multi-step sequence with NO worked example (recall-style, 26 items), gpt-5-mini with
+     no completion guard completed 0/6 runs under the prior "task completion" wording and 6/6 under
+     this wording. It does NOT regress the single-step exits: one-turn and two-turn turn-counts are
+     identical between the two wordings across all six models (gpt-5-mini, gpt-5.4-nano, gpt-5.4-mini,
+     gpt-5.6-luna, gpt-5.4, gpt-5.6-sol) — see tests/test_return_instruction_integration.py.
+   Measured against jaz core b38a66a6; the b38a66a6 -> develop return-path diff is behavior-preserving
+   for these numbers (the only non-refactor change is a `max_failures` off-by-one on ReturnType /
+   ValidateReturn that no measured run exercised — all used the default `max_failures=None`). #}
+- `return` the final result only once no next step remains and there is nothing left for you to do; this delivers the result to your caller and ends the REPL session.
   Do NOT print and return in the same REPL iteration - printing is for observing intermediate output
-  to decide your next step, whereas returning is for indicating task completion and ending the REPL session.
+  to decide your next step, whereas returning is what you do only when no next step remains and nothing is left to do.
 {% if allow_raise %}
-- If the task is impossible, use a `raise` statement to raise an exception explaining why:
-  `raise Exception("<reason why the task is impossible>")`.
+- If what you were asked is impossible, use a `raise` statement to raise an exception explaining why:
+  `raise Exception("<reason why it is impossible>")`.
   Executing `raise` immediately ends the REPL session.
 {% endif %}
-{# `__inputs__` is deliberately undocumented: it is slated for removal, and dropping it from the
-   prompt is the first step. Do not restore it here. #}
-- The magic variable `__repl_history__` is available by name in the REPL.
-  It is a list with one entry per REPL iteration, in order (`__repl_history__[0]` is your first
-  iteration and `__repl_history__[-1]` the most recent). Each entry has:
-  - `.llm_response (str)`: Your full response for that iteration containing your code
-  - `.repl_output (str)`: The printed output from that iteration, including any error traceback
-  - `.repl_exception (BaseException | None)`: The exception object raised if that iteration hit
-    a recoverable error, else None
+{% if allows_everything(allowed_imports) %}
+- You may import any Python module.
+{% elif allowed_imports %}
+- You may ONLY import Python modules whose name matches:
+  `{{ allowed_imports | join("`, `") }}`
+{% else %}
+- You are NOT allowed to import any Python modules.
+{% endif %}
+{% macro file_rule(verb, patterns) %}
+{%- if patterns -%}
+- You may only {{ verb }} files whose path matches: `{{ patterns | join("`, `") }}`
+{%- else -%}
+- You may NOT {{ verb }} any files.
+{%- endif -%}
+{% endmacro %}
+{{ file_rule("read", allowed_read_paths) }}
+{{ file_rule("write", allowed_write_paths) }}
 
 ## Determine the workflow type
 
-- If the task is a question that can be answered directly, hard-code your response:
+- If all that there is to do is to answer a question that can be answered directly, hard-code your response:
 
     return <hard-coded response>
 
-- If the task involves computing a result programmatically, write a program:
+- If it involves computing a result programmatically, write a program:
 
     <program computing the result>
     return <computed result>
 
-- If the task is neither a directly-answerable question nor a programming problem, then you must use
+- If it is neither a directly-answerable question nor a programming problem, then you must use
   a *multi-step agentic workflow*. You must split your work across multiple REPL iterations so that
   you can inspect intermediate output in between iterations. Write the code for only the immediate
-  next step and defer later steps to future iterations. Do NOT return if multiple steps remain - instead
-  print intermediate output to inform future steps. Return iff the immediate next step is the last step
-  and completes the entire task.
+  next step and defer later steps to future iterations. Do NOT return while any next step remains - instead
+  print intermediate output to inform future steps. Return only once no next step remains -- the step you
+  just completed was the last one and nothing further is left to do.
 
     <code for the *immediate next step* (non-final)>
     print(<intermediate output>)  # do NOT return

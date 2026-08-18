@@ -1,13 +1,19 @@
-"""Invoke event, contexts, and span."""
+"""Invoke events, contexts, and span."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from jaz.library import Library
-from jaz.repl.types import ExecResult
+from jaz._invoke_tool import InvokeTool
+from jaz.repl.types import ExecResult, Raise, Return
 
 from ..base import Event, ExecutionContext
+from .base import Aborted, Completed, Failed
+
+#: The invoke span's outcome union — what :attr:`InvokeExit.outcome` holds. The payload is
+#: ``Return | Raise`` (never ``Continue``): an invoke only ever exits on a terminal result.
+type InvokeOutcome = Completed[Return | Raise] | Aborted | Failed
 
 
 @dataclass(frozen=True)
@@ -19,18 +25,18 @@ class InvokeEnter(Event):
 
     Allowed effects:
 
-    - :class:`Abort` — terminate the invoke before its first turn.
+    - :class:`Abort` — abort the invoke before its first turn.
     - :class:`AddInputs` — add an input, visible in the prompt and bound in the REPL.
     - :class:`DropInputs` — remove an input from both the prompt and the REPL.
-    - :class:`DisableRecursion` — withhold the recursive ``jaz.invoke`` tool from this invoke.
+    - :class:`DisableRecursion` — withhold the recursive ``invoke`` tool from this invoke.
 
     Attributes:
         parent_invoke_id: The enclosing invoke's id, or ``None`` at the top level.
         parent_repl_iteration: The enclosing invoke's iteration that spawned this one, or
             ``None`` at the top level.
         inputs: The explicit ``**inputs`` passed to ``jaz.invoke``, as a read-only mapping.
-        jaz_library: The JAZ library bound into this invoke, or ``None`` when recursion is
-            disabled.
+        invoke_tool: The recursive sub-invoke primitive bound into this invoke (as the bare
+            REPL name ``invoke``), or ``None`` when recursion is disabled.
         scope: The resolved ambient ``jaz.scope`` values, as a read-only mapping. Disjoint
             from ``inputs``.
     """
@@ -56,12 +62,14 @@ class InvokeEnter(Event):
     # Exposed as a read-only mapping (see ``__post_init__``) — like the whole event, treat it as
     # immutable; a hook must not rebind keys here (it would perturb later-dispatched hooks).
     inputs: Mapping[str, object]
-    # The framework JAZ library bound into this invoke (jaz.invoke + opted-in
-    # jaz.* exports), or None. A ``DisableRecursion`` effect emitted in response to THIS
-    # event (by ``RecursionLimit`` at the cap leaf) causes the primitive to bind the REPL
-    # with this nullified — the recursion-cap affordance-removal now lives in the effect
-    # layer, not a framework ``max_depth`` field.
-    jaz_library: Library | None
+    # The framework's recursive sub-invoke primitive bound into this invoke — a single
+    # callable the agent reaches as the bare REPL name ``invoke`` — or None. (It was a whole
+    # ``Library`` named ``jaz`` until the namespace's last other member left in #635.) A
+    # ``DisableRecursion`` effect emitted in response to THIS event (by ``RecursionLimit`` at
+    # the cap leaf) causes the primitive to bind the REPL with this nullified — the
+    # recursion-cap affordance-removal lives in the effect layer, not a framework
+    # ``max_depth`` field.
+    invoke_tool: InvokeTool | None
     # The RESOLVED ambient scope for this invoke — the ``jaz.scope`` values in effect
     # (``{**parent_scope, **local_scope}``, mirroring how ``config`` is the resolved effective
     # config). A separate observability channel from ``inputs`` because ``jaz.scope`` and the
@@ -78,60 +86,166 @@ class InvokeEnter(Event):
         # silently change what a later-dispatched hook at the same event observes. ``dict()``
         # is a shallow copy (cheap; it does not copy the values), and ``object.__setattr__`` is
         # the frozen-dataclass escape hatch for this framework-internal coercion.
+        #
+        # The inner ``dict()`` is LOAD-BEARING, not redundant with the proxy:
+        # ``MappingProxyType`` is a read-only *view*, not a copy — wrapping the caller's dict
+        # directly would block writes through the field while still showing every later
+        # mutation of the caller's dict. The copy severs; the proxy freezes. Construction
+        # sites therefore pass their containers uncopied (the event owns the severing) — do
+        # not "simplify" the inner copy away, and do not re-add call-site copies.
         object.__setattr__(self, "inputs", MappingProxyType(dict(self.inputs)))
         object.__setattr__(self, "scope", MappingProxyType(dict(self.scope)))
 
 
 @dataclass(frozen=True)
-class InvokeExit(Event):
-    """Fired when Agent.invoke completes or raises.
+class InvokeSend(Event):
+    """Fired when an invoke's input set has committed — post :class:`AddInputs` / :class:`DropInputs`.
 
-    **Fires once per invoke**, not per turn, on every path that reaches a terminal result —
-    including when a hook emits an :class:`Abort` at :class:`InvokeEnter`, which still completes
-    with that :class:`Raise`. It does *not* fire if an error escapes before the invoke produces a
-    result at all (a REPL that fails to initialize, say); that case is logged, not reported as
-    an exit.
+    Fires once per invoke, after :class:`InvokeEnter`'s input effects have been folded into
+    the inputs the prompt renders and the REPL binds, before the first turn. It does not
+    fire when a hook aborts the invoke at :class:`InvokeEnter` (the input never commits).
 
     Allowed effects:
 
-    - :class:`ModifyResult` — replace the invoke's terminal result.
-    - :class:`Abort` — terminate the invoke with an error.
+    - :class:`Abort` — abort the invoke, declining the committed input set.
+
+    No invoke supplier effect exists today, so the supply slot the other spans' ``*Send``
+    events host is uniform here but unused.
 
     Attributes:
-        result: The invoke's terminal result — a :class:`Return` or a :class:`Raise`.
+        inputs: The invoke's committed explicit inputs (resolved values, post add/drop), as
+            a read-only mapping — the counterpart of :class:`InvokeEnter`'s pre-commit
+            ``inputs``.
+        added_inputs: The inputs hooks added via :class:`AddInputs` (raw effect values).
+        dropped_inputs: The input names hooks dropped via :class:`DropInputs`.
     """
 
-    # This is a **transform** boundary, unlike the enter-time ``InvokeContext``: it is the last
-    # line of defense for a return contract. A ``ReturnType`` / ``ValidateReturn`` hook re-checks
-    # the *final* ``Return`` here and downgrades it to a ``Raise``, so a wrong-typed / invalid
-    # return can't escape even when another hook's ``REPLExecExit`` override reinstated a
-    # ``Return`` past the per-turn check.
-    #
-    # Known limitation (#906): the event carries the PRE-transform result, while the invoke
-    # returns the POST-transform one — so a passive observer keyed on ``event.result`` misses an
-    # InvokeExit downgrade. Inherent to the event being the transform's *input*.
+    # Observers of InvokeEnter record the *proposal*: an input a hook injects via AddInputs
+    # (e.g. ultrahorizon's per-child ``env`` library) is absent from InvokeEnter.inputs, so
+    # traces built from Enter mis-record what the child actually received — the input-side
+    # instance of the #906 pattern. This event is the commit those observers should read.
+    # ``scope`` is not repeated here: it is not editable at InvokeEnter, so InvokeEnter's
+    # copy is already the committed one.
+
+    # ``Mapping``/``AbstractSet`` in the annotations, ``MappingProxyType``/``frozenset`` at
+    # runtime (see __post_init__) — the constructor accepts plain containers, the types
+    # forbid mutation through the fields.
+    inputs: Mapping[str, object]
+    added_inputs: Mapping[str, object] = field(default_factory=dict)
+    dropped_inputs: AbstractSet[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        # Same read-only coercion as InvokeEnter (see its __post_init__): one shared event
+        # instance is dispatched to every hook, so a hook must not be able to rebind or
+        # alias-mutate what a later-dispatched hook observes.
+        object.__setattr__(self, "inputs", MappingProxyType(dict(self.inputs)))
+        object.__setattr__(
+            self, "added_inputs", MappingProxyType(dict(self.added_inputs))
+        )
+        object.__setattr__(self, "dropped_inputs", frozenset(self.dropped_inputs))
+
+
+@dataclass(frozen=True)
+class InvokeComplete(Event):
+    """Fired when the invoke's raw terminal result exists — the transform boundary.
+
+    **Fires once per invoke**, with the terminal result the loop produced. It does not
+    fire when the invoke unwinds on an in-flight exception before a terminal result
+    exists (transformers never run during unwind), nor when a hook's :class:`Abort`
+    ended the invoke at an earlier stage (an abort skips the pipeline's remaining
+    stages — its stickiness is structural).
+
+    Allowed effects:
+
+    - :class:`ModifyExecResult` — replace the invoke's terminal result.
+    - :class:`Abort` — abort the invoke with an error.
+
+    Attributes:
+        result: The invoke's raw terminal result — a :class:`Return` or a :class:`Raise` —
+            before any transform composes.
+    """
+
+    # This is the transform boundary that used to live on InvokeExit (#568): the last line
+    # of defense for a return contract. A ``ReturnType`` / ``ValidateReturn`` hook re-checks
+    # the *final* ``Return`` here and downgrades it to a ``Raise``, so a wrong-typed /
+    # invalid return can't escape even when another hook's ``REPLExecComplete`` override
+    # reinstated a ``Return`` past the per-turn check. The transformed result is what
+    # ``InvokeExit`` then carries, and what the invoke actually returns.
 
     result: ExecResult
 
 
-@dataclass
-class InvokeExitContext(ExecutionContext):
-    """Context for invoke *exit* events (#568).
+@dataclass(frozen=True)
+class InvokeExit(Event):
+    """Fired when the invoke span closes, with the invoke's final outcome.
 
-    Symmetric with ``REPLExecExitContext``: the invoke's terminal result is a **transform**
-    boundary, so a hook may replace it via :class:`ModifyResult` (or terminate via :class:`Abort`). The
+    **Fires once per invoke**, not per turn. ``outcome`` is the tagged union
+    :data:`InvokeOutcome`: :class:`Completed` carries the invoke's **final, post-transform**
+    terminal result (``outcome.result`` — any :class:`ModifyExecResult` composed at
+    :class:`InvokeComplete` already applied), exactly what the invoke returns or raises to
+    its caller. :class:`Aborted` means this invoke's own hook control plane ended it via
+    :class:`Abort` — at whichever stage the effect composed (``outcome.exception``
+    carries the abort's error, which the invoke raises to its caller). :class:`Failed`
+    carries every other error that escaped before the invoke produced a result — a REPL
+    that fails to initialize, a ``FatalError`` propagating from below, a child invoke's
+    abort passing through; the error still propagates after the event fires.
+
+    Observation-only: no effect is valid here — the outcome is already final (an effect
+    returned here raises :class:`~jaz.exceptions.InvalidEffectError`). To change the
+    terminal result, transform it at :class:`InvokeComplete`.
+
+    Timing: like every event, this exit carries only :attr:`~jaz.hooks.events.Event.timestamp`
+    (its emission time); the span's duration is ``Exit.timestamp - Enter.timestamp``.
+
+    Attributes:
+        outcome: How the span ended, with its payload — match on the variant
+            (``Completed[Return | Raise] | Aborted | Failed``).
+    """
+
+    # The Completed payload being the POST-transform value is the #906 fix
+    # (span_event_lifecycle.md): observers of this event finally record what the invoke
+    # actually returned. See the Complete→Exit ordering comment in ``span_invoke``.
+    #
+    # No time fields: the former start_time/end_time (interval-on-record, #1011) were
+    # replaced by the base ``Event.timestamp`` — see its field comment in hooks/base.py
+    # for the decision record.
+    #
+    # ``outcome`` has no default — see the rationale on ``LLMQueryExit``.
+
+    outcome: InvokeOutcome
+
+
+@dataclass
+class InvokeSendContext(ExecutionContext):
+    """Context for invoke *send* events.
+
+    Hooks can abort the invoke via :class:`Abort` (``abort_errors`` — ``span_invoke``'s
+    send emitter raises their combination; the span closes ``Aborted``). No invoke
+    supplier effect exists, so unlike the other spans' Send contexts there is no supply
+    slot to collect.
+    """
+
+    abort_errors: list[Exception] = field(default_factory=list)
+
+
+@dataclass
+class InvokeCompleteContext(ExecutionContext):
+    """Context for invoke *complete* events (#568).
+
+    Symmetric with ``REPLExecCompleteContext``: the invoke's terminal result is a **transform**
+    boundary, so a hook may replace it via :class:`ModifyExecResult` (or abort via :class:`Abort`). The
     effects are collected here and resolved against the actual terminal result by
     ``resolve_modify_results`` in ``span_invoke``. Used by :class:`ReturnType` / :class:`ValidateReturn` to
     downgrade a wrong-typed / invalid final :class:`Return` to a :class:`Raise` — the backstop that survives
-    another hook's :class:`REPLExecExit` override reinstating a :class:`Return`.
+    another hook's :class:`REPLExecComplete` override reinstating a :class:`Return`.
     """
 
-    # Transform / terminate effects, mirroring REPLExecExitContext: ``modify_effects`` holds the
-    # exit-time ``ModifyResult``s (each carrying a full ExecResult) and ``abort_errors`` the Abort
+    # Transform / abort effects, mirroring REPLExecCompleteContext: ``modify_effects`` holds the
+    # ``ModifyExecResult``s (each carrying a full ExecResult) and ``abort_errors`` the Abort
     # exceptions (resolve to a Raise). Left untyped-element (plain ``list``) deliberately: importing
-    # ``ModifyResult`` (in the effects layer) here creates an events→effects cycle that makes pyright
+    # ``ModifyExecResult`` (in the effects layer) here creates an events→effects cycle that makes pyright
     # mis-resolve the frozen generic ``Event`` dataclasses in this module. The dispatcher's
-    # ``_compose_invoke_exit`` is the only writer and appends the right types.
+    # ``_compose_invoke_complete`` is the only writer and appends the right types.
     modify_effects: list = field(default_factory=list)
     abort_errors: list[Exception] = field(default_factory=list)
 
@@ -141,9 +255,9 @@ class InvokeContext(ExecutionContext):
     """Context for invoke enter events.
 
     Hooks can:
-    - Short-circuit the whole invoke with an Abort (terminate before the first
-      iteration): the loop is skipped and the composed Raise is raised instead
-      (see ``abort_errors``).
+    - Short-circuit the whole invoke with an Abort (abort before the first
+      iteration): the loop is skipped and the combined carried exception is raised
+      instead (see ``abort_errors``).
     - Add invoke inputs (``added_inputs``, via :class:`AddInputs`) — including tool namespaces /
       libraries, now ordinary inputs (the dedicated AddLibrary effect was removed with the
       privileged libraries= path, see ``library_as_input.md``). Added inputs render in the
@@ -153,14 +267,14 @@ class InvokeContext(ExecutionContext):
       name only). Applied *before* any :class:`AddInputs`, so dropping and adding the same key
       replaces it (provided the caller passed that key), and a drop never removes an input
       another hook added.
-    - Suppress the recursive ``jaz.invoke`` tool for this invoke with a
+    - Suppress the recursive ``invoke`` tool for this invoke with a
       :class:`DisableRecursion` effect (``recursion_disabled``): the primitive binds
-      the REPL with ``jaz_library=None``, so the agent never sees ``jaz.invoke``.
+      the REPL with ``invoke_tool=None``, so the agent never sees ``invoke``.
       This is the hook-driven successor to the framework's former ``max_depth``
       structural affordance-removal (see :class:`RecursionLimit`).
     - Record metrics
 
-    The result-scoped effects (OverrideResult / ModifyResult) are not valid here (an invoke
+    The result-scoped effects (SupplyExecResult / ModifyExecResult) are not valid here (an invoke
     has no execution result to supply or transform), and ``Finish`` (a graceful
     Return-terminate) is deliberately excluded (#481, YAGNI) — so Abort is the only
     terminating effect at invoke enter.
@@ -180,12 +294,12 @@ class InvokeContext(ExecutionContext):
     # key already being un-passed by another effect). Union across hooks: one opt-in exempts the key.
     dropped_inputs_allow_missing: set[str] = field(default_factory=set)
 
-    # Terminate effects: the exceptions from Aborts (``abort_errors`` — they resolve to a
-    # ``Raise`` that short-circuits the invoke before its first iteration).
+    # Abort effects: the exceptions from Aborts (``abort_errors`` — they resolve to
+    # a ``Raise`` that short-circuits the invoke before its first iteration).
     abort_errors: list[Exception] = field(default_factory=list)
 
     # Set True by a ``DisableRecursion`` effect: the primitive binds this invoke's REPL with
-    # ``jaz_library=None`` (no recursive ``jaz.invoke`` tool). Idempotent — any number of
+    # ``invoke_tool=None`` (no recursive ``invoke`` tool). Idempotent — any number of
     # emitters collapse to this one boolean. Its inverse rides ``LLMQueryEnter`` as
     # ``can_recurse`` so the must-exit warnings gate their delegate guidance correctly.
     recursion_disabled: bool = False
@@ -196,22 +310,42 @@ class InvokeSpan:
 
     Usage:
         with dispatcher.span_invoke(...) as span:
-            if span.enter_override is not None:
-                result = span.enter_override  # a hook aborted the invoke
-            else:
-                result = agent._invoke_internal(...)
+            result = agent._invoke_internal(...)
             span.complete(result=result)
 
-    ``enter_override`` is set by the dispatcher from enter-time Aborts.
+    An :class:`Abort` never surfaces on the span: the ``span_invoke`` context manager
+    raises the carried exception itself (from the ``with`` statement at enter, from
+    ``send()`` at the committed-input veto), after closing the span with an ``Aborted``
+    outcome. The former ``abort`` / ``send_abort`` fields were the legacy laundering
+    channel and are gone.
     """
 
     def __init__(self, ctx: InvokeContext) -> None:
         self.ctx = ctx
         self._completed: bool = False
         self._result: ExecResult | None = None
-        # ExecResult produced by an enter-time Abort, if any. When set, the
-        # caller should skip the invoke body.
-        self.enter_override: ExecResult | None = None
+        # Emitter for InvokeSend, installed by ``span_invoke`` (the span is pure data and
+        # must not import the dispatcher; the CM closes over the enter event + composed
+        # input effects so ``send()`` needs only the committed inputs). None on a
+        # hand-built span.
+        self._emit_send: Callable[[Mapping[str, object]], None] | None = None
+
+    def send(self, inputs: Mapping[str, object]) -> None:
+        """Fire :class:`InvokeSend` with this invoke's committed inputs.
+
+        Called by the agent loop once the enter-time :class:`AddInputs` / :class:`DropInputs`
+        have been folded into the invoke's inputs — i.e. exactly when the input set commits,
+        before the prompt renders its first turn. A Send-composed :class:`Abort` raises its
+        carried exception from this call (the span closes ``Aborted``).
+
+        Raises:
+            RuntimeError: If the span was not created by ``span_invoke``.
+        """
+        if self._emit_send is None:
+            raise RuntimeError(
+                "InvokeSpan.send() requires a span created by span_invoke"
+            )
+        self._emit_send(inputs)
 
     def complete(self, *, result: ExecResult) -> None:
         """Complete span with invocation result.
@@ -246,10 +380,10 @@ class InvokeSpan:
         return self._result
 
     def set_final_result(self, result: ExecResult) -> None:
-        """Replace the completed result with an ``InvokeExit``-composed override.
+        """Replace the completed result with an ``InvokeComplete``-composed override.
 
-        Called only by ``span_invoke`` after emitting ``InvokeExit`` and resolving any exit-time
-        ``ModifyResult`` (mirrors ``REPLExecSpan.set_final_exec_result``). The caller then reads
+        Called only by ``span_invoke`` after emitting ``InvokeComplete`` and resolving any
+        ``ModifyExecResult`` (mirrors ``REPLExecSpan.set_final_exec_result``). The caller then reads
         the (possibly overridden) terminal result via :meth:`get_result` *after* the span closes.
         """
         if not self._completed:

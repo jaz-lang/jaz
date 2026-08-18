@@ -6,7 +6,7 @@ import re
 import sys
 import threading
 import traceback
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from enum import StrEnum
 from io import StringIO
@@ -15,8 +15,9 @@ from typing import Any, Self, override
 
 from typing_extensions import TypedDict
 
+from jaz._invoke_tool import InvokeTool
 from jaz.exceptions import (
-    AbortError,
+    FatalError,
     MissingDropTargetError,
     REPLInputConflictError,
     REPLTimeoutPragmaError,
@@ -24,8 +25,7 @@ from jaz.exceptions import (
     is_fatal,
 )
 from jaz.inputs import resolve_inputs
-from jaz.library import Library
-from jaz.string_utils import backtickify, summarize_exception
+from jaz.string_utils import summarize_exception
 from jaz.template_loader import _jinja_env
 
 from ._ast_utils import parse_allowing_toplevel_return
@@ -40,7 +40,7 @@ from ._exec_guards import (
     new_owner,
 )
 from ._glob_allowlist import allows_everything
-from .base import REPL
+from .base import BaseREPL
 from .compiler import secure_compile
 from .permissions import REPLPermissionPolicy, build_allowed_builtins
 from .registry import register_repl
@@ -104,25 +104,34 @@ def _is_foreign_memory_error(e: BaseException, owner_id: object) -> bool:
     return isinstance(e, REPLMemoryError) and not is_our_memory_error(e, owner_id)
 
 
-def _propagate_if_fatal(e: BaseException, timeout_owner: object) -> Raise | None:
-    """Return a ``Raise`` for an exception that must escape the invoke, else None.
+def _reraise_if_fatal(e: BaseException, timeout_owner: object) -> None:
+    """Re-raise an exception that must escape the invoke; return for recoverable ones.
 
     Two exceptions don't become recoverable agent feedback at a REPL exec boundary:
-    a *foreign timeout* (an enclosing exec's deadline, see ``_is_foreign_timeout``) and
-    any *fatal* exception (``is_fatal`` — ``AbortError`` / internal errors /
-    ``KeyboardInterrupt`` …). Both surface as a ``Raise`` carrying the **original**
-    exception, so a fatal error stays fatal and bubbles through every enclosing invoke
-    rather than being caught as feedback at the first boundary (a subagent's abort is
-    re-classified fatal at the parent's exec boundary and keeps propagating). Anything
-    else returns ``None`` and the caller renders it as a recoverable ``Continue``.
+    a *foreign timeout / memory cap* (an enclosing exec's deadline or ceiling, see
+    ``_is_foreign_timeout`` / ``_is_foreign_memory_error``) and any *fatal* exception
+    (``is_fatal`` — ``FatalError`` / internal errors / ``KeyboardInterrupt`` …). Both
+    **re-raise** the original exception out of ``repl.exec``: the REPL-exec span closes
+    ``Failed`` with it and the exception keeps propagating out of the invoke, so a fatal
+    error stays fatal through every enclosing invoke, and a foreign timeout reaches the
+    exec that owns the deadline — which recognizes it as its own (``is_our_timeout``) and
+    renders it there as recoverable feedback. Anything else returns and the caller renders
+    it as a recoverable ``Continue``.
     """
+    # This used to RETURN a `Raise(exception=e)` result instead of re-raising — the last
+    # laundering relay of the pre-propagation abort model: every REPL boundary re-wrapped
+    # a fatal into a terminal *result*, so a child's FatalError re-entered the parent's
+    # transform pipeline (record as Completed-with-Raise, transformers get a shot) instead
+    # of unwinding past it. Re-raising is what makes FatalError containment structural
+    # (span_event_lifecycle.md stage 3); the is_fatal classification itself — including
+    # the non-negotiable abort-in-group containment rule — transfers unchanged (see
+    # ``jaz.exceptions.is_fatal``).
     if (
         _is_foreign_timeout(e, timeout_owner)
         or _is_foreign_memory_error(e, timeout_owner)
         or is_fatal(e)
     ):
-        return Raise(exception=e)
-    return None
+        raise e
 
 
 class PythonREPLConfig(TypedDict, total=False):
@@ -140,8 +149,10 @@ class PythonREPLConfig(TypedDict, total=False):
     # ["**"] = cwd subtree, ["//**"] = whole filesystem; reads/writes gated separately. No None.
     allowed_read_paths: list[str]
     allowed_write_paths: list[str]
-    # Compiler sandbox (#688). Enforced at secure_compile; the policy text is rendered into
-    # the system prompt via get_description. The compiler enforces these on every exec, but the
+    # Compiler sandbox (#688). Enforced at secure_compile on every exec. The import and file
+    # allow-lists are also stated to the agent (get_description renders them into the system
+    # prompt); the attribute allow-list is enforced silently — see the sandbox-policy comment in
+    # python_repl_description.jinja2. The
     # policy is NOT un-strippable by an agent: `repl_configs` is an ordinary config key, so a host
     # that passes `jaz.ConfigOverride` in as an input (or otherwise hands the agent a
     # config-override surface) opts into letting the agent reconfigure this sandbox for its
@@ -149,7 +160,8 @@ class PythonREPLConfig(TypedDict, total=False):
     # Uniform gitignore-glob allow-lists (imports/attributes/files), no "unrestricted"/None state:
     # key absent → the secure default; []: deny all; [...]: allow-list; ["*"]: allow all.
     allowed_imports: list[str]  # default [] (deny all); matched on the root module name
-    # default ["*", "!__*"] (allow all attrs except double-underscore-PREFIXED names); [] denies all.
+    # default DEFAULT_ALLOWED_ATTRIBUTES: allow all attrs except double-underscore-PREFIXED names
+    # and the frame-bearing interpreter surface (f_back/gi_frame/...); [] denies all.
     allowed_attributes: list[str]
     # for -R, suppress recursion (install RecursionLimit(max_depth=1) so the agent has no
     # recursive jaz.invoke)
@@ -175,28 +187,208 @@ class PythonREPLConfig(TypedDict, total=False):
 # still fails *open* for anything unenumerated. The accepted cost is that an unconfigured agent can
 # import nothing until a host opts in.
 #
-# Attributes default to ``["*", "!__*"]`` — allow every attribute EXCEPT double-underscore-prefixed
-# ones. NOTE ``__*`` is *prefix*, so it denies more than just true ``__x__`` dunders — it also
-# catches name-mangled ``__private`` attributes (leading ``__``, no trailing ``__``). That is
-# strictly safer (denies a superset), just broader than the word "dunder" implies.
+# Attributes default to ``["*", "!__*"]`` refined by the two lists below — allow every attribute
+# EXCEPT double-underscore-prefixed ones, minus the frame-bearing interpreter surface, plus three
+# inert dunders put back. NOTE ``__*`` is *prefix*, so it denies more than just true ``__x__``
+# dunders — it also catches name-mangled ``__private`` attributes (leading ``__``, no trailing
+# ``__``). That is strictly safer (denies a superset), just broader than the word "dunder" implies.
 # The dunder attribute surface (``__globals__``, ``__closure__``, ``__subclasses__``,
 # ``__mro__``, ``__dict__``, …) is the standard sandbox-escape vector; denying the whole class with
 # one gitignore-negation rule beats enumerating it (a curated denylist always misses one). This is
-# the allow-only inverse of the former ``forbidden_attributes=["__*"]`` denylist — identical
-# behavior. Cost: legitimate explicit dunder access (``obj.__class__``) is also denied by default;
-# a host widens the allow-list (e.g. ``["*"]`` to allow everything incl. dunders).
+# the allow-only inverse of the former ``forbidden_attributes=["__*"]`` denylist. A host widens the
+# allow-list (e.g. ``["*"]`` to allow everything incl. dunders) or replaces it outright.
+
+
+# Interpreter-owned attributes that hand back a *frame*, and through it the real module globals and
+# the real builtins table. They are the hole in the ``!__*`` half of the default: the dunder deny is
+# what stops ``x.__class__`` / ``__globals__`` / ``__subclasses__``, but every name here is
+# ordinary-looking and non-dunder, so a bare ``["*", "!__*"]`` allows all of them.
 #
-# KNOWN RESIDUAL (inherits #811's Known Limitations — the denylist had the same hole): this denies
-# the ``__*`` dunder surface but NOT the *non-dunder* introspection surface. Frame/generator/
-# traceback attributes — ``f_globals``, ``gi_frame``, ``cr_frame``, ``tb_frame``, ``f_back`` — match
-# ``*`` and are not re-excluded by ``!__*``, so ``getattr(gen, "gi_frame").f_globals["__builtins__"]``
-# stays reachable and ``str.format`` bypasses this getattr backstop entirely. This default is
-# deliberately permissive, NOT a tight attribute boundary — don't over-trust it as one. Because the
-# model is now allow-list based, a security-conscious host *can* close the gap (which the old
-# denylist couldn't) by appending ``!`` rules — e.g. ``["*", "!__*", "!f_globals", "!gi_frame",
-# "!cr_frame", "!tb_frame", "!f_back"]`` — or by switching to a tight positive allow-list.
-# TODO(#827): decide whether the shipped default should exclude these frame/generator names too.
-DEFAULT_ALLOWED_ATTRIBUTES: list[str] = ["*", "!__*"]
+# That is not theoretical — on the bare default this input escapes, using no dunder attribute and
+# no import:
+#
+#     def gen():
+#         yield g.gi_frame.f_back          # the frame that called next(g)
+#     g = gen()
+#     fr = next(g)
+#     while "eval" not in fr.f_builtins:   # walk out of the REPL into a real jaz module frame
+#         fr = fr.f_back
+#     fr.f_builtins["eval"]("().__class__.__mro__[-1].__subclasses__()")
+#
+# The ``eval`` recovered that way is the *real* one, so it runs a string the compiler's
+# ``AllowedAttributesChecker`` never sees — measured reaching ``(1).__class__`` and the classic
+# ``__subclasses__()`` walk. (``open``/``__import__`` in that table are still jaz's secured
+# wrappers, so the file and import allow-lists hold; what is bypassed is specifically the attribute
+# axis.)
+#
+# EXECUTIVE CALL — this closes TODO(#827) in favour of hardening the SHIPPED DEFAULT, and reverses
+# this PR's own first cut, which denied these names only in the console settings helper's sandbox
+# pin (`console._HELPER_SANDBOX_OVERRIDE`) and left the default alone as "much larger blast radius,
+# and not this pin's call to make". That scoping was wrong: the helper is the *narrow* sandbox, and
+# the general REPL — which runs arbitrary model-generated code — is the one that actually needs the
+# hole closed. Fixing it per-caller means every future sandbox re-derives the same list, and the
+# one that forgets is silently escapable. The accepted cost is repo-wide: an agent that legitimately
+# walks a frame or traceback *object* (``tb_frame``, ``f_back``) is now denied by default and needs
+# a host to widen the list.
+#
+# Scoped by REACHABILITY, and spelled out one name at a time — both narrow the deny set against the
+# obvious ``!f_*``/``!gi_*``/``!cr_*``/``!ag_*``/``!tb_*`` globs, and both are the user's call. The
+# invariant is specifically that **no non-dunder name may hand back a frame**, directly or in one
+# more hop (a generator/coroutine/traceback carries one; a code object and ``f_globals``/
+# ``f_builtins`` are the payload the walk exists to reach). Read it that narrowly: "hands back
+# something walkable" over-generalizes — ``property.fget`` hands back a function and is not denied,
+# because a function's route onward is ``__globals__``, which ``!__*`` already closes.
+# The inert names in ``_INERT_FRAME_ATTRIBUTES`` below are deliberately left
+# ALLOWED, because reading ``tb_lineno`` off a traceback is how an agent reports where its own code
+# failed and denying it buys no containment. And an explicit name denies exactly the interpreter
+# surface, where a prefix glob would also catch any *ordinary* attribute starting with those two
+# letters (a component setting, a caller's data) — blast radius that grows with code nobody has
+# written yet. Denying the whole prefix surface uniformly was the first cut, free in the settings
+# helper's sandbox (its namespace holds three strings, so no legitimate turn reads any of these) and
+# not free as a shipped default.
+#
+# The cost of enumerating is that the list does not self-extend: a future Python that adds a frame
+# attribute would be in neither list, which is why ``test_default_classifies_every_live_frame_
+# attribute`` re-derives the surface from the running interpreter and fails on anything unclassified
+# rather than letting the gap open silently. ``f_generator`` is 3.13+; listing it is harmless on
+# 3.12, where it simply never matches.
+_DENIED_FRAME_ATTRIBUTES: tuple[str, ...] = (
+    # frame objects → frame / dict / code / function
+    "!f_back",
+    "!f_builtins",
+    "!f_code",
+    "!f_generator",
+    "!f_globals",
+    "!f_locals",
+    # `f_trace` is a function; the two `f_trace_*` flags are bools, but they exist only to configure
+    # `f_trace` and this allow-list governs `setattr` too, so they stay denied as write levers.
+    "!f_trace",
+    "!f_trace_lines",
+    "!f_trace_opcodes",
+    # generators → code / frame / iterator
+    "!gi_code",
+    "!gi_frame",
+    "!gi_yieldfrom",
+    # coroutines → awaitable / code / frame
+    "!cr_await",
+    "!cr_code",
+    "!cr_frame",
+    # async generators → awaitable / code / frame
+    "!ag_await",
+    "!ag_code",
+    "!ag_frame",
+    # tracebacks → frame / traceback
+    "!tb_frame",
+    "!tb_next",
+)
+
+
+# Audited counterpart to ``_DENIED_FRAME_ATTRIBUTES``: interpreter attributes on the same objects
+# that hand back only ints, bools, or strings — nothing to walk — and are therefore left allowed by
+# ``*``. NOT part of the policy: every name here is already permitted, and listing it changes no
+# behavior. It exists so the audit is recorded and so the drift test can partition the live
+# ``f_``/``gi_``/``cr_``/``ag_``/``tb_`` surface into "denied" and "deliberately allowed" and fail on
+# anything in neither, which is what turns a new Python version's frame attribute into a red build
+# rather than a silent reopening.
+#
+# ``cr_origin`` is the one that is not a bare scalar: a tuple of ``(filename, lineno, funcname)``
+# triples (``None`` unless ``sys.set_coroutine_origin_tracking_depth`` is on). It stays allowed
+# because inertness is what this list is scoped by and strings are inert. An earlier draft denied it
+# as source-path disclosure — wrong reasoning, since ``allowed_read_paths``/``allowed_write_paths``
+# gate *opening* files and never claimed to hide path names, so there was no property to protect.
+#
+# WRITE AXIS audited too, because this allow-list governs ``setattr`` as well as reads (the same
+# asymmetry that keeps ``__class__`` out of ``_REALLOWED_DUNDERS``). Every name here is read-only in
+# CPython, so permitting it grants no write capability — ``test_inert_frame_attributes_are_readonly``
+# re-checks that against the running interpreter. The one with a caveat is ``f_lineno``: it *is*
+# settable, but only from inside a trace function (the debugger "jump" feature; otherwise
+# ``ValueError``), and installing one needs ``f_trace`` (denied here) or ``sys.settrace`` (needs an
+# import the default denies). Left allowed because denying it would cost the read case this whole
+# scoping exists to preserve, and a host that allows ``sys`` has opened far more than this.
+_INERT_FRAME_ATTRIBUTES: tuple[str, ...] = (
+    "f_lasti",
+    "f_lineno",
+    "gi_running",
+    "gi_suspended",
+    "cr_origin",
+    "cr_running",
+    "cr_suspended",
+    "ag_running",
+    "ag_suspended",
+    "tb_lasti",
+    "tb_lineno",
+)
+
+
+# Dunders re-admitted after ``!__*``, because blanket-denying every ``__*`` name costs ordinary
+# Python without buying containment. ``super().__init__(...)`` is an ``ast.Attribute`` like any
+# other, so a blanket deny makes plain subclassing a SyntaxError; ``type(x).__name__`` is likewise
+# the normal way to name a class. Both were rejected by the default before this list existed —
+# a usability bug, not a security property.
+#
+# Verified free rather than assumed free: with these three allowed, every dunder that actually
+# *reaches* something stays denied — ``__globals__``, ``__mro__``, ``__bases__``, ``__base__``,
+# ``__subclasses__``, ``__dict__``, ``__code__``, ``__self__`` — statically and through a computed
+# ``getattr(cls, "__mro__")``, so no classic escape chain reopens. What ``__init__`` hands back is a
+# slot wrapper / bound method that is inert without ``__globals__``/``__code__``/``__self__``;
+# ``__name__``/``__qualname__`` are strings whose value ``repr(type(x))`` already leaks.
+#
+# ``__class__`` is deliberately NOT here, and the reason is the read/write asymmetry rather than
+# reachability. Reading it is free to the point of redundancy — ``type()`` is already a permitted
+# builtin, so ``x.__class__`` is a second spelling of ``type(x)``. But this allow-list also governs
+# ``setattr``, so admitting the name re-enables ``obj.__class__ = Fake`` type confusion on any
+# object handed into the sandbox that lacks its own ``__setattr__`` guard. Nothing readable is
+# gained and a write capability is lost, so it stays denied.
+_REALLOWED_DUNDERS: tuple[str, ...] = (
+    "__init__",
+    "__name__",
+    "__qualname__",
+)
+
+
+# Order matters: gitignore semantics are last-match-wins, so the exclusions must follow the ``*``
+# that would otherwise re-admit them, and the re-admitted dunders must follow ``!__*`` in turn.
+# Anything placed *before* the pattern that overrides it is inert.
+#
+# KNOWN RESIDUAL (inherits #811's Known Limitations): ``str.format`` reaches attributes at the C
+# level via ``PyObject_GetAttr`` without ever calling the wrapped ``getattr``, so
+# ``"{0.__globals__}".format(fn)`` bypasses the runtime backstop entirely (read-only, and
+# un-closeable in CPython). That applies to the frame names above too — ``"{0.gi_frame}".format(g)``
+# still stringifies a frame — so the denials close the escape-to-*execution* (``format`` cannot hand
+# back a callable) without making frames unobservable. The other standing hole is not an attribute
+# name at all: a module reachable through an ordinary attribute of a host-supplied input
+# (``h.os.system(...)``) bypasses every axis, because a name allow-list cannot police what an
+# allowed name returns. This default is defense-in-depth, NOT a tight attribute boundary —
+# genuinely untrusted code needs OS/process isolation; don't over-trust this as a substitute.
+DEFAULT_ALLOWED_ATTRIBUTES: list[str] = [
+    "*",
+    "!__*",
+    *_DENIED_FRAME_ATTRIBUTES,
+    *_REALLOWED_DUNDERS,
+]
+
+
+# The default's WRITE axis: the same list without the re-admissions, so `!__*` denies those three
+# again for `setattr`/`delattr` and `obj.attr = ...`/`del obj.attr`.
+#
+# EXECUTIVE CALL — the read/write split exists because re-admitting `_REALLOWED_DUNDERS` on both
+# axes would hand agent code a write lever it never needed. `type(host).__init__ = agent_fn` is
+# accepted when the name is writable, and classes are process-global, so the patched constructor
+# outlives the exec and is visible to later invokes under different policies; `delattr` of it and
+# renaming via `__name__` are the same shape. Ordinary method patching (`type(host).greet = ...`)
+# was already reachable under a bare `["*", "!__*"]`, so the new exposure is specifically the
+# constructor, its deletion, and the class's reported name — small, but the re-admission was for
+# `super().__init__(...)` and `type(x).__name__`, both of which are READS. Splitting buys the read
+# fix with no write cost, which is what the widening was actually for.
+#
+# A host-supplied `allowed_attributes` governs BOTH axes: this split is a property of the default's
+# re-admission, not a general policy, and a host that writes its own list has said what it wants —
+# silently subtracting from it would be the surprise. So `["*"]` still allows dunder writes.
+DEFAULT_ALLOWED_WRITE_ATTRIBUTES: list[str] = [
+    "*",
+    "!__*",
+    *_DENIED_FRAME_ATTRIBUTES,
+]
 
 
 def _effective_allowed_attributes(config: PythonREPLConfig) -> list[str]:
@@ -319,6 +511,35 @@ def _effective_allowed_imports(config: PythonREPLConfig) -> list[str]:
 _DEFAULT_ALLOWED_READ_PATHS: list[str] = []
 _DEFAULT_ALLOWED_WRITE_PATHS: list[str] = []
 
+# WIDENING THESE REACHES ~/.jaz. The lists REPLACE the default rather than merging with it, and the
+# patterns are gitwildmatch, whose `*`/`**` match dotted segments (unlike shell globs) — so a grant
+# as ordinary as `["~/**"]` includes `~/.jaz/credentials.json` and `~/.jaz/settings.json` without
+# ever naming them. Exclude them with a trailing negation if that is not what you meant:
+#
+#     allowed_read_paths=["~/**", "!~/.jaz/**"]
+#
+# EXECUTIVE CALL (user, 2026-08-15) — this is ADVICE, not enforcement. A deny of `~/.jaz` checked
+# ahead of these lists, which no allow-list could grant, was implemented and then reverted (#1047).
+# Two reasons, and NEITHER is that the deny was leaky — it would be reverted just the same if it were
+# enforced below the `open()` wrapper and airtight, because the objection is to the behaviour rather
+# than to its reach:
+#
+#  1. THE ALLOW-LIST IS AUTHORITATIVE. Its entire contract is that what it grants is granted. A
+#     hidden denial silently subtracting from an explicit grant is the failure we refuse to ship:
+#     someone who allows a path and finds it still denied cannot reason about the policy they wrote,
+#     and has no way to discover the subtraction from the config surface. Being wrong in the
+#     permissive direction is the author's to fix, and the negation above is how; being wrong in the
+#     restrictive direction is ours, and it is undebuggable from where the user is standing.
+#  2. IT MATCHES THE CLOSEST PRECEDENT. Claude Code protects nothing on the READ side of its own
+#     `~/.claude` — its hardcoded protected-path list covers writes only, degrades to a prompt
+#     rather than a veto, and is lifted entirely in `bypassPermissions`. So on Linux, where its
+#     OAuth token sits in `~/.claude/.credentials.json`, an explicit broad grant does include the
+#     credentials. That is the accepted behaviour of a mature agent CLI, not an oversight.
+#
+# If credentials should survive a broad grant, the answer is to keep them out of a readable file
+# (OS keyring, #1076) — which is exactly what Claude Code relies on for its own — not to make the
+# allow-list mean something other than what it says.
+
 
 def _effective_allowed_read_paths(config: PythonREPLConfig) -> list[str]:
     """Read-path gitignore allowlist, fail-closed by default (absent key → deny all reads).
@@ -366,88 +587,6 @@ def _make_print(output: StringIO):
             print(*args, sep=sep, end=end, file=output, flush=flush)
 
     return custom_print
-
-
-# --- Sandbox policy prompt text ---
-# The agent-facing descriptions of the compiler sandbox (#688). These describe the REPL to
-# the model, so they live here with the REPL's `get_description`, not in `compiler` (which
-# owns the enforcement — the matching `secure_compile` checkers).
-#
-# Wording note (#518): a violation is recoverable, not fatal — secure_compile raises
-# (ImportError / SyntaxError), or secure_open raises SandboxPermissionError at runtime; all are
-# ``Exception``-rooted, so the REPL's exec boundary renders them as a recoverable ``Continue``
-# (``is_fatal`` escalates only what is rooted outside ``Exception``, plus ``AbortError``; none of
-# these are either). So these prompts just state the
-# error plainly ("... raises an ImportError.") rather than "fail the task": the old wording
-# overstated the consequence, and naming the error is enough without editorializing about it.
-
-
-def import_constraint_prompt(allowed_imports: Sequence[str]) -> str:
-    """Agent-facing system-prompt text describing the import allow-list.
-
-    Always rendered (imports are always policed): ``[]`` ⇒ ban all, ``["*"]`` ⇒ any module, else
-    the gitignore-style allow-list (matched on the root module name)."""
-    if allows_everything(allowed_imports):
-        return "- You may import any Python module."
-    if not allowed_imports:
-        return (
-            "- You are NOT allowed to import any Python modules.\n"
-            "  Importing anything raises an ImportError."
-        )
-    allowed_str = ", ".join(map(backtickify, allowed_imports))
-    return (
-        "- You may ONLY import Python modules whose name matches:\n"
-        f"  {allowed_str}\n"
-        "  Importing anything else raises an ImportError."
-    )
-
-
-def allowed_attributes_prompt(allowed_attributes: Sequence[str]) -> str:
-    """Agent-facing system-prompt text describing the attribute allow-list.
-
-    Always rendered (attribute access is always policed). ``["*"]`` ⇒ no restriction (no text);
-    ``[]`` ⇒ all attribute access banned; otherwise the gitignore-style allow-list, where a
-    ``!pat`` entry re-excludes (the default ``["*", "!__*"]`` reads as "everything except double-
-    underscore-prefixed names" — dunders AND name-mangled ``__private`` attrs, since ``__*`` is a
-    prefix match).
-    """
-    if allows_everything(allowed_attributes):
-        return ""
-    if not allowed_attributes:
-        return (
-            "- You may NOT access any attributes (``obj.attr``) of any object.\n"
-            "  Any attribute access raises a SyntaxError."
-        )
-    allowed_str = ", ".join(map(backtickify, allowed_attributes))
-    return (
-        "- You may only access attributes matching these gitignore-style patterns on ANY object "
-        "(`*` = any name, a leading `!` excludes):\n"
-        f"  {allowed_str}\n"
-        "  Accessing any other attribute raises a SyntaxError."
-    )
-
-
-def file_access_prompt(
-    allowed_read_paths: Sequence[str], allowed_write_paths: Sequence[str]
-) -> str:
-    """Agent-facing text describing the file read/write allowlists.
-
-    Always rendered — file access is always policed, so an empty list is a real statement ("you
-    may not read/write any files"), not "no policy". Patterns are gitignore-style globs anchored
-    per ``secure_open`` (``//`` filesystem, ``~/`` home, ``/`` & ``./`` cwd, bare cwd; a slash
-    anchors, a slash-less name recurses)."""
-
-    def _line(verb: str, patterns: Sequence[str]) -> str:
-        if not patterns:
-            return f"- You may NOT {verb} any files."
-        pats = ", ".join(map(backtickify, patterns))
-        return f"- You may only {verb} files whose path matches: {pats}"
-
-    return (
-        f"{_line('read', allowed_read_paths)}\n"
-        f"{_line('write', allowed_write_paths)}\n"
-        "  Any other file access raises a SandboxPermissionError."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -564,15 +703,15 @@ class _NativeReturnRaiseTransformer(ast.NodeTransformer):
 
 
 def _reraise_first_abort() -> None:
-    """Re-raise the ``AbortError`` leaf of the in-flight ``except*`` group, *bare*.
+    """Re-raise the ``FatalError`` leaf of the in-flight ``except*`` group, *bare*.
 
     Why not a plain ``raise``: inside an ``except*`` handler that re-raises the enclosing
     ``ExceptionGroup``, so the ``Raise`` the exec boundary produces would carry the *wrapper*.
     Fatality would still be detected — :func:`~jaz.exceptions.is_fatal` treats a group holding
-    an ``AbortError`` as fatal — but the exception object is carried onward from there to hooks
-    and out of ``jaz.invoke()``, where ``except AbortError`` must match. Against a group it does
-    not (measured: ``isinstance(group, AbortError)`` is ``False``), which would defeat the whole
-    reason ``AbortError`` was re-rooted under ``Exception``. So this is about preserving the
+    an ``FatalError`` as fatal — but the exception object is carried onward from there to hooks
+    and out of ``jaz.invoke()``, where ``except FatalError`` must match. Against a group it does
+    not (measured: ``isinstance(group, FatalError)`` is ``False``), which would defeat the whole
+    reason ``FatalError`` was re-rooted under ``Exception``. So this is about preserving the
     exception's *type* across the public boundary, not about classification.
 
     Reads the group from ``sys.exc_info()`` rather than taking it as an argument so the
@@ -588,7 +727,7 @@ def _reraise_first_abort() -> None:
         current = stack.pop(0)
         if isinstance(current, BaseExceptionGroup):
             stack.extend(current.exceptions)
-        elif isinstance(current, AbortError):
+        elif isinstance(current, FatalError):
             raise current
     if exc is not None:  # pragma: no cover - the guard only matches when a leaf exists
         raise exc
@@ -601,7 +740,7 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
 
     * **Defense A** — insert, as the *first* handlers, ``except <return_signal cookie>: raise`` and
       ``except <abort cookie>: raise``. The cookies substitute to ``_JazReturnSignal`` and
-      :class:`~jaz.exceptions.AbortError`, so a top-level ``return`` — or an abort raised by a tool
+      :class:`~jaz.exceptions.FatalError`, so a top-level ``return`` — or an abort raised by a tool
       the agent called — that unwinds through this ``try`` is re-raised *before* any of the agent's
       own handlers run. This holds even against an ``except BaseException:`` the agent writes using a
       ``BaseException`` reference handed in as an *input* (the builtins allowlist withholds the name,
@@ -609,9 +748,9 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
       un-swallowable regardless of what the agent can name. The cookie (not an ``ast.Name``) is what
       makes the reference itself un-shadowable and un-nameable — see ._cookies.
 
-      ``AbortError`` needs Defense A specifically because it is ``Exception``-rooted: unlike
+      ``FatalError`` needs Defense A specifically because it is ``Exception``-rooted: unlike
       ``_JazReturnSignal`` it is *not* excluded by Defense B's narrowing to ``Exception``, and its
-      base class no longer protects it. See :class:`~jaz.exceptions.AbortError` for that call.
+      base class no longer protects it. See :class:`~jaz.exceptions.FatalError` for that call.
 
     * **Defense B** — rewrite a bare ``except:`` to ``except <exception cookie>:`` (cookie ->
       the real ``Exception``). This narrows the catch to ``Exception``-rooted errors, so a bare
@@ -625,7 +764,7 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
     ``ast.TryStar`` (``try/except*``) gets an **abort guard only** (:meth:`visit_TryStar`). For
     ``_JazReturnSignal`` no guard is needed: ``except*`` cannot be bare (nothing for Defense B to
     narrow) and cannot catch a naked ``BaseException``-rooted exception, so the finish sentinel is
-    immune by construction. That reasoning does *not* extend to ``AbortError``, which is
+    immune by construction. That reasoning does *not* extend to ``FatalError``, which is
     ``Exception``-rooted — ``except*`` wraps a lone exception in an implicit ``ExceptionGroup`` and
     matches it, so an unguarded ``try: <aborting call> except* Exception:`` swallowed an abort while
     naming only the allowlisted ``Exception``.
@@ -633,29 +772,29 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
     Two facts make the guard work, both non-obvious enough to be worth stating:
 
     * ``except*`` clauses **consume** the part of the group they match, and a later clause is offered
-      only the remainder. Position 0 therefore takes the ``AbortError`` out before the agent's
+      only the remainder. Position 0 therefore takes the ``FatalError`` out before the agent's
       ``except* Exception`` is considered. (It is *not* that only the first clause runs — later
-      clauses do run, on what is left; a group of ``[AbortError, ValueError]`` runs both.)
+      clauses do run, on what is left; a group of ``[FatalError, ValueError]`` runs both.)
     * The guard body calls :func:`_reraise_first_abort` rather than a plain ``raise``, so what
       reaches the exec boundary is the abort *leaf*, not the ``ExceptionGroup`` wrapper. This is
       about the exception's **type surviving to the caller** — a wrapper is still classified fatal
-      by ``is_fatal``, but ``except AbortError`` around ``jaz.invoke()`` would not match it.
+      by ``is_fatal``, but ``except FatalError`` around ``jaz.invoke()`` would not match it.
 
     Residual, and irreducible in ``except*`` semantics: when the abort is bundled with unhandled
     exceptions (an ``asyncio.TaskGroup``, say), ``except*`` re-combines the guard's re-raise with the
     remainder, so a group can still reach the boundary. That case is covered on the classification
-    side — :func:`~jaz.exceptions.is_fatal` treats a group containing an ``AbortError`` at any depth
+    side — :func:`~jaz.exceptions.is_fatal` treats a group containing an ``FatalError`` at any depth
     as fatal — and the two halves cover *different* failures rather than overlapping: the guard keeps
     the agent's clause from consuming the abort at all (nothing would reach the boundary to
     classify), and the group rule keeps a bundled abort fatal once it does.
 
-    Two signals are guarded here (``_JazReturnSignal`` and ``AbortError``). The remaining
+    Two signals are guarded here (``_JazReturnSignal`` and ``FatalError``). The remaining
     must-not-swallow signals are handled differently by design: ``KeyboardInterrupt`` /
     ``SystemExit`` / ``GeneratorExit`` / ``CancelledError`` are absent from the default builtins, so
     the agent can only name — and thus only catch — one when a caller *explicitly* passes it in,
     which is read as intent to let the agent handle it; ``REPLTimeoutError`` is deferred (its
     ``Exception`` rooting makes it catchable by a plain ``except Exception:``, so it needs its own
-    treatment, handled separately). ``AbortError`` is *not* in that group: it is reachable via the
+    treatment, handled separately). ``FatalError`` is *not* in that group: it is reachable via the
     allowlisted ``Exception`` with no caller cooperation, which is why it is force-guarded rather
     than left to the builtins allowlist.
     """
@@ -700,7 +839,7 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
         # `_JazReturnSignal` is still immune by construction.
         #
         # Position 0 matters because `except*` clauses CONSUME the part of the group they match:
-        # a later clause is offered only the remainder. So this guard takes the AbortError out
+        # a later clause is offered only the remainder. So this guard takes the FatalError out
         # before the agent's `except* Exception` is considered, and that clause never sees it.
         # (Not "only the first clause runs" — later clauses do run, on what is left.)
         #
@@ -727,7 +866,7 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
 
 
 @register_repl("python")
-class PythonREPL(REPL):
+class PythonREPL(BaseREPL):
     """REPL implementation that enforces compile-time safety policies.
 
     Uses native ``return`` / ``raise`` semantics: a top-level ``return`` / ``raise`` statement
@@ -742,27 +881,31 @@ class PythonREPL(REPL):
     """
 
     repl_state_locals: dict[str, object]
-    jaz_library: Library | None
+    invoke_tool: InvokeTool | None
     session_id: str | None
     allow_raise: bool
     allowed_imports: list[str]
     allowed_attributes: list[str]
 
-    # PythonREPL surfaces __repl_history__ in its namespace (see base REPL).
+    # PythonREPL surfaces __history__ in its namespace (see base REPL).
     maintains_repl_history = True
 
     @property
     def description(self) -> str:
         """Return the appropriate description based on configuration.
 
-        Passes what ``get_description`` reads: the template name, the sandbox allow-lists that feed
-        the appended policy text, and the three *live core variables* ``get_description`` injects —
-        ``allow_raise``, ``exec_timeout`` and ``allow_timeout_pragma`` (#898). All must be forwarded
-        from the instance here: without them the render falls back to the constructor defaults, so
-        an ``allow_raise=False`` REPL would still describe ``raise``, a re-timed one would quote
-        30 s, and one with the pragma disabled would still offer it — in each case disagreeing with
-        both enforcement and ``get_description(repl_config)``.
+        Passes what ``get_description`` reads: the template name and every *live core variable* it
+        injects — ``allow_raise``, ``exec_timeout``, ``allow_timeout_pragma`` and the two
+        described sandbox allow-lists (imports, file read/write). All must be forwarded from the
+        instance here: without them the render falls back to the constructor defaults, so an
+        ``allow_raise=False`` REPL would still describe ``raise``, a re-timed one would quote 30 s,
+        one with the pragma disabled would still offer it, and one granted imports or file access
+        would still tell the agent it has none — in each case disagreeing with both enforcement and
+        ``get_description(repl_config)``.
         """
+        # ``allowed_attributes`` is deliberately NOT forwarded: it is enforced (secure_compile +
+        # the getattr backstops) but no longer described, so passing it would only mislead a reader
+        # into thinking the description reflects it. See the template's sandbox-policy comment.
         return self.get_description(
             PythonREPLConfig(
                 repl_description_template=self.repl_description_template,
@@ -770,7 +913,8 @@ class PythonREPL(REPL):
                 exec_timeout=self.exec_timeout,
                 allow_timeout_pragma=self.allow_timeout_pragma,
                 allowed_imports=self.allowed_imports,
-                allowed_attributes=self.allowed_attributes,
+                allowed_read_paths=self.allowed_read_paths,
+                allowed_write_paths=self.allowed_write_paths,
             )
         )
 
@@ -789,48 +933,57 @@ class PythonREPL(REPL):
             The appropriate REPL description string.
 
         Prompt prose is config-driven, but core renders the template with only *core-owned* vars.
-        Three qualify here — ``allow_raise``, ``exec_timeout`` and ``allow_timeout_pragma`` —
-        because core owns and enforces all three, and a description that disagreed with enforcement
-        would be a bug (offering ``raise`` as a finish when the REPL forbids it; quoting a
-        wall-clock bound the exec does not apply; offering an override the REPL ignores).
-        So core injects the effective values into the render. This makes the core default template
-        (``python_repl_description.jinja2``, gated on ``{% if allow_raise %}``) coherent for a
-        direct, non-eval ``jaz.invoke`` caller who sets them via ``repl_configs`` (#898).
+        Five qualify here — ``allow_raise``, ``exec_timeout``, ``allow_timeout_pragma`` and the
+        sandbox allow-lists ``allowed_imports`` / ``allowed_read_paths`` / ``allowed_write_paths``
+        (one var each, the last two being the two halves of file access) — because core owns and
+        enforces all of them, and a description that disagreed with enforcement would be a bug
+        (offering ``raise`` as a finish when the REPL forbids it; quoting a wall-clock bound the
+        exec does not apply; offering an override the REPL ignores; promising imports or files the
+        sandbox denies). So core injects the effective values into the render. This makes the core
+        default template (``python_repl_description.jinja2``, gated on ``{% if allow_raise %}``)
+        coherent for a direct, non-eval ``jaz.invoke`` caller who sets them via ``repl_configs``.
         The *hook-owned* feature flags (repl_history, exposed inputs, return restriction, …) are an
         eval-configuration concern and are **baked** into the evals description meta-template at
-        config time (the harness's ``bake_template``, #898/#912) — never passed at render time. Core
+        config time (the harness's ``bake_template``) — never passed at render time. Core
         deliberately has no generic vars escape hatch: a template that references an unbaked toggle
         raises here (``_jinja_env`` is StrictUndefined), by design.
         """
+        # The sandbox text used to be *appended* here by three prompt-building helpers, to whatever
+        # template was configured; it now lives inside the template, which is what makes that
+        # template the whole description rather than most of it. Two consequences, both accepted
+        # (user's call) and both spelled out in full in the `{# Sandbox policy #}` comment in
+        # python_repl_description.jinja2: a configured `repl_description_template` (the evals
+        # variants) no longer inherits the policy text, and `allowed_attributes` is described
+        # nowhere — so `_effective_allowed_attributes` feeds enforcement only.
         config = config or {}
         template_name = config.get(
             "repl_description_template", _DEFAULT_REPL_DESCRIPTION_TEMPLATE
         )
         template = _jinja_env.get_template(template_name)
-        # allow_raise, exec_timeout and allow_timeout_pragma are the live core variables (see
-        # docstring): supply the effective values so the otherwise flag-free core default reflects
-        # them for direct callers. Every other var a configured (evals) template needs is baked in
-        # at config time, so nothing else here. Each falls back to the constructor default, not to
-        # a second literal — `get_description` is a classmethod that may be called with no config
-        # at all, and the number it quotes must be the one an unconfigured REPL would enforce.
-        rendered = template.render(
+        # The live core variables (see docstring): supply the effective values so the otherwise
+        # flag-free core default reflects them for direct callers. Every other var a configured
+        # (evals) template needs is baked in at config time, so nothing else here. Each falls back
+        # to the constructor default, not to a second literal — `get_description` is a classmethod
+        # that may be called with no config at all, and what it states must be what an unconfigured
+        # REPL would enforce; for the allow-lists that is what the `_effective_*` helpers return.
+        #
+        # `allows_everything` rides along as a callable rather than being applied here and passed as
+        # a bool, so the template asks the shared predicate (_glob_allowlist) instead of re-spelling
+        # "is this trivially allow-all?" in Jinja. Note what that predicate is: a CONSERVATIVE check
+        # for the two canonical spellings (`["*"]`/`["**"]`), not an enforcement-side notion of
+        # allow-all — enforcement has none, it just runs the matcher. So any other allow-all
+        # spelling (`["*", "*"]`, `["**/*"]`) is printed as a literal allow-list while enforcement
+        # allows everything. Sound in the safe direction only: the agent under-uses a permission it
+        # has, never the reverse.
+        return template.render(
             allow_raise=config.get("allow_raise", True),
             exec_timeout=config.get("exec_timeout", _DEFAULT_EXEC_TIMEOUT),
             allow_timeout_pragma=config.get("allow_timeout_pragma", True),
+            allowed_imports=_effective_allowed_imports(config),
+            allowed_read_paths=_effective_allowed_read_paths(config),
+            allowed_write_paths=_effective_allowed_write_paths(config),
+            allows_everything=allows_everything,
         )
-        # Append the compiler-sandbox policy text (#688) so it reaches the system prompt. Every
-        # axis is now an always-policed allow-list; each helper renders the right text (and returns
-        # '' for the trivially-allow-all case, so it's filtered out below). These describe the REPL
-        # to the agent, so they live here (with the REPL) rather than in ``compiler`` (enforcement).
-        sandbox_parts = [
-            import_constraint_prompt(_effective_allowed_imports(config)),
-            allowed_attributes_prompt(_effective_allowed_attributes(config)),
-            file_access_prompt(
-                _effective_allowed_read_paths(config),
-                _effective_allowed_write_paths(config),
-            ),
-        ]
-        return "\n\n".join([rendered, *[p for p in sandbox_parts if p]])
 
     @override
     def get_finish_command_hint(self) -> str:
@@ -977,10 +1130,10 @@ class PythonREPL(REPL):
         allowed_write_paths: list[str] | None = None,
         traceback_verbosity: TracebackVerbosity | str = TracebackVerbosity.ALL,
     ) -> None:
-        """Configure a REPL. The result is **not yet usable** — call :meth:`initialize` first.
+        """Configure a REPL. The result is **not yet usable** — call :meth:`~PythonREPL.initialize` first.
 
         Construction takes only *configuration*; the per-invoke state (inputs, the library
-        binding, the session id, the history list) is supplied by :meth:`initialize`.
+        binding, the session id, the history list) is supplied by :meth:`~PythonREPL.initialize`.
 
         Arguments:
             exec_timeout: Per-exec wall-clock bound in seconds (None = no timeout).
@@ -1001,8 +1154,10 @@ class PythonREPL(REPL):
             allowed_imports: Import allow-list. ``None`` applies the fail-closed default
                 (deny all); ``["*"]`` is the explicit allow-all.
             allowed_attributes: Attribute allow-list. ``None`` applies the secure default.
-            allowed_read_paths / allowed_write_paths: gitignore-style globs for file access.
-                ``None`` applies the fail-closed default (deny all).
+            allowed_read_paths: gitignore-style globs for file reads. ``None`` applies
+                the fail-closed default (deny all).
+            allowed_write_paths: gitignore-style globs for file writes. ``None`` applies
+                the fail-closed default (deny all).
             traceback_verbosity: How much of the error traceback the agent sees, a
                 :class:`TracebackVerbosity` (or its str value). The REPL's engine
                 frames above the agent's code are always stripped; this controls
@@ -1084,6 +1239,14 @@ class PythonREPL(REPL):
             if allowed_attributes is None
             else allowed_attributes
         )
+        # Derived, not a constructor parameter: the read/write split exists to undo the *default's*
+        # dunder re-admission on the write axis, so a host that states its own `allowed_attributes`
+        # gets that one list on both axes rather than a silent subtraction it never asked for.
+        self.allowed_write_attributes = (
+            list(DEFAULT_ALLOWED_WRITE_ATTRIBUTES)
+            if allowed_attributes is None
+            else self.allowed_attributes
+        )
         self.allowed_read_paths = (
             list(_DEFAULT_ALLOWED_READ_PATHS)
             if allowed_read_paths is None
@@ -1098,7 +1261,7 @@ class PythonREPL(REPL):
         # initialized REPL has the attributes (empty) rather than raising AttributeError from
         # somewhere far from the missing `initialize()` call.
         self.repl_state_locals: dict[str, object] = {}
-        self.jaz_library: Library | None = None
+        self.invoke_tool: InvokeTool | None = None
         self.session_id: str | None = None
         try:
             self.traceback_verbosity = TracebackVerbosity(traceback_verbosity)
@@ -1124,7 +1287,7 @@ class PythonREPL(REPL):
     def initialize(
         self,
         inputs: dict[str, object],
-        jaz_library: Library | None,
+        invoke_tool: InvokeTool | None,
         allowed_builtins: dict[str, object] | None = None,
         session_id: str = "",
         initial_repl_history: list[object] | None = None,
@@ -1133,16 +1296,16 @@ class PythonREPL(REPL):
 
         Takes only the *invoke-time* arguments — everything here belongs to one run rather than
         to the REPL's configuration, which was fixed at construction. Builds the namespace
-        (``__builtins__`` under this REPL's sandbox policy, ``__inputs__``, ``__repl_history__``,
+        (``__builtins__`` under this REPL's sandbox policy, ``__inputs__``, ``__history__``,
         and a binding per input) on a copy, leaving the receiver a clean, reusable template.
 
         Arguments:
             inputs: The invoke's inputs, already payload-resolved (see ``jaz.inputs``).
-            jaz_library: The JAZ Library bound in the REPL, or None.
+            invoke_tool: The recursive sub-invoke primitive to bind as ``invoke``, or None.
             allowed_builtins: Extra builtins to seed before the sandbox policy is applied.
             session_id: Unique session identifier for linecache filenames.
             initial_repl_history: The list object the driver owns and surfaces as
-                ``__repl_history__``, or None to start a fresh empty one.
+                ``__history__``, or None to start a fresh empty one.
         """
         # This used to bind onto `self` and return it, which made the object single-use: calling
         # it twice silently replaced the first run's namespace, library binding and session id.
@@ -1154,8 +1317,11 @@ class PythonREPL(REPL):
             allowed_write_paths=self.allowed_write_paths,
             allowed_imports=self.allowed_imports,
             # Drives the runtime getattr/hasattr/setattr/delattr/vars backstops, which apply the
-            # same allow-list the static AllowedAttributesChecker enforces on literal access.
+            # same allow-lists the static AllowedAttributesChecker enforces on literal access —
+            # including the read/write split, or `setattr(type(host), "__init__", ...)` would walk
+            # straight past a static checker that only sees `obj.attr = ...`.
             allowed_attributes=self.allowed_attributes,
+            allowed_write_attributes=self.allowed_write_attributes,
         )
         allowed_builtins = build_allowed_builtins(
             base_builtins=allowed_builtins,
@@ -1209,10 +1375,10 @@ class PythonREPL(REPL):
         # config-set description.
         allowed_builtins["__inputs__"] = inputs.copy()
 
-        # __repl_history__ is ALWAYS present in the REPL state and owned by the core agent loop
+        # __history__ is ALWAYS present in the REPL state and owned by the core agent loop
         # (the single writer of iteration entries) — the former `repl_history` on/off flag was
         # removed (#568): history now lives in the core unconditionally, and "history off" is a
-        # HOOK (DisableREPLHistory, in evals/) that emits a DropVariables({"__repl_history__"})
+        # HOOK (DisableREPLHistory, in evals/) that emits a DropVariables({"__history__"})
         # effect so the binding is removed each turn and agent access raises NameError; the prompt
         # omits the mention via a config-set description (no core `repl_history` flag). The
         # driver builds the list (starting empty — there is no index-0 init snapshot anymore, #568;
@@ -1222,13 +1388,18 @@ class PythonREPL(REPL):
         # ``design/design_features/basics.md``.
         # An empty list is the whole initial history — there is no index-0 init snapshot (#568):
         # the old ``REPLHistoryInit(inputs)`` duplicated ``__inputs__`` and leaked withheld inputs.
-        allowed_builtins["__repl_history__"] = (
+        allowed_builtins["__history__"] = (
             initial_repl_history if initial_repl_history is not None else []
         )
 
         init_repl_state_locals: dict[str, object] = {"__builtins__": allowed_builtins}
-        if jaz_library is not None:
-            jaz_library.add_self_to_program_state(init_repl_state_locals)
+        # Bound under the bare name `invoke` — there is no `jaz` namespace wrapping it (see
+        # jaz._invoke_tool). Deliberately bound BEFORE the inputs below, so an input literally
+        # named `invoke` shadows the primitive rather than being refused. That ordering predates
+        # this change (an input named `jaz` shadowed the namespace the same way); the bare name
+        # only makes the collision likelier, and which names a host may pass is the host's call.
+        if invoke_tool is not None:
+            init_repl_state_locals["invoke"] = invoke_tool
         # Always bind the inputs as REPL variables (#568); WithholdInputsFromREPL drops them.
         # TODO(#927): unlike the AddInputs/AddVariables effect path (which raises SandboxKeyError on
         # __builtins__), this top-level bind does not refuse a caller-passed __builtins__ input, so
@@ -1265,17 +1436,18 @@ class PythonREPL(REPL):
         # which walks `__dict__` and so also catches whatever mutable attribute is added next.
         #
         # TODO(#1058): this per-attribute care is the cost of keeping per-invoke state on the REPL
-        # at all. Making `REPL` stateless and threading an explicit `REPLState` removes the whole
+        # at all. Making `BaseREPL` stateless and threading an explicit `REPLState` removes the whole
         # class of hazard rather than guarding it — the intended end state; this is the cheap
         # approximation until then.
         new._tagged_raises = []
         new.allowed_imports = list(self.allowed_imports)
         new.allowed_attributes = list(self.allowed_attributes)
+        new.allowed_write_attributes = list(self.allowed_write_attributes)
         new.allowed_read_paths = list(self.allowed_read_paths)
         new.allowed_write_paths = list(self.allowed_write_paths)
 
         new.repl_state_locals = init_repl_state_locals
-        new.jaz_library = jaz_library
+        new.invoke_tool = invoke_tool
         new.session_id = session_id
         return new
 
@@ -1350,7 +1522,7 @@ class PythonREPL(REPL):
         (the exec locals/globals) then ``__builtins__``. So to make a name *genuinely*
         undefined we ``pop`` it from **both** — invoke inputs live at the top level
         (``init_repl_state_locals.update(inputs)``), while framework magics like
-        ``__repl_history__`` / ``__inputs__`` live inside ``__builtins__``.
+        ``__history__`` / ``__inputs__`` live inside ``__builtins__``.
 
         Dropping a name that is **not bound** raises ``MissingDropTargetError`` — a drop of an
         absent name is a hook bug (a typo, or a "re-drop every turn" pattern that should be
@@ -1366,7 +1538,7 @@ class PythonREPL(REPL):
         sandbox (#688/#690), and unbinding the dict would strip import/attribute/builtins
         policy. (Composition raises ``SandboxKeyError`` on it before reaching here, so via the effect
         path this never runs; this ``continue`` is a defensive backstop.) Removing an individual
-        *key inside* ``__builtins__`` (e.g. ``__repl_history__``) is fine — it only hides that
+        *key inside* ``__builtins__`` (e.g. ``__history__``) is fine — it only hides that
         name, it does not disable the sandbox.
         """
         # ``__builtins__`` is always our sandbox dict (``allowed_builtins``, set at REPL init and
@@ -1450,10 +1622,10 @@ class PythonREPL(REPL):
         jar.seed("return_signal", _JazReturnSignal)
         jar.seed("tag_raise", self._tag_raise)
         jar.seed("exception", Exception)
-        # AbortError is Exception-rooted, so Defense B's narrowing to `Exception` does NOT
+        # FatalError is Exception-rooted, so Defense B's narrowing to `Exception` does NOT
         # protect it and its base class no longer does either — the cookie guard is what keeps
-        # the agent's own handlers from swallowing an abort. See jaz.exceptions.AbortError.
-        jar.seed("abort", AbortError)
+        # the agent's own handlers from swallowing an abort. See jaz.exceptions.FatalError.
+        jar.seed("abort", FatalError)
         jar.seed("reraise_abort", _reraise_first_abort)
         _NativeReturnRaiseTransformer(allow_raise=self.allow_raise, jar=jar).visit(tree)
         _ExceptGuardTransformer(jar).visit(tree)
@@ -1487,6 +1659,7 @@ class PythonREPL(REPL):
                 allow_top_level_await=allow_top_level_await,
                 allowed_imports=self.allowed_imports,
                 allowed_attributes=self.allowed_attributes,
+                allowed_write_attributes=self.allowed_write_attributes,
                 cookie_jar=jar,
                 tree=tree,
             )
@@ -1504,17 +1677,16 @@ class PythonREPL(REPL):
 
     def _native_exception_result(
         self, e: BaseException, string_io: StringIO, timeout_owner: object
-    ) -> Continue | Raise:
+    ) -> Continue:
         """ExecResult for a non-signal exception from native-return exec (shared sync/async).
 
         A foreign (outer) timeout or fatal exception cannot become a Continue the
-        inner agent reacts to: surface it as a ``Raise`` (via ``_propagate_if_fatal``)
-        so the sub-invoke terminates and the exception propagates to the parent exec that
-        owns the deadline. Everything else is recoverable feedback.
+        inner agent reacts to: it **re-raises** out of ``exec`` (via ``_reraise_if_fatal``),
+        so the sub-invoke's spans close and the exception propagates to the parent exec
+        that owns the deadline (or, for a fatal, past every agent). Everything else is
+        recoverable feedback.
         """
-        abort = _propagate_if_fatal(e, timeout_owner)
-        if abort is not None:
-            return abort
+        _reraise_if_fatal(e, timeout_owner)
         formatted_output = self._format_error(e, string_io.getvalue())
         return Continue(
             output=formatted_output,
@@ -1613,7 +1785,7 @@ class PythonREPL(REPL):
         return f"<repl_{input_id}>"
 
     # Pre-execution REPL-input validation moved to the ValidateREPLInput hook (#528): it
-    # runs the validator at REPLExecEnter and supplies an OverrideResult (skipping exec) on
+    # runs the validator at REPLExecSend and supplies a SupplyExecResult (skipping exec) on
     # rejection — the effect-path equivalent of the old _validate_input short-circuit here.
 
     def _resolve_timeout(
@@ -1669,7 +1841,7 @@ class PythonREPL(REPL):
         # ---- Execute ----
         # Tag this exec's deadline (new_owner) so a foreign (outer) timeout firing inside a
         # nested invoke stays distinguishable from our own - see _native_exception_result /
-        # _propagate_if_fatal.
+        # _reraise_if_fatal.
         timeout_owner = new_owner()
         string_io = StringIO()
         self._tagged_raises = []  # reset per exec; populated by _tag_raise during the run
@@ -1745,38 +1917,43 @@ class PythonREPL(REPL):
         Runs the Python code in the REPL. A top-level ``return`` statement exits the REPL
         with that return value; a top-level ``raise`` (when ``allow_raise``) exits with that
         exception. If an error occurs during execution, the error is captured and returned
-        back into the REPL, with result category ERROR.
+        back into the REPL as a recoverable :class:`~jaz.repl.Continue` — except a *fatal*
+        exception (:class:`~jaz.exceptions.FatalError`, non-``Exception`` signals) or an
+        enclosing exec's timeout/memory breach, which **re-raises** out of this call so it
+        propagates out of the invoke (see ``_reraise_if_fatal``).
 
         The input sets its own wall-clock bound with a ``# timeout: <seconds>`` comment among the
         lines that open it (before any code), which overrides both ``exec_timeout_override`` and
         the configured ``exec_timeout`` for this call only. A malformed value there is reported as
-        an ERROR result and the input is not executed. Configuring ``allow_timeout_pragma=False``
-        turns that comment back into ordinary text.
+        a recoverable :class:`~jaz.repl.Continue` and the input is not executed. Configuring
+        ``allow_timeout_pragma=False`` turns that comment back into ordinary text.
 
         Arguments:
             src: The REPL command to execute
             input_id: The unique identifier for the REPL input
 
         Returns:
-            exec_result: A tuple containing:
-                result_category: The category of the result (i.e., EXECUTE, ERROR,
-                RETURN, RAISE — the internal result categories, not REPL syntax).
-                output: The output of the REPL command that was executed
-                The REPL state is mutated in place.
+            An :class:`~jaz.repl.ExecResult` — exactly one of :class:`~jaz.repl.Continue`
+            (ran, session continues; carries ``output`` and an optional recoverable
+            ``exception``), :class:`~jaz.repl.Return` (finished by returning ``return_value``),
+            or :class:`~jaz.repl.Raise` (finished by raising ``exception``). The REPL state is
+            mutated in place.
         """
-        # TODO: Rename input_id to (1-based) iteration index?
+        # TODO: Rename input_id to iteration index? (The agent loop passes `str(iteration)`, which
+        # is 0-based since #719 — this name predates that and says nothing about the base.)
         try:
             timeout = self._resolve_timeout(src, exec_timeout_override)
         except REPLTimeoutPragmaError as e:
             # A recoverable `Continue`, not a propagated raise: an agent typo in a comment is the
             # same class of mistake as a `SyntaxError`, and the REPL answers those by handing the
-            # message back rather than ending the invoke. `exec`'s never-raise contract holds.
+            # message back rather than ending the invoke. (`exec` DOES re-raise fatal/foreign
+            # exceptions — see `_reraise_if_fatal` — but a pragma typo is neither.)
             #
             # `summarize_exception`, not `_format_error`: no agent frame exists to render (the
             # code never ran), so a traceback would show only stripped engine frames. This is the
-            # same rendering `Agent._parse_error_result` uses for the other did-not-execute case.
+            # same rendering the loop used for a parse failure, back when parsing could fail.
             return Continue(output=summarize_exception(e), exception=e)
-        # NOTE: __repl_history__ is no longer updated here. It is written exclusively
+        # NOTE: __history__ is no longer updated here. It is written exclusively
         # by the core agent loop, once per iteration, from the *finalized* result
         # (after exit-time effect composition); see agent.do_one_repl_iteration. This
         # keeps history a single-writer, core-owned concept and lets a result-override
@@ -1801,7 +1978,7 @@ class PythonREPL(REPL):
 
         The ``# timeout: <seconds>`` pragma applies here exactly as it does to ``exec``.
 
-        Like sync ``exec``, this does not write ``__repl_history__`` — the core agent loop
+        Like sync ``exec``, this does not write ``__history__`` — the core agent loop
         is the single writer (see ``exec``'s NOTE; #448/#527).
         """
         try:

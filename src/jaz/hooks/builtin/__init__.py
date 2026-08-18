@@ -1,18 +1,18 @@
 """Built-in hook implementations."""
 
-from ._must_exit import TemplatedMustExitWarning
+from .atif_trace import ATIFTrace
 from .budget_forcing import BudgetForcing
 from .budget_pool import BudgetPool
 from .compaction import Compaction
-from .context_window import ContextWindow
-from .conversation_history import ConversationHistory
+from .context_window import ContextWindowWarning
 from .iteration_limit import IterationLimit
 from .loggers import FileLogger, PrintLogger
 from .metadata import MetaData
 from .recursion_limit import RecursionLimit
 from .repl_input_hooks import ValidateREPLInput
-from .replay import Replay
+from .replay import ATIFReplay
 from .return_hooks import ReturnType, ValidateReturn
+from .rollout import FlatSample, Rollout, RolloutRecorder, TurnSample
 from .workflow_replay import WorkflowReplay
 
 # Conditionally import tracing hooks if opentelemetry is installed
@@ -29,22 +29,26 @@ except ImportError:
     _TRACING_AVAILABLE = False
 
 __all__ = [
+    "ATIFReplay",
+    "ATIFTrace",
     "BudgetForcing",
     "BudgetPool",
     "Compaction",
-    "ConversationHistory",
-    "ContextWindow",
+    "ContextWindowWarning",
     "IterationLimit",
     "RecursionLimit",
-    "TemplatedMustExitWarning",
     "MetaData",
     "PrintLogger",
     "FileLogger",
     "WorkflowReplay",
-    "Replay",
     "ReturnType",
     "ValidateReturn",
     "ValidateREPLInput",
+    # Rollout recording (token-native backends)
+    "RolloutRecorder",
+    "Rollout",
+    "FlatSample",
+    "TurnSample",
 ]
 
 # Only export tracing hooks if available
@@ -59,10 +63,15 @@ if _TRACING_AVAILABLE:
 # the parent would still break `from jaz.hooks.builtin import ReplayHook`.
 BudgetForcingHook = BudgetForcing
 CompactionHook = Compaction
-ContextWindowHook = ContextWindow
-ConversationHistoryHook = ConversationHistory
+# ContextWindow: the pre-``warning_text``-required spelling, kept importable after the rename to
+# ContextWindowWarning. ContextWindowHook: the original ``*Hook`` alias.
+ContextWindow = ContextWindowWarning
+ContextWindowHook = ContextWindowWarning
 IterationLimitHook = IterationLimit
-ReplayHook = Replay
+# Two pre-rename generations of ATIFReplay (ReplayHook → Replay → ATIFReplay); both were
+# importable from this namespace, so both stay bound here.
+Replay = ATIFReplay
+ReplayHook = ATIFReplay
 WorkflowReplayHook = WorkflowReplay
 
 if _TRACING_AVAILABLE:

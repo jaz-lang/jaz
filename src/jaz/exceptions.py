@@ -7,7 +7,7 @@ raises may be renamed, re-rooted, or removed in a future release.
 """
 
 # There are no exceptions to the rule above, so ``try: jaz.invoke(...) except Exception:``
-# catches everything JAZ can surface — including :class:`AbortError`, which used to escape it
+# catches everything JAZ can surface — including :class:`FatalError`, which used to escape it
 # (see that class's docstring for why the ``BaseException`` rooting was reversed). Catch
 # ``jaz.exceptions.JazException`` for a framework-wide catch-all, or a specific subclass for a
 # specific failure mode (e.g. a hook enforcing a budget raises ``BudgetExhaustedError``).
@@ -19,9 +19,20 @@ raises may be renamed, re-rooted, or removed in a future release.
 #   clash with a builtin takes a domain word instead of the prefix —
 #   :class:`SandboxPermissionError`, not ``JazPermissionError``.
 # * Conflict errors are ``<subject>ConflictError`` (:class:`REPLInputConflictError`,
-#   :class:`OverrideConflictError`, …) — one shape for one contract.
+#   :class:`LLMResponseConflictError`, …) — one shape for one contract.
 # * The :class:`LLMError` subtree keeps LiteLLM's exception vocabulary verbatim; see that class's
 #   docstring for the provenance and for why an ``LLM`` prefix was considered and dropped.
+#
+# Decision — NO ``REPLError`` grouping base (#1005). The REPL-layer errors — e.g.
+# ``SandboxPermissionError``, ``REPLInputConflictError``, ``REPLTimeoutPragmaError``,
+# ``MissingDropTargetError`` here; ``REPLTimeoutError`` / ``REPLMemoryError`` in ``repl/_exec_guards.py``;
+# ``CookieCollisionError`` in ``repl/_cookies.py`` — are deliberately NOT unified under a common base,
+# unlike the :class:`LLMError` subtree. ``LLMError`` earns its base because its members share one payload
+# and one coherent handling story; these share neither, so a caller writing ``except REPLError`` would
+# have no single failure mode to act on. ``except JazException`` is already the framework-wide catch-all,
+# and three of these errors are not ``JazException`` at all (they subclass plain ``Exception`` /
+# ``RuntimeError`` and live in other modules), so introducing the base would force MRO changes and widen
+# what ``except JazException`` catches — cost, for no caller benefit.
 
 # Deprecated aliases for every pre-rename spelling live next to their replacements. They are
 # plain assignments, kept out of ``__all__``, and removable at the next major bump. Maintainer
@@ -31,7 +42,7 @@ raises may be renamed, re-rooted, or removed in a future release.
 
 __all__ = [
     "JazException",
-    "AbortError",
+    "FatalError",
     "NonPublicAPIWarning",
     # Public so callers can filter it: `jaz.describe` on bare built-ins retains them,
     # and this is how that cost announces itself. Silencing it must be possible by name.
@@ -40,18 +51,23 @@ __all__ = [
     # small ints) mislabels every other use of it. Filterable separately because the remedy
     # differs — this one is never fixed by describing fewer values.
     "DescriptionSharedValueWarning",
+    "UnknownRequestParamWarning",
     # Execution / runtime failures
-    "LLMResponseParseError",
     "ReturnTypeError",
     "SandboxPermissionError",
     "BudgetExhaustedError",
+    "IterationLimitExhaustedError",
+    "BudgetPoolExhaustedError",
     "RecursionLimitError",
     "BudgetForcingError",
     "REPLInputConflictError",
     "REPLTimeoutPragmaError",
     "SandboxKeyError",
+    # Rollout export failures (jaz.hooks.builtin.rollout)
+    "NonMonotoneRolloutError",
     # API-misuse failures (hooks / config composition)
-    "OverrideConflictError",
+    "InvalidEffectError",
+    "LLMResponseConflictError",
     "ReturnValueConflictError",
     "BlackboardSeedError",
     "BlackboardWriteConflictError",
@@ -77,42 +93,41 @@ class JazException(Exception):
     """Base exception class for JAZ-related errors."""
 
 
-class AbortError(JazException):
+class FatalError(JazException):
     """Class of exceptions that cause :func:`invoke` to error out instead of being shown to the
     agent as recoverable feedback; exempt from being caught by agent-written ``except`` clauses.
 
     An ordinary exception in REPL code is caught and shown to the agent as recoverable feedback
-    (a :class:`Continue`) so it can retry. An ``AbortError`` instead ends the REPL session and
-    causes the :func:`invoke` to error out with that error (a :class:`Raise` result). If this
-    invoke is a subinvoke of a parent invoke and the ``AbortError`` occurs in the REPL of that
+    (a :class:`Continue`) so it can retry. A ``FatalError`` instead ends the REPL session and
+    causes the :func:`invoke` to error out with that error. If this
+    invoke is a subinvoke of a parent invoke and the ``FatalError`` occurs in the REPL of that
     parent :func:`invoke`, then that parent :func:`invoke` also errors out. Thus, usually, the
-    entire :func:`invoke` tree is aborted and the top-level :func:`invoke` raises the
-    ``AbortError``.
+    entire :func:`invoke` tree fails and the top-level :func:`invoke` raises the
+    ``FatalError``.
 
-    Raise ``AbortError`` when a fatal error occurs that the invoke tree cannot recover from. For
-    example, write ``raise AbortError()`` inside a tool definition in paths that should abort
-    the entire invoke tree. Errors from third-party libraries that you'd like to convert to a
-    fatal error should be caught and re-raised as ``AbortError``. A hook that would like to
-    abort the entire invoke tree should emit an ``Abort(error=AbortError(...))`` effect.
-    (Emitting ``Abort(error=exc)`` where ``exc`` is not an ``AbortError`` aborts the in-progress
+    Raise ``FatalError`` when a fatal error occurs that the invoke tree cannot recover from. For
+    example, write ``raise FatalError()`` inside a tool definition in paths that should take
+    down the entire invoke tree. Errors from third-party libraries that you'd like to convert to
+    a fatal error should be caught and re-raised as ``FatalError``. A hook that would like to
+    take down the entire invoke tree should emit an ``Abort(error=FatalError(...))`` effect.
+    (Emitting ``Abort(error=exc)`` where ``exc`` is not a ``FatalError`` aborts the in-progress
     :func:`invoke` but does not propagate to the parent :func:`invoke`.)
 
-    Who can decline an abort, since that is the whole point of the class:
+    Who can decline a fatal error, since that is the whole point of the class:
 
     ====================  ==========================================================================
-    **Agent REPL code**   **No** — an ``AbortError`` is exempt from being caught by agent-written
+    **Agent REPL code**   **No** — a ``FatalError`` is exempt from being caught by agent-written
                           ``except`` and ``except*`` clauses. Two known exceptions, both under
                           "Known limitations".
     **User code**         Yes, by catching it — a tool or the caller is host code, and one that
-                          catches its own abort has decided not to abort.
-    **A hook**            Yes, by returning a non-terminal result
-                          (:class:`ModifyResult`/:class:`OverrideResult` with a
-                          :class:`Continue`). Intended: the result kind is the
-                          hook's expressed intention.
+                          catches its own fatal error has decided not to fail.
+    **A hook**            **No** — a fatal exception propagates during unwind, and no transform
+                          boundary fires on the unwind path, so there is no effect a hook could
+                          return to convert it back into normal control flow.
     ====================  ==========================================================================
 
     The purpose of this class is *routing*, i.e. who the error is addressed to. An ordinary error
-    is addressed to the agent; an abort is addressed to the **caller**: "this failure is not
+    is addressed to the agent; a fatal error is addressed to the **caller**: "this failure is not
     something the agent can fix by retrying."
 
     Known limitations
@@ -124,15 +139,30 @@ class AbortError(JazException):
               def __enter__(self): return self
               def __exit__(self, *a): return True   # truthy -> suppresses anything
           with S():
-              tool_that_aborts()                    # abort swallowed; the run continues
+              tool_that_raises_fatal()              # fatal error swallowed; the run continues
 
       A known limitation, not a boundary.
-    * **A group-wrapped abort is catchable.** An ``ExceptionGroup`` containing an ``AbortError``
-      is really an ``ExceptionGroup``, so both ``except Exception`` and ``except ExceptionGroup``
-      catch it. Such a group *is* still exempt from ``except*``, which surfaces the ``AbortError``
-      leaf. A group that goes uncaught still aborts the invoke tree.
+    * **A group-wrapped fatal error is catchable.** An ``ExceptionGroup`` containing a
+      ``FatalError`` is really an ``ExceptionGroup``, so both ``except Exception`` and
+      ``except ExceptionGroup`` catch it. Such a group *is* still exempt from ``except*``, which
+      surfaces the ``FatalError`` leaf. A group that goes uncaught still takes down the invoke
+      tree.
     """
 
+    # Renamed from the abort-stem error name (span_event_lifecycle.md naming, revised by user
+    # decision): the effect/category stem-conflation was resolved by moving THIS name, not the
+    # effect's — DOM ``AbortController.abort(reason)`` is the ``Abort`` effect's exact precedent
+    # (an operation-scoped stop with a reason payload, containable by the parent), so the
+    # mechanism keeps the word "abort", while "fatal" is what this module's own ``is_fatal``
+    # predicate already called this category — the rename makes the pairing tautological. The
+    # deeper reason the old name had to go: it baked an INTENT claim into the type name
+    # ("someone chose to abort") — but the channel carries unknowable intent (governance stops
+    # and breakage reports alike), which is what caused real conflation. "FatalError" claims
+    # only a PROPERTY: the error is fatal, hence it propagates past every agent. Property-naming
+    # keeps the category intent-agnostic, which the span-outcome classification requires
+    # (outcome is decided by control-plane association, never by reading intent off an
+    # exception type). No back-compat alias — pre-release.
+    #
     # EXECUTIVE CALL (user, 2026-07-29): **rooted at ``JazException`` (an ``Exception``)**, so
     # every error JAZ raises is an ``Exception`` and one rule describes the taxonomy. This
     # reverses the earlier ``BaseException`` rooting (#559/#561), for two reasons:
@@ -144,7 +174,7 @@ class AbortError(JazException):
     #    escaping ``except Exception``, which is desirable precisely because it is *not*
     #    addressed to you.)
     # 2. The guarantee that rooting bought was not real. ``BaseException`` rooting was chosen so
-    #    no routine handler could swallow an abort. It does stop ``except Exception`` — but it is
+    #    no routine handler could swallow a fatal error. It does stop ``except Exception`` — but it is
     #    defeated in the *default* configuration by four lines of agent code (the suppressing
     #    context manager under "Known limitations"). So the property being protected was a strong
     #    default, not a boundary, and it is now upheld by mechanism rather than class identity.
@@ -153,45 +183,14 @@ class AbortError(JazException):
     # detail. Suppressing context manager: ``__exit__`` is invoked at the C level and a ``with``
     # block has no ``except`` clause for the cookie transform to guard, so neither the transform
     # nor any base class can stop it. This defeated the old ``BaseException`` rooting identically,
-    # so it is not a regression, but it does mean an adversarial agent can decline an abort.
-    # Group-wrapped abort: the cookie guard matches ``AbortError``, and a group *containing* one
-    # is not an ``AbortError``, so the guard does not fire. Reachable whenever anything in the
+    # so it is not a regression, but it does mean an adversarial agent can decline a fatal error.
+    # Group-wrapped fatal error: the cookie guard matches ``FatalError``, and a group *containing* one
+    # is not an ``FatalError``, so the guard does not fire. Reachable whenever anything in the
     # call path bundles exceptions — a tool using ``asyncio.TaskGroup``/``gather``, or
     # ``hooks.effects._combine_exceptions``. Guarding it would mean intercepting groups and
     # unwrapping, which a plain injected handler cannot do without also stealing ordinary
-    # ``ExceptionGroup``s from the agent's own handlers. #977 tracks the abort *latch* on the
+    # ``ExceptionGroup``s from the agent's own handlers. #977 tracks the fatality *latch* on the
     # invoke context, which closes both routes at once.
-
-
-#: Deprecated alias for the pre-rename spelling. Note this alias is **not** behavior-
-#: preserving the way the other aliases in this module are: the class it points at is no
-#: longer ``BaseException``-rooted, so an ``except Exception`` that previously let an abort
-#: through will now catch it. That change is the point (see the ``AbortError`` docstring),
-#: but it means out-of-tree code relying on the old escape behavior needs review, not just a
-#: rename. Deliberately absent from ``__all__``.
-JazAbortError = AbortError
-
-
-class LLMResponseParseError(JazException):
-    """Exception raised when parsing an LLM response fails."""
-
-    # Deliberately NOT an ``LLMError``, despite the shared ``LLM`` prefix — so ``except LLMError``
-    # does not catch this. ``LLMError`` is the provider/transport subtree: the call failed (rate
-    # limit, auth, context window, HTTP error) and no usable response came back, and its members
-    # carry ``status_code``/``llm_provider``. This is the opposite situation — the call *succeeded*
-    # and the provider returned a well-formed response whose content the protocol layer could not
-    # parse into REPL input. Grouping them would make ``except LLMError`` mean two unrelated things
-    # (retry the request vs. reprompt the model), and there is no status code to attach.
-    #
-    # The prefix is kept because the error is still *about* the LLM's response; the base is
-    # ``JazException`` because the failure is ours to interpret, not the provider's to report.
-
-
-#: Deprecated alias for the pre-rename spelling — see :data:`BudgetForcingException`
-#: for the full rationale (old name was in ``__all__``, so dropping it outright would be a
-#: bare ``NameError``). An alias, not a subclass, so ``except`` keeps matching exactly.
-#: Deliberately absent from ``__all__``.
-LLMOutputParseError = LLMResponseParseError
 
 
 class ReturnTypeError(TypeError, JazException):
@@ -233,8 +232,42 @@ JazPermissionError = SandboxPermissionError
 class BudgetExhaustedError(JazException):
     """Raised when a budget-enforcing hook stops the run because its budget is spent.
 
-    Emitted by :class:`jaz.hooks.BudgetPool` when the pooled cost/call ceiling is reached, and by
-    :class:`jaz.hooks.IterationLimit` when the iteration cap is reached.
+    The base of two distinct causes — catch this to handle either, or the subclass to tell
+    them apart: :class:`IterationLimitExhaustedError` (the turn cap) and
+    :class:`BudgetPoolExhaustedError` (a cost/calls pool). The distinction matters to a caller
+    that can *do* something different about each — e.g. offer more turns for the former but not
+    the latter, which more turns cannot refill.
+    """
+
+
+class IterationLimitExhaustedError(BudgetExhaustedError):
+    """Raised by :class:`jaz.hooks.IterationLimit` when the per-invoke turn cap is reached.
+
+    A subclass of :class:`BudgetExhaustedError`, so ``except BudgetExhaustedError`` still
+    matches; catch this specifically to react to the turn cap alone (granting more turns can
+    let the run finish, unlike a spent cost/calls pool).
+    """
+
+
+class BudgetPoolExhaustedError(BudgetExhaustedError):
+    """Raised by :class:`jaz.hooks.BudgetPool` when its pooled cost or calls ceiling is reached.
+
+    A subclass of :class:`BudgetExhaustedError`, so ``except BudgetExhaustedError`` still
+    matches; catch this specifically to distinguish a spent cost/calls pool from the turn cap
+    (:class:`IterationLimitExhaustedError`) — more turns cannot refill a pool.
+    """
+
+
+class NonMonotoneRolloutError(JazException):
+    """Raised by ``Rollout.to_flat()`` when the trajectory's context was not append-only.
+
+    The model saw genuinely different prefixes on different turns, so no single flat
+    masked token sequence represents the run. Routine causes: a reasoning model under
+    ``SGLangLLM``'s hidden-trace interface (each turn's ``<think>…</think>`` is stripped
+    from the next turn's context, so *every* multi-turn reasoning rollout is non-monotone
+    by design), a transient hook nudge (e.g. :class:`jaz.hooks.IterationLimit`'s warning),
+    or a history compaction. Use ``to_pieces()`` (flat samples per monotone span) or
+    ``to_turn_samples()`` (fully general, per-turn) instead.
     """
 
 
@@ -263,12 +296,12 @@ class RecursionLimitError(JazException):
 DepthLimitError = RecursionLimitError
 
 
-class _JazInternalError(AbortError):
+class _JazInternalError(FatalError):
     """Internal framework error — **always fatal**.
 
-    Subclasses :class:`AbortError` so a framework bug / invariant violation fails
+    Subclasses :class:`FatalError` so a framework bug / invariant violation fails
     fast (propagates out of the invoke) rather than being hidden from the caller as
-    agent feedback. Framework code that must abort raises this (not a bare ``assert``,
+    agent feedback. Framework code that must end the run raises this (not a bare ``assert``,
     which is deliberately non-fatal — see :func:`is_fatal`)."""
 
 
@@ -356,34 +389,58 @@ class SandboxKeyError(ValueError, JazException):
     # TODO: revise docstring
 
 
-class OverrideConflictError(JazException):
-    """Raised when two distinct :class:`OverrideResponse` effects target the same LLM query.
+class InvalidEffectError(JazException):
+    """Raised when a hook returns an effect at an event that does not accept it.
 
-    Identical overrides coalesce; distinct ones raise, because resolving by arrival order would
-    make composition depend on hook registration or ``with``-nesting order.
+    Every event documents the effects valid at its stage (supplies at ``*Send``, transforms
+    at ``*Complete``, :class:`Abort` at every control event, the ``*Exit`` events accept
+    none). An out-of-stage effect is a hook bug — emitting it can only mean the hook expects
+    an influence the stage cannot deliver — so composition rejects it loudly rather than
+    ignoring it. The message names the offending effect kind and the event.
     """
 
-    # TODO: revise docstring
+    # Follows the conflict-error convention (a dedicated JazException per composition
+    # contract): a plain rejection, NOT FatalError-category — like a conflict error it
+    # propagates out of the invoke whose composition hit it, and a parent invoke may
+    # legitimately contain a child's hook-config bug the way it contains any other
+    # child failure. This replaced the warn-and-ignore patchwork (and the silent drop in
+    # the invoke-enter composer) in the final stage of span_event_lifecycle.md: a stale
+    # hook must fail its first run, not silently no-op.
+    #
+    # ``BlackboardWrite`` never reaches this check: ``HookDispatcher.emit`` partitions it
+    # out of the effect stream and applies it at the generational barrier, so it remains
+    # valid at every event, observation-only ``*Exit`` included.
 
 
-#: Deprecated alias for the pre-rename spelling — see :data:`BudgetForcingException`
-#: for the full rationale (old name was in ``__all__``, so dropping it outright would be a
-#: bare ``NameError``). An alias, not a subclass, so ``except`` keeps matching exactly.
-#: Deliberately absent from ``__all__``.
-ConflictingOverrideError = OverrideConflictError
+class LLMResponseConflictError(JazException):
+    """Raised when two distinct :class:`SupplyLLMResponse` effects supply a response for the
+    same LLM query.
+
+    Identical supplies coalesce to one; distinct ones raise, because resolving by arrival order
+    would make composition depend on hook registration or ``with``-nesting order.
+    """
+
+
+#: Deprecated aliases for the pre-rename spellings — see :data:`BudgetForcingException`
+#: for the full rationale (the old names were public / in ``__all__``, so dropping them outright
+#: would be a bare ``NameError`` for any code that ``except``s or imports them). Aliases, not
+#: subclasses, so ``except`` keeps matching exactly. Deliberately absent from ``__all__``.
+#: ``OverrideConflictError`` was this class's own former name (renamed with the effect
+#: ``OverrideResponse`` -> ``SupplyLLMResponse``); ``ConflictingOverrideError`` was an even older
+#: alias of that.
+OverrideConflictError = LLMResponseConflictError
+ConflictingOverrideError = LLMResponseConflictError
 
 
 class ReturnValueConflictError(JazException):
     """Raised when effects carrying *distinct* :class:`Return` values fold at one boundary.
 
-    Applies wherever results fold — :class:`OverrideResult` at :class:`REPLExecEnter`, and
-    :class:`ModifyResult` at :class:`REPLExecExit` or :class:`InvokeExit`. Carried
+    Applies wherever results fold — :class:`SupplyExecResult` at :class:`REPLExecSend`, and
+    :class:`ModifyExecResult` at :class:`REPLExecComplete` or :class:`InvokeComplete`. Carried
     :class:`Continue` results merge (outputs concatenate, exceptions group) and identical return
     values coalesce, but two *different* return values cannot be combined without picking a
     winner by hook order.
     """
-
-    # TODO: revise docstring
 
 
 #: Deprecated alias for the pre-rename spelling — see :data:`BudgetForcingException`
@@ -402,20 +459,17 @@ class ResultConflictError(JazException):
 
     # Once raised when two hooks supplied *distinct* whole results at the ``REPLExecEnter``
     # supply boundary, on the theory that a supply "names THE result" and so must agree. That
-    # contract was dropped: the supply boundary now folds its ``OverrideResult``s by the same
+    # contract was dropped: the supply boundary now folds its ``SupplyExecResult``s by the same
     # precedence the exit boundary uses, so independent enter-point vetoes compose instead of
     # crashing.
     #
     # Removed from ``__all__`` (2026-07-31). It had remained *advertised* public API — frozen
     # into the v1 surface by #955 — while being unreachable: zero raise sites, so an out-of-tree
     # ``except ResultConflictError`` could never fire. Advertising a handler that cannot run is
-    # worse than not offering one, because it reads as coverage. It is also easy to mistake for
-    # ``OverrideConflictError``: both concern an "override" effect, but this one is about
-    # ``OverrideResult`` (the REPL exec-result supply) and that one about ``OverrideResponse``
-    # (the LLM query response) — each name built from the half of its effect's name that does
-    # *not* distinguish it. Nothing replaces it directly, so no alias was added.
-
-    # TODO: revise docstring
+    # worse than not offering one, because it reads as coverage. It concerned a *supply* effect
+    # (the enter-boundary ``SupplyExecResult``, then spelled ``OverrideResult``); the surviving
+    # ``LLMResponseConflictError`` concerns the LLM-query supply ``SupplyLLMResponse``. Nothing
+    # replaces it directly, so no alias was added.
 
 
 #: Deprecated alias for the pre-rename spelling — see :data:`BudgetForcingException`
@@ -449,11 +503,11 @@ class BlackboardWriteConflictError(JazException):
 
 
 def is_fatal(e: BaseException) -> bool:
-    """Whether ``e`` should abort the whole agent run instead of becoming feedback.
+    """Whether ``e`` should end the whole agent run instead of becoming feedback.
 
-    Consulted at every REPL exec boundary (see ``_propagate_if_fatal``) to decide whether
-    a caught exception propagates out of the invoke (fatal) or is rendered as a
-    recoverable ``ErrorResult``.
+    Consulted at every REPL exec boundary (see ``_reraise_if_fatal``) to decide whether
+    a caught exception re-raises out of ``exec`` and propagates out of the invoke (fatal)
+    or is rendered as a recoverable ``Continue``.
 
     Two rules, in this order:
 
@@ -462,11 +516,11 @@ def is_fatal(e: BaseException) -> bool:
        recoverable-vs-fatal split the language already encodes (``Exception`` = "all
        non-system-exiting exceptions") rather than a hand-maintained list; enumerating them
        by hand is what silently omitted ``GeneratorExit`` before.
-    2. **:class:`AbortError` (incl. :class:`_JazInternalError`) is fatal**, explicitly —
+    2. **:class:`FatalError` (incl. :class:`_JazInternalError`) is fatal**, explicitly —
        including when it is nested anywhere inside a ``(Base)ExceptionGroup``.
 
     Rule 2 is a deliberate carve-out for an ``Exception``-rooted fatal, added when
-    :class:`AbortError` was re-rooted under :class:`JazException` (see its docstring for the
+    :class:`FatalError` was re-rooted under :class:`JazException` (see its docstring for the
     executive call). It is safe in a way a hand-list is not: it is a single ``isinstance``
     against a type JAZ owns, so it covers every present and future subclass automatically and
     cannot silently omit a member the way enumerating ``BaseException`` leaves did.
@@ -476,7 +530,7 @@ def is_fatal(e: BaseException) -> bool:
     recoverable (free a large object and retry), so an agent hitting it gets recoverable
     feedback (the iteration / budget caps backstop a retry loop). Adding per-type carve-outs
     for exceptions JAZ does *not* own would reintroduce the hand-list that hid
-    ``GeneratorExit`` — if a third-party error should abort, rewrap it as an :class:`AbortError`
+    ``GeneratorExit`` — if a third-party error should be fatal, rewrap it as a :class:`FatalError`
     at the raise site rather than extending this function.
 
     Why classify here at all, rather than ``except Exception`` and let fatals propagate
@@ -490,29 +544,29 @@ def is_fatal(e: BaseException) -> bool:
     ``BaseException`` — ``_exec_guards.TimeoutError`` is an ``Exception``.)
 
     ``AssertionError`` is deliberately *not* fatal (it is an ``Exception``): an agent's own
-    ``assert`` stays recoverable; framework asserts that must abort raise
+    ``assert`` stays recoverable; framework asserts that must be fatal raise
     :class:`_JazInternalError` instead.
 
     Exception groups
     ----------------
-    A group is fatal if it contains an :class:`AbortError` **anywhere**, at any nesting depth.
-    Judgment call, recorded because the alternative is defensible: an abort bundled with
+    A group is fatal if it contains a :class:`FatalError` **anywhere**, at any nesting depth.
+    Judgment call, recorded because the alternative is defensible: a fatal error bundled with
     ordinary errors could be treated as recoverable on the grounds that the group "is mostly
-    recoverable". It is not, because an abort is not negotiable — allowing a co-occurring
-    ``ValueError`` to neutralize it would make aborting depend on what else happened to fail
+    recoverable". It is not, because a fatal error is not negotiable — allowing a co-occurring
+    ``ValueError`` to neutralize it would make fatality depend on what else happened to fail
     at the same moment, and agent code can *construct* such a group deliberately
     (``asyncio.TaskGroup``, or the remainder ``except*`` re-raises alongside a guard's leaf).
     So containment, not majority.
 
     This is what makes the ``except*`` guard complete: ``except*`` can re-bundle a re-raise with
     an unhandled remainder, so for a mixed group the exec boundary can still see a group — the
-    guard alone cannot guarantee a bare :class:`AbortError` there. The guard remains necessary for a
-    different reason (it keeps the agent's own clause from consuming the abort, and it preserves
-    the abort's type across the public boundary, which this rule does not); the two cover
+    guard alone cannot guarantee a bare :class:`FatalError` there. The guard remains necessary for a
+    different reason (it keeps the agent's own clause from consuming the fatal error, and it preserves
+    its type across the public boundary, which this rule does not); the two cover
     different failures rather than one subsuming the other. See
     ``repl.python_repl._ExceptGuardTransformer``.
     """
-    if not isinstance(e, Exception) or isinstance(e, AbortError):
+    if not isinstance(e, Exception) or isinstance(e, FatalError):
         return True
     if isinstance(e, BaseExceptionGroup):
         return any(is_fatal(sub) for sub in e.exceptions)
@@ -540,53 +594,53 @@ class ModelPricingUnavailableError(JazException):
     """Raised when a ``cost_budget`` is set but no per-call cost is available to enforce it.
 
     The usual cause is a model missing from the bundled price table; refresh it (see
-    ``jaz/providers/pricing.py``) or use ``calls_budget``, which counts LLM calls and needs no
+    ``jaz/llm/pricing.py``) or use ``calls_budget``, which counts LLM calls and needs no
     rates. Custom or self-hosted models reached through a ``base_url`` never appear in that
     table, so ``calls_budget`` is the way to cap them. Nothing is spent before this is raised,
-    unless a custom backend's :meth:`~jaz.providers.llm.LLM.can_report_cost` promised a cost
+    unless a custom backend's :meth:`~BaseLLM.can_report_cost` promised a cost
     it then failed to deliver.
     """
 
-    # Raised from either of two checks in `BudgetPool.on_llm_query_enter`, whichever fires
-    # first:
+    # Raised from either of two checks in `BudgetPool`, whichever fires first:
     #
-    # * PRE-FLIGHT, before the first query: the backend answers `LLM.can_report_cost`
-    #   with False, so the budget is known unenforceable in advance and NO LLM call is made.
-    #   The client is asked rather than the price table consulted here because only the client
-    #   knows where its cost comes from — a table lookup would false-abort `MockLLMClient`,
-    #   which supplies its own cost and whose default model name is not in the table.
-    # * BACKSTOP, one turn late: a turn actually reported no cost despite that promise (a
-    #   stale rate, a provider returning no usage). ONE TURN IS SPENT before the run stops.
+    # * PRE-FLIGHT (`on_llm_query_enter`), before the first query: the backend answers
+    #   `LLM.can_report_cost` with False, so the budget is known unenforceable in advance and
+    #   NO LLM call is made. The client is asked rather than the price table consulted here
+    #   because only the client knows where its cost comes from — a table lookup would
+    #   false-abort `MockLLMClient`, which supplies its own cost and whose default model name
+    #   is not in the table.
+    # * BACKSTOP (`on_llm_query_complete`, #1071): a turn actually reported no cost despite
+    #   that promise (a stale rate, a provider returning no usage). ONE TURN IS SPENT — the
+    #   uncosted call itself — but the abort composes at LLMQueryComplete, the very turn the
+    #   condition is observed, so the agent never executes the code from that turn and no
+    #   further query is made.
     #
     # So the pre-flight check is exact for clients that implement it and the backstop covers
     # the rest; only the backstop path costs a turn.
     #
     # Why this exists: the bundled price table is a filtered snapshot of LiteLLM's data
-    # (see providers/pricing.py), so it goes stale whenever a model family ships. Before
+    # (see llm/pricing.py), so it goes stale whenever a model family ships. Before
     # this error, an unpriced model made `BudgetPool` raise an AssertionError on every
     # LLMQueryExit; the dispatcher swallows hook exceptions, so the only symptom was a log
     # line and a budget that silently enforced nothing. That is the worst failure shape for
     # a spending control — the caller believes they are capped and they are not. Observed
     # live: the GPT-5.6 family (luna/sol) ran uncapped, one of them to 164 turns.
     #
-    # Surfaced as an `Abort` effect at LLMQueryEnter, NOT by raising: the dispatcher never
-    # propagates a hook's exception ("Raising is NOT an abort channel — emit Abort(error=...)
-    # instead"), so raising here would be swallowed exactly like the assert it replaces.
+    # Surfaced as an `Abort` effect, NOT by raising: the dispatcher never propagates a hook's
+    # exception ("Raising is NOT an abort channel — emit Abort(error=...) instead"), so
+    # raising here would be swallowed exactly like the assert it replaces.
     #
-    # Residual hole, and note how narrow the pre-flight made it. The BACKSTOP alone is
-    # detect-at-exit / abort-at-next-enter, so an invoke that finishes on the uncosted turn
-    # never reaches another LLMQueryEnter and completes silently. That USED to apply to any
-    # unpriced model — a harness running single-turn invokes under one BudgetPool got no signal
-    # at all. The pre-flight closes exactly that case: it has no turn guard, so it fires on the
-    # first LLMQueryEnter and a single-turn invoke aborts before its only query
-    # (`test_unpriced_model_aborts_before_any_llm_call` asserts zero LLM calls).
-    #
-    # What remains is only a client whose `can_report_cost` answered True and then reported no
-    # cost — an over-promise, not a table miss, and unreachable for the built-in backends, whose
-    # answer is the same lookup that produces the cost. Not closed because the obvious fix —
-    # checking again in `teardown()` — raises from a different place at a different time and
-    # would change the shape callers see for the multi-turn case, which is the one that actually
-    # overspends.
+    # Historical shape of the hole, kept because it explains why BOTH layers exist. The
+    # backstop was originally detect-at-exit / abort-at-NEXT-enter, so an invoke that
+    # finished on the uncosted turn never reached another LLMQueryEnter and completed
+    # silently — a harness running single-turn invokes under one BudgetPool got no signal at
+    # all. The pre-flight was added to close exactly that case for honest clients
+    # (`test_unpriced_model_aborts_before_any_llm_call` asserts zero LLM calls), and the
+    # backstop's move to LLMQueryComplete (#1071) closed the deferral itself: the abort now
+    # composes on the observed turn, last turn included. What remains is only the single
+    # uncosted call — an over-promise by a client whose `can_report_cost` answered True,
+    # unreachable for the built-in backends, whose answer is the same lookup that produces
+    # the cost.
     #
     # Distinct from #1034, where a cost IS reported (0.0, from a table entry with no rates) and
     # so neither layer fires.
@@ -665,9 +719,9 @@ class MissingDropTargetError(KeyError, JazException):
 # --- LLM provider / transport errors -----------------------------------------
 # Raised by the provider layer (the code that calls OpenAI/Anthropic/litellm) and
 # normalized into this taxonomy. Defined HERE — the central exception module — rather than
-# in jaz/providers/exceptions.py so they share the `JazException` base (one catch-all) and
+# in jaz/llm/exceptions.py so they share the `JazException` base (one catch-all) and
 # are importable from the single public home, `jaz.exceptions`, without exposing the
-# internal `jaz.providers` package. `jaz.providers.exceptions` re-exports them for
+# internal `jaz.llm` package. `jaz.llm.exceptions` re-exports them for
 # back-compat (and hosts the provider-only `is_content_policy_violation` helper).
 
 
@@ -863,8 +917,8 @@ class DescriptionSharedValueWarning(UserWarning):
     interpreter, so describing one describes every occurrence of it — in your code, in your
     dependencies, and in every nested ``jaz.invoke``::
 
-        jaz.describe(42, "row count")
-        jaz.invoke(task="…", limit=42)   # `limit` now renders as "row count"
+        describe(42, "row count")
+        invoke(task="…", limit=42)   # `limit` now renders as "row count"
 
     Unlike :class:`DescriptionRetentionWarning`, this fires on the **first** call: the problem
     is scope, not volume, and a single describe is already the whole failure.
@@ -929,3 +983,27 @@ class NonPublicAPIWarning(UserWarning):
     # rather than a re-rooting of the whole category. ``FutureWarning`` is the one defensible
     # alternative — also shown by default — if "will be removed" ever becomes the dominant case;
     # switching is cheap either way, since user filters name this class, not its base.
+
+
+class UnknownRequestParamWarning(UserWarning):
+    """Emitted when a backend construction kwarg looks like a misspelled request parameter.
+
+    A backend (e.g. :class:`jaz.llm.LiteLLM`) forwards any keyword it does not name as a
+    per-request default onto the wire, so a typo like ``temperatrue=0.7`` is otherwise sent
+    verbatim and silently ignored by the provider. When an unrecognized kwarg closely matches a
+    known request parameter, this warns with the suggested spelling — but the kwarg is still
+    forwarded, since arbitrary provider-specific extras are supported by design.
+
+    Filter it like any warning category::
+
+        import warnings, jaz
+        warnings.simplefilter("ignore", jaz.exceptions.UnknownRequestParamWarning)
+        warnings.simplefilter("error", jaz.exceptions.UnknownRequestParamWarning)
+    """
+
+    # Warns only on a CLOSE match to a known param, not on every unrecognized kwarg: the
+    # ``**request_defaults`` tail is a deliberate open passthrough (vLLM/router extras a JAZ
+    # release cannot enumerate), so warning on every unknown key would train users to ignore the
+    # category. A near-miss of a real param name is the signal that means "typo", which is the
+    # failure this catches. Rooted at ``UserWarning`` (shown by default) for the same
+    # audience reason as :class:`NonPublicAPIWarning`.

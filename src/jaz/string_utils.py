@@ -20,10 +20,10 @@ def summarize_exception(exc: BaseException) -> str:
     into a count. For a plain exception this is ``"Type: message"``.
 
     Used to render an exception into agent-facing feedback. Called directly by each
-    consumer that needs it — :class:`jaz.protocol.default.DefaultProtocol` (both its
+    consumer that needs it — :class:`CodeOnlyProtocol` (both its
     ``render_observation`` and its ``build_history_entry`` record seam) and OTel tracing
     (:mod:`jaz.hooks.builtin.otel_tracing`) — rather than through a derived property on
-    :class:`jaz.repl.types.Continue`, so the result type stays a plain fact carrier
+    :class:`Continue`, so the result type stays a plain fact carrier
     and serialization is each consumer's own call.
     """
     if isinstance(exc, BaseExceptionGroup):
@@ -55,8 +55,8 @@ def abbreviate_string(
     """Abbreviate string when it exceeds max_length.
 
     Truncation is expressed as a single **in-place substitution**: the removed span becomes
-    ``[N characters omitted]``, spliced exactly where the characters were, with nothing added
-    around it — no surrounding newlines and no header line.
+    ``[...N characters omitted...]``, spliced exactly where the characters were, with nothing
+    added around it — no surrounding newlines and no header line.
 
     This is deliberately one code path for every ratio, replacing three branches that each
     rendered differently and, at ``prefix_ratio`` 0 or 1, announced the truncation *without*
@@ -72,7 +72,7 @@ def abbreviate_string(
 
     A corollary worth knowing before treating this as a size limiter: on a cut that only just
     crosses the cap, the marker is wider than the span it replaces, so the result comes out
-    *longer than the input* — a 101-character string at ``max_length=100`` renders 122
+    *longer than the input* — a 101-character string at ``max_length=100`` renders 128
     characters, to elide one.
 
     Returns:
@@ -87,6 +87,6 @@ def abbreviate_string(
     # == 1.0) would make that negative slice return the WHOLE string rather than nothing.
     suffix = string[len(string) - suffix_length :]
     return (
-        f"{string[:prefix_length]}[{omitted} characters omitted]{suffix}",
+        f"{string[:prefix_length]}[...{omitted} characters omitted...]{suffix}",
         True,
     )

@@ -21,7 +21,7 @@ class Continue(NamedTuple):
 
     output: str
     # BaseException (not Exception): only the fixed fatal set (KeyboardInterrupt, SystemExit,
-    # JazAbortError, REPL timeouts, …) is propagated as a terminal Raise/abort; any *other*
+    # FatalError, REPL timeouts, …) is propagated as a terminal Raise/abort; any *other*
     # non-Exception BaseException still surfaces here as a recoverable Continue, so the field
     # must admit it. Mirrors Raise.exception. Narrowing to Exception would be a behavior change
     # (reclassifying those as fatal), not a docstring fix.
@@ -82,6 +82,6 @@ results.
 - :class:`Raise` — the code finished the run by raising an exception.
 
 An :class:`ExecResult` is what a hook receives as ``event.exec_result``, and what it wraps in
-``jaz.hooks.effects.OverrideResult`` / :class:`ModifyResult` to supply or replace the outcome of a
+``jaz.hooks.effects.SupplyExecResult`` / :class:`ModifyExecResult` to supply or replace the outcome of a
 turn.
 """

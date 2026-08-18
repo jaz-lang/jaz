@@ -252,9 +252,11 @@ def describe[T](value: T, description: DescriptionValue) -> T:
     default display to the LLM when passed as an input to :func:`jaz.invoke`;
     returns the object itself.
 
-    ``description`` may be a ``str``, or a ``Callable[[object], str]`` evaluated lazily at
-    read time with the object as its argument (so the description can reflect the
-    object's current state). The description travels with the object into invokes.
+    ``description`` may be a ``str``; the :class:`jaz.Catalog` render mode (for a
+    tool namespace / container, so its members render as a catalog); or a callable
+    evaluated lazily at read time — given the object, and optionally the bound
+    keyword name it was passed under — so the description can reflect the object's
+    current state. The description travels with the object into invokes.
 
     Describing the same object again overwrites. ``value`` is never altered or replaced:
     ``describe(x, ...) is x`` and ``type(x)`` hold for every type.
@@ -486,7 +488,7 @@ def get_description(
 class DescriptionOverride:
     """Scope one or more descriptions to a ``with`` block without mutating the values — the
     scoped counterpart to :func:`describe`, mirroring how :class:`jaz.ConfigOverride` is the
-    scoped counterpart to :func:`jaz.configure` (#654).
+    scoped counterpart to :func:`jaz.configure`.
 
     Each ``(value, description)`` pair attaches ``description`` to ``value`` (matched by
     object identity — never hashed, copied, or written to the value or side-table) for the
@@ -495,11 +497,11 @@ class DescriptionOverride:
 
         # one value
         with jaz.DescriptionOverride((sales_df, "Q1 sales: ...")):
-            jaz.invoke(task="...", sales=sales_df)
+            invoke(task="...", sales=sales_df)
 
         # several at once
         with jaz.DescriptionOverride((train_df, "training rows"), (test_df, "held-out rows")):
-            jaz.invoke(task="...", train=train_df, test=test_df)
+            invoke(task="...", train=train_df, test=test_df)
 
     **Layering semantics — and why a ``describe`` *inside* the block does not win over the override.**
     :func:`describe` and ``DescriptionOverride`` are two different *kinds* of state, and they compose
@@ -507,8 +509,7 @@ class DescriptionOverride:
     **permanent base** description (one slot, last-write-wins, unscoped), while each active
     ``DescriptionOverride`` pushes a **scoped shadow layer** on top (of nested overrides, the innermost
     wins). :func:`get_description` reads the innermost active override, else the base. The consequence
-    — pinned by ``test_description_override_shadows_describe_called_inside_block`` — is that a
-    ``describe`` call made *inside* an override block does **not** override it: it updates the base
+    is that a ``describe`` call made *inside* an override block does **not** override it: it updates the base
     *beneath* the shadow, so the override still renders for the block's whole extent and the
     interleaved ``describe`` value surfaces only once the override exits. This is the one coherent way
     to merge a permanent single slot with a LIFO scoped stack: the alternative (letting a
@@ -518,7 +519,7 @@ class DescriptionOverride:
     ``jaz.invoke``. It is exactly how :func:`jaz.configure` behaves under a :class:`jaz.ConfigOverride`
     block (a ``configure`` updates the base singleton but stays shadowed until the scope lifts) — the
     same base-plus-shadow-stack layering, documented on ``config.ConfigStack``; this is the deeper form
-    of the ``configure`` ↔ ``ConfigOverride`` parity this class was built to mirror (#654).
+    of the ``configure`` ↔ ``ConfigOverride`` parity this class was built to mirror.
 
     **Why pairs, not a mapping** (``{value: desc}``): the whole point of the scoped form is to
     work for values that reject :func:`describe` — unhashable ones like lists/DataFrames —

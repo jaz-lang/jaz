@@ -8,6 +8,7 @@ This module defines the foundational types used throughout the hook system:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from .blackboard import Blackboard
@@ -24,6 +25,12 @@ class Event:
 
     Events represent discrete points in the agent's execution lifecycle where
     hooks can observe and influence behavior.
+
+    Every event carries ``timestamp`` — the moment it was emitted to hooks, as a
+    **timezone-aware UTC** ``datetime``. Durations are
+    consumer arithmetic over two events' timestamps: ``Exit.timestamp - Enter.timestamp``
+    is a span's boundary-to-boundary interval, and the ``Send``/``Complete`` stamps give
+    the per-stage breakdown. There are no interval fields on any event.
 
     Event objects must be treated as immutable and should never be mutated. Side effects are
     emitted by returning effects from the event handler (see :class:`Hook`).
@@ -50,7 +57,10 @@ class Event:
     # unsupported and can corrupt shared/global state or a peer hook. Frozen + read-only mappings
     # close the accidental-mutation footguns that are cheap to close; the rest is this contract.
     # TODO: revisit enforcing the remainder — notably that ``config`` is still fully mutable
-    # (deep ``inputs``/``scope`` value mutation and live-peer mutation via ``hooks`` are the others).
+    # (deep ``inputs``/``scope`` value mutation, live-peer mutation via ``hooks``, and the
+    # mutable *payload value objects* some events carry — e.g. ``LLMResponse`` on
+    # LLMQueryComplete/Exit, shared with the loop's own copy — are the others; the
+    # container-level payloads are all coerced read-only as of #1156).
 
     # Effective config for the invoke that produced this event (the per-invoke
     # config after ConfigOverride / resolve_for_depth — NOT ambient get_config()).
@@ -96,12 +106,45 @@ class Event:
     #
     # READ-ONLY BY CONVENTION: reading a peer's state is the supported use; mutating a peer through
     # this field is unsupported — the event is a passive record, not a back channel between hooks.
-    # Observability consumers that want a serializable governance trace call ``Hook.to_dict()`` at
-    # their own edge (FileLogger / PrintLogger / ATIFTrace / OTelTracing /
-    # ConversationHistory, all at ``InvokeEnter``): serialization lives at the log boundary, not
+    # Observability consumers that want a renderable governance trace call ``repr()`` at
+    # their own edge (FileLogger / PrintLogger / ATIFTrace / OTelTracing,
+    # all at ``InvokeEnter``): rendering lives at the log boundary, not
     # on this field — which is exactly why the field can hold live, non-serializable hook state
     # (open files, locks, spans) that a pre-serialized field could not.
     hooks: tuple[Hook, ...] = field(kw_only=True, default_factory=tuple)
+
+    # When this event was EMITTED to hooks — stamped by ``HookDispatcher.emit`` immediately
+    # before the hook loop (like ``blackboard``/``hooks`` above), overwriting the
+    # construction-time default a hand-built event carries outside a dispatch.
+    #
+    # Emission time, not construction time (user decision, #1156 follow-up — the Kafka
+    # CreateTime-vs-LogAppendTime distinction, choosing the append side; DOM's ``timeStamp``
+    # chose creation time and it is a recurring confusion there): exit events are
+    # constructed measurably before they are dispatched, and "when hooks saw it" is the
+    # meaning every derived interval wants. This one uniformly-defined point stamp REPLACED
+    # the ``*Exit`` events' ``start_time``/``end_time`` (the interval-on-record model, #1011)
+    # and ``LLMQueryExit``'s ``call_start_time``/``call_end_time``: the interval fields'
+    # boundary semantics took three caveats to state accurately and had no in-tree interval
+    # consumer, and the call fields lost their only consumer when #1159 made BudgetPool a
+    # scalar enforcer — unread recorded surface, removed per the same dead-surface standard
+    # as ``show_status`` (#719/#1119). Provider-call latency is NOT derivable from event
+    # timestamps (``Complete - Send`` includes Send-stage dispatch); if a consumer ever needs
+    # it exactly, it must be measured at the call site again and given a consumer in the
+    # same change.
+    #
+    # Timezone-aware UTC (user decision, #1163 review): a recorded timestamp must be an
+    # unambiguous absolute time — naive-local is wrong by an hour across a DST fold and
+    # meaningless when a trace is read on another machine — and aware values mix safely
+    # in arithmetic. Naive-local (the codebase's prior convention) was rejected on the
+    # merits, pre-release being the cheapest time; CostTracker's stamps were converted
+    # in the same change so no naive wall-clock stamp remains in src/.
+    #
+    # The default is ``datetime.now`` rather than ``None``: a ``None`` default would make
+    # a never-emitted event *detectable*, but hand-built events fired straight at
+    # handlers (the unit-test pattern) feed consumers like ATIF's
+    # ``timestamp.astimezone(...)`` that need a real datetime — an Optional field would
+    # push a None-guard into every consumer to serve only synthetic events.
+    timestamp: datetime = field(kw_only=True, default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass

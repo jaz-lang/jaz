@@ -9,7 +9,8 @@ unusual home) can redirect all of them at once by setting ``JAZ_CONFIG_DIR``.
 # Why a whole module for two functions: the alternative was each consumer spelling
 # ``os.path.expanduser("~/.jaz")`` itself, which is how the console's history file came to
 # live at ``~/.jaz_repl_history`` — a bare dotfile in the home directory, invisible to any
-# future "where does jaz keep my state?" question. Centralizing makes the directory a
+# future "where does jaz keep my state?" question (it has since moved under this directory,
+# as ``~/.jaz/history``). Centralizing makes the directory a
 # property of the package rather than a string repeated at each call site, and gives the
 # test suite one seam to redirect (see the autouse isolation fixture in tests/conftest.py):
 # without that seam, running the test suite on a machine with a real ``~/.jaz/settings.json``

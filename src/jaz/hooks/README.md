@@ -42,7 +42,32 @@ The trade-offs were worth it for the cleaner API and better composability.
 ### Events
 Discrete points in the agent's execution lifecycle where hooks can observe and influence behavior.
 
-Examples:
+Each of the three spans (invoke, LLM query, REPL execution) fires the same four-stage
+pipeline of value states (`span_event_lifecycle.md`):
+
+```
+proposal ──[edits]──▸ committed input ──[work or supply]──▸ raw result ──[modify]──▸ outcome
+
+*Enter     observes the proposal          controls edits + abort      fires always
+*Send      observes the committed input   controls supply + abort     fires iff the input committed
+*Complete  observes the raw result        controls modify + abort     fires iff a raw result exists
+*Exit      observes the outcome union     controls nothing (terminal) fires whenever the span opened*
+```
+
+Events mark **value states becoming fixed**, not phases of the machinery: an event's payload
+is the commit of the previous stage's effects, so no event can observe its own composition's
+output — only the next event can carry it. `*Send` therefore fires on the supplied/replayed
+path too (the input commit is real even when no provider is called), and `*Exit` carries an
+tagged outcome union (`Completed[...] | Aborted | Failed` — the variant IS the span status,
+its payload the **post-transform** result or the terminating exception) — a span that opened
+closes even when an exception unwinds through it (#892): `outcome=Aborted(exc)` when the
+span's own invoke's `Abort` ended it, `outcome=Failed(exc)` for every other unwind.
+(\*"Whenever the span opened" holds on every *execution* path — normal, abort, unwind.
+The one non-firing state is a framework programming error: a span body that exits cleanly
+without calling `complete()` trips a loud ERROR log and no exit, deliberately — see
+`_log_incomplete_span` in the dispatcher.)
+
+Anchor events:
 - `LLMQueryEnter` - Before making an LLM API call (the always-present per-turn boundary)
 - `REPLExecEnter` - Before executing parsed REPL code (conditional — only on runnable code)
 - `InvokeEnter` - When `jaz.invoke()` is called
@@ -53,47 +78,65 @@ Examples:
 Typed outputs from hooks that express how they want to influence execution. Effects are order-independent and composed by the dispatcher.
 
 Examples:
-- `Abort` - Terminate the invoke with a `Raise` (loop/budget hard-stops). Valid at **every live event**.
-- `OverrideResult` - Supply an `ExecResult` at `REPLExecEnter`, skipping execution.
-- `ModifyResult` - Transform the `ExecResult` at `REPLExecExit` (e.g. budget-forcing a refusal).
+- `Abort` - Abort the invoke: its carried exception raises out of `jaz.invoke()` and the invoke's spans close `Aborted` (loop/budget hard-stops). Valid at **every control event** (`*Enter`/`*Send`/`*Complete`; the `*Exit` events are observation-only).
+- `SupplyExecResult` - Supply an `ExecResult` at `REPLExecSend`, skipping execution.
+- `ModifyExecResult` - Transform the raw result at `REPLExecComplete` / `InvokeComplete` (e.g. budget-forcing a refusal).
 - `AddMessages` - Add message(s) (e.g. instruction text) to the query at `LLMQueryEnter`
-- `OverrideResponse` - Supply a pre-computed LLM response, skipping the API call
+- `SupplyLLMResponse` - Supply a pre-computed LLM response at `LLMQuerySend`, skipping the API call
 
-The two exec-result effects each carry a full `ExecResult`: `OverrideResult` *supplies* one at
-`REPLExecEnter` (execution is skipped; multiple must **agree**), `ModifyResult` *transforms* the
-result at `REPLExecExit` (multiple **fold** — carried `Continue`s concat output + group
-exceptions). `Abort` is *termination* — un-bundled from these (#481) — and is valid at **every
-live event**, so loop/budget control has an always-present home. Emitting an exec-result effect
-at any other event is ignored with a warning.
+The two exec-result effects each carry a full `ExecResult`: `SupplyExecResult` *supplies* one at
+`REPLExecSend` (execution is skipped; multiple **fold** among themselves), `ModifyExecResult`
+*transforms* the raw result at the `*Complete` boundaries (multiple **fold** — carried `Continue`s
+concat output + group exceptions). Suppliers live at `*Send` and transformers at `*Complete`
+because each must see the value state its decision is about: a supplier decides on the committed
+input (at `*Enter`, composition may still rewrite it), a transformer on the raw result. `Abort` is
+*termination* — un-bundled from these (#481) — and is valid at **every
+control event except `LLMQueryRetry`**, so loop/budget control has an always-present home. Emitting an
+effect at an event that does not accept it raises `InvalidEffectError` — out-of-stage
+effects are hook bugs and fail loudly.
+
+At `LLMQueryComplete`, `Abort` is the *only* valid effect. The query has already completed and been
+paid for, so an abort there does not un-do it — it stops the turn before the agent acts on the
+response, meaning the code the model just proposed is never executed. That last part is the
+whole difference from deferring to the next `LLMQueryEnter`, and it is *not* a saving in spend:
+an abort at the next enter fires before the query, so no extra call is paid either way. What the
+deferral costs is an **execution** — the code from the turn that prompted the decision runs in
+between.
 
 **Conditional vs unconditional events (a contract every enforcement hook must
-know):** within a span, enter/exit pairing is guaranteed **with one carve-out — an
-`Abort` at `LLMQueryEnter` skips the paired `LLMQueryExit`** (the query never happens; the
-loop short-circuits to termination). So an observer hook that opens a resource at
-`LLMQueryEnter` and closes it at `LLMQueryExit` (e.g. a tracing span) leaks on every
-hard-stopped turn unless it *also* cleans up at `InvokeExit` — which is where the invoke
-ends and every still-open per-turn resource for that `invoke_id` should be released. The
-in-repo `OTelTracing` does exactly this (ends any orphaned `llm_query` child span at
-`InvokeExit`). Consumers that merely *read* `LLMQueryExit` (budget/cost, history, loggers)
-need no carve-out: an aborted turn ran no query, so there is correctly nothing to record.
-Child spans are also **not** guaranteed to open at all — REPL *execution* events only fire
+know):** a span that opened always closes with its `*Exit`, on every path — an in-flight
+exception fires `Exit(outcome=Failed(exc))` on the unwind (#892), and an `Abort` resolved
+at any of the span's control stages fires `Exit(outcome=Aborted(exc))` before its carried
+exception propagates. A pairing observer (e.g. a tracing span opened at `LLMQueryEnter`)
+can therefore close unconditionally at its `*Exit`. Consumers that merely *read* `*Exit`
+payloads (budget/cost, history, loggers) **must match
+on `event.outcome`**: the payload lives on the `Completed` variant (`event.outcome.result`),
+and the non-completed variants carry the terminating error (`event.outcome.exception`) —
+there are no parallel payload fields. Child spans are
+**not** guaranteed to open at all — REPL *execution* events only fire
 when the LLM response parses to runnable code; a turn whose response fails to parse never
 opens an execution span. So never use
 execution events as a proxy for "once per turn" — a hard stop hung there silently never
 fires for perpetually-unparseable output. Rule of thumb: **liveness / per-turn
 enforcement → `Abort` at `LLMQueryEnter`** (the always-present per-turn boundary — it fires
 unconditionally once per turn, before the query); **result-composed nudges → execution
-exit** (they intentionally compose with what the code actually did). This is how
+*complete*** (the transform boundary — they intentionally compose with what the code
+actually did, and the subsequent `*Exit` carries the post-transform result). This is how
 `IterationLimit` and `BudgetPool` place their hard stops vs soft force-finish nudges.
 
 ### Contexts
 Typed contracts between the dispatcher and agent containing composed effects. Each event type has a specific context type.
 
 Examples:
-- `REPLExecContext` - REPL execution *enter*: can supply a result (OverrideResult) or terminate (Abort)
-- `REPLExecExitContext` - REPL execution *exit*: can transform the result (ModifyResult) or terminate (Abort)
-- `LLMQueryContext` - LLM query *enter*: can edit the prompt (AddMessages/DropMessages), override the response (OverrideResponse), or terminate (Abort)
-- `InvokeContext` - Can add REPL inputs, or terminate (Abort)
+- `REPLExecContext` - REPL execution *enter*: namespace edits (AddVariables/DropVariables) or abort (Abort)
+- `REPLExecSendContext` - REPL execution *send*: supply a result (SupplyExecResult) or abort
+- `REPLExecCompleteContext` - REPL execution *complete*: transform the result (ModifyExecResult) or abort
+- `LLMQueryContext` - LLM query *enter*: prompt edits (AddMessages/DropMessages) or abort
+- `LLMQuerySendContext` - LLM query *send*: override the response (SupplyLLMResponse) or abort
+- `LLMQueryCompleteContext` - LLM query *complete*: abort only
+- `InvokeContext` - Invoke *enter*: add/drop invoke inputs, disable recursion, or abort (Abort)
+- `InvokeSendContext` - Invoke *send*: abort only (no invoke supplier effect exists)
+- `InvokeCompleteContext` - Invoke *complete*: transform the terminal result (ModifyExecResult) or abort
 
 ### Hooks
 Extension points that process events and return effects. Hooks inherit from the `Hook` base class and support the context manager protocol.
@@ -123,51 +166,68 @@ Don't override `_dispatch_event`: it's the framework's private internal event ro
 (#597, renamed from `on_event` in #740 so the router no longer looks like an `on_<event>`
 override point). Override the typed `on_<event>` handlers or `on_any` instead.
 
-### Hook serialization (`to_dict` / `from_dict`)
+### What a hook shows in a trace (`__repr__`)
 
-`Hook.to_dict()` serializes a hook to a JSON-safe `{"class", "qualified_name", "params"}` dict,
-and `Hook.from_dict(d)` reconstructs it. Two uses: recording *what governance applied* in an
-observability trace (the loggers/tracers serialize each active hook at `InvokeEnter`), and
-round-tripping `Config.baseline_hooks` through `Config.to_dict()` → reconstruct.
-
-**Make a hook a dataclass and serialization is free** — no boilerplate:
+Observability consumers — `FileLogger`, `PrintLogger`, `ATIFTrace`, `OTelTracing` — render the
+active hook set at `InvokeEnter` by calling `repr()` on each hook. That string is the whole
+record of what governance applied, so a hook whose configuration constrains the run should say
+so:
 
 ```python
-from dataclasses import dataclass
-from jaz.hooks import Hook
+class MyHook(Hook):
+    def __init__(self, threshold: float = 0.5) -> None:
+        self.threshold = threshold
 
+    def __repr__(self) -> str:
+        return f"MyHook(threshold={self.threshold!r})"
+```
+
+The base `Hook.__repr__` returns `MyHook()` — the class name and nothing else. That is
+deliberately minimal but *stable*: `object.__repr__` would embed the instance's memory address,
+which is noise in a trace and differs between runs, defeating any diff of two traces. Override
+when the configuration is worth recording.
+
+**A dataclass hook needs nothing.** `@dataclass` generates a `__repr__` listing the fields,
+which wins over the base by MRO:
+
+```python
 @dataclass(eq=False)          # eq=False: hooks are identity objects (deduped by `is`, not value)
 class MyHook(Hook):
     threshold: float = 0.5
-
-MyHook(threshold=0.9).to_dict()   # {"class": "MyHook", "qualified_name": ..., "params": {"threshold": 0.9}}
-Hook.from_dict(d)                 # -> MyHook(threshold=0.9)
+                              # repr -> MyHook(threshold=0.5)
 ```
 
-Rules for the dataclass path:
-- Each `init` field becomes a param; `field(init=False)` runtime state (counters, per-invoke
-  dicts, open handles) is **excluded**.
-- A field whose value isn't JSON-safe and has no encoder is **omitted** — it round-trips to its
-  constructor default rather than crashing serialization.
-- For a non-JSON-safe value you *do* want preserved, declare a per-field
-  `field(metadata={"to_dict": encode, "from_dict": decode})` pair (an encoder returning `None`
-  omits the key). This is how `IterationLimit.must_exit_warning` (a callable/str/None)
-  round-trips.
-- Put validation in `__post_init__` (e.g. a range check), and heavy `__init__` work / derived
-  state there too.
+Guidance for what to include:
 
-**Reconstruction never imports by name.** `from_dict` matches `class`/`qualified_name` against a
-registry auto-populated when each `Hook` subclass is defined (`__init_subclass__`), so any
-*imported* subclass **resolves** — built-ins are covered because importing `jaz.hooks` imports
-them all; a custom hook is resolvable once its module is imported. An unknown/unimported class
-raises `ValueError`. A short-name collision requires a matching `qualified_name` to disambiguate.
-A full *round-trip* additionally needs the params, so it holds for any imported **dataclass** hook
-(or one overriding `_to_dict_params`) — a plain-class hook with required constructor args
-serializes to empty params and fails to reconstruct.
+- **Frozen construction params, not runtime state.** Two identically-configured hooks should
+  render identically; a per-invoke counter in the repr makes the record depend on when it was
+  taken. On a dataclass this needs `field(init=False, repr=False)` — `init=False` alone keeps
+  a field out of the constructor but *not* out of the generated repr.
+- **Render the value; the bar for hiding one is high.** Collapsing a field to a flag loses
+  information, so it needs a reason beyond "this could be ugly". A bare callable rendering as
+  `<function w at 0x102e523e0>` is *not* sufficient on its own — a field whose common values read
+  fine as-is (`None`, a plain string, a named function) should show them. (The governance hooks
+  sidestep the question now: `IterationLimit` / `ContextWindowWarning` / `BudgetPool` take a plain
+  `warning_text: str | None`, not a callable.) The one field in-tree that is hidden is
+  `Compaction.summary_prompt`, and only when it holds the
+  default: a 440-character constant otherwise repeated in every record. It is *shown* when the
+  caller overrode it. A repr whose field list varies by instance is fine.
+- **Don't count on the consumer to truncate.** The loggers do (`abbrev_repr(...,
+  max_field_length)`, default 1000), but `ATIFTrace` and `OTelTracing` write the string whole. A
+  value that is large *and* near-constant is worth suppressing at the source; a merely long one
+  that carries real information is not.
+- **No JSON-safety requirement.** A repr is a string, so a value the old serializer had to encode
+  or omit can simply be described.
+- **No module qualifier.** The old serialized record carried a `qualified_name`; a repr does not,
+  so two same-named hooks from different modules are indistinguishable in a trace. Rare enough
+  not to pay for globally; a hook that expects to collide should qualify itself in its override.
 
-A hook that can't reasonably be a dataclass (live objects, `**kwargs`, credentials) stays a plain
-class and overrides `_to_dict_params()` (the explicit escape hatch), or simply doesn't serialize
-its params.
+**There is no hook serialization.** `Hook.to_dict`/`Hook.from_dict`, the `_to_dict_params`
+escape hatch and the qualified-name subclass registry were removed (YAGNI): nothing in the
+codebase ever reconstructed a hook from a dict, the only consumers were the four write-only
+observability sinks above, and maintaining a round-trip contract — JSON-safety rules, per-field
+encoder/decoder pairs, a registry that resolves without importing by name — cost more than the
+debug string it actually produced. `repr()` is that debug string, honestly labelled.
 
 ### HookDispatcher
 Stateless singleton that orchestrates hooks by:
@@ -338,8 +398,8 @@ with Hook1(), Hook2(), Hook3():
               └────────────────────┘
                     │
                     │ Composition Rules:
-                    │ • Abort → Raise (supersedes ModifyResult)
-                    │ • ModifyResult → transforms the ExecResult
+                    │ • Abort → raises its carried error (supersedes ModifyExecResult)
+                    │ • ModifyExecResult → transforms the ExecResult
                     │ • ALL prompts → concatenate
                     │ • MIN iteration limit
                     │ • ALL metrics → record
@@ -402,8 +462,8 @@ class WrapUpHook(Hook):
         # LLMQueryEnter fires once per turn, before the query — count here.
         self._iterations += 1
 
-        # Once past `hard`, terminate the invoke: Abort resolves to a Raise that
-        # propagates out of invoke().
+        # Once past `hard`, terminate the invoke: the Abort's carried error
+        # propagates out of invoke() and the invoke's spans close Aborted.
         if self._iterations > self.hard:
             return [Abort(error=RuntimeError("Iteration limit exceeded"))]
 
@@ -464,18 +524,21 @@ from jaz.hooks import get_dispatcher
 dispatcher = get_dispatcher()
 
 with dispatcher.span_repl_exec(enter_event) as span:
-    if span.enter_override is not None:
-        # An enter-time OverrideResult (supply) / Abort short-circuits execution.
-        exec_result = span.enter_override
+    # ...apply span.ctx namespace deltas to the REPL...
+    span.send()  # fires REPLExecSend; suppliers compose here (an Abort raises)
+    if span.supplied is not None:
+        # A Send-composed SupplyExecResult short-circuits execution.
+        exec_result = span.supplied
     else:
         # Execute REPL code (REPL inputs are injected once at InvokeEnter, not here —
-        # AddInput is InvokeEnter-only, #481)
+        # AddInputs is InvokeEnter-only, #481)
         exec_result = repl.exec(code, ...)
 
-    # Complete the span
+    # Complete the span; REPLExecComplete fires as the block unwinds, then REPLExecExit
+    # carries the post-transform result.
     span.complete(exec_result=exec_result)
 
-# Apply any exit-time ModifyResult transform / Abort.
+# Apply any Complete-time ModifyExecResult transform.
 exec_result = span.get_final_exec_result()
 ```
 
@@ -483,29 +546,31 @@ exec_result = span.get_final_exec_result()
 
 The dispatcher applies explicit composition rules when combining effects from multiple hooks:
 
-### Exec-result / terminate effects (`OverrideResult` / `ModifyResult` / `Abort`)
-`OverrideResult` is valid only at `REPLExecEnter` (supply), `ModifyResult` only at `REPLExecExit`
-(transform); `Abort` is valid at every live event. Where they co-occur (the REPL execution
-boundaries) they compose into the REPL result types (`Continue` / `Return` / `Raise`):
+### Exec-result / abort effects (`SupplyExecResult` / `ModifyExecResult` / `Abort`)
+`SupplyExecResult` is valid only at `REPLExecSend` (supply, with the committed input in view),
+`ModifyExecResult` only at the `*Complete` transform boundaries (`REPLExecComplete` /
+`InvokeComplete`); `Abort` is valid at every control event. Where they co-occur they compose into
+the REPL result types (`Continue` / `Return` / `Raise`):
 
-- **Enter (`OverrideResult`)**: execution is skipped and the supplied result is used. Multiple
-  `OverrideResult`s **fold** among themselves (no `exec_result` to fold onto yet) by the same
-  precedence as the exit boundary — carried `Continue`s concatenate their `output` and group their
-  exceptions, so two hooks vetoing the same input (e.g. a `ValidateREPLInput` and the evals
+- **Send (`SupplyExecResult`)**: execution is skipped and the supplied result is used. Multiple
+  `SupplyExecResult`s **fold** among themselves (no `exec_result` to fold onto yet) by the same
+  precedence as the transform boundary — carried `Continue`s concatenate their `output` and group
+  their exceptions, so two hooks vetoing the same input (e.g. a `ValidateREPLInput` and the evals
   `RestrictReturnValue`) compose into one recoverable rejection; distinct carried `Return` *values*
   still raise `ReturnValueConflictError`. `Abort` supersedes them.
-- **Exit (`ModifyResult`)**: the composed result supersedes the actual `exec_result`; multiple
+- **Complete (`ModifyExecResult`)**: the composed result supersedes the raw `exec_result`; multiple
   **fold** by carried-result kind precedence `Raise` > `Return` > `Continue`. Carried `Continue`s
   concatenate their `output` onto the original's and group their exceptions into an
   `ExceptionGroup`; carried `Return`s cannot merge (two distinct values raise
   `ReturnValueConflictError`, identical ones coalesce); carried `Raise`s group their exceptions. The original's
   exception is folded in only when the outcome is of the same final type; the original `output` is
-  preserved.
+  preserved. The subsequent `*Exit` carries the post-transform result (#906).
 
-Both boundaries share one fold (`_fold_carried_results`); enter passes `original=None`, exit passes
-the executed result.
+Both boundaries share one fold (`_fold_carried_results`); a supply passes `original=None`, a
+transform passes the produced result.
 - **`Abort` supersedes** the exec-result effects at either boundary (termination trumps
-  supply/transform) → `Raise`. Multiple `Abort`s group their exceptions into an `ExceptionGroup`.
+  supply/transform): the span CM raises the carried exception *before* the fold runs, and the
+  span closes `Aborted`. Multiple `Abort`s group their exceptions into an `ExceptionGroup`.
 
 ### Prompt Modifications
 - **Rule**: prompt text is added via `AddMessages` at `LLMQueryEnter`; all adds compose into the query through the message-edit fold (`apply_message_edits`)
@@ -517,23 +582,24 @@ the executed result.
 The dispatcher uses typed contexts to prevent invalid operations:
 
 ```python
-# Type checker knows ctx is REPLExecContext!
+# Type checker knows ctx is REPLExecContext (the *enter* context)!
 with dispatcher.span_repl_exec(...) as span:
-    span.ctx.override_effects  # ✓ Exists
+    span.ctx.added_variables  # ✓ Exists
     span.ctx.message_edits  # ✗ Type error - doesn't exist on REPLExecContext
+    # (supply effects live on REPLExecSendContext, composed when span.send() fires)
 
-# Type checker knows ctx is LLMQueryContext!
+# Type checker knows ctx is LLMQueryContext (the *enter* context)!
 with dispatcher.span_llm_query(...) as span:
     span.ctx.message_edits  # ✓ Exists
-    span.ctx.override_response  # ✓ Exists
-    span.ctx.override_effects  # ✗ Type error - doesn't exist on LLMQueryContext
+    span.ctx.added_variables  # ✗ Type error - doesn't exist on LLMQueryContext
+    # (a supplied response lands on span.supplied_response after span.send(...))
 ```
 
 Read-only contexts prevent invalid operations:
 
 ```python
-# An OverrideResult / ModifyResult emitted at an event that can't compose it
-# (e.g. LLMQueryEnter) is logged as a warning and ignored — but Abort is
+# A SupplyExecResult / ModifyExecResult emitted at an event that can't compose it
+# (e.g. LLMQueryEnter) raises InvalidEffectError — but Abort is
 # valid there and terminates the invoke.
 ```
 
@@ -559,7 +625,7 @@ class AdaptiveBudgetHook(Hook):
         # Check the hard stop first so an exhausted budget terminates rather than
         # merely warning.
         if self._utilization() >= 1.0:
-            # Abort is valid at every live event and resolves to a terminal Raise.
+            # Abort is valid at every control event; its carried error propagates.
             return [Abort(error=BudgetExhaustedError())]
 
         # Otherwise, warn the agent to wrap up (prompt modification, composed at the query).
@@ -680,15 +746,16 @@ To add new capabilities to the hook system:
 # events/my_event.py
 @dataclass
 class MyCustomEvent(Event):
-    """My custom event. Inherits the required `config` field from Event (#463)."""
+    """My custom event. Inherits the required `config` field from Event (#463),
+    plus `timestamp` — the emission stamp emit() sets on every event. Do NOT
+    redeclare a field named `timestamp`: emit() overwrites it."""
     data: str
-    timestamp: float
 
 # dispatcher.py - add span method. The Agent passes the invoke's effective config
 # into the enter event (self.config); the dispatcher copies it onto the exit event.
 @contextmanager
 def span_my_custom(self, config: "Config", data: str):
-    enter_event = MyCustomEvent(config=config, data=data, timestamp=time.time())
+    enter_event = MyCustomEvent(config=config, data=data)
     effects = self.emit(enter_event)
     ctx = self._compose_my_custom(effects)
     span = Span(ctx=ctx)

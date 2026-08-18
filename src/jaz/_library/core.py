@@ -26,8 +26,8 @@ class Library:
 
     A library is a collection of tools (functions or other objects with ``__name__``
     / ``__doc__``) assembled into a hierarchical namespace, like a Python package.
-    Its construction ergonomics — dotted-path :meth:`add`, the
-    :meth:`register` decorator, nested submodules with docstrings — are the reason
+    Its construction ergonomics — dotted-path :meth:`~Library.add`, the
+    :meth:`~Library.register` decorator, nested submodules with docstrings — are the reason
     it still exists; ``SimpleNamespace`` covers the flat case, ``Library`` is nicer
     for nested namespaces built at runtime (tools that close over per-episode state).
 
@@ -46,13 +46,20 @@ class Library:
 
     Constraint: a ``Library`` used as an input must have **exactly one root module**
     (every real library does); see :meth:`_single_root_module`. The privileged
-    multi-name binding (``add_self_to_program_state``) survives only to bind the
-    framework's own JAZ library and to support eval harnesses with their own REPLs.
+    multi-name binding (``add_self_to_program_state``) survives only to support eval
+    harnesses with their own REPLs.
 
     Methods:
     - add(tool_path: str, tool: object): Add a tool to the library at the
       path specified by tool_path.
     """
+
+    # ``Library`` is now purely a *user*-facing builder. The framework used to eat its own
+    # dog food here — the recursive sub-invoke tool shipped as a one-member ``Library`` named
+    # "JAZ" whose root module was ``jaz``, which is where ``add_self_to_program_state`` and
+    # ``render_prompt_description`` came from. That wrapper went away with the ``jaz.``
+    # prefix (the primitive is now a bare callable — see ``jaz._invoke_tool``), so both
+    # methods are kept for out-of-core callers only, and no core path constructs a ``Library``.
 
     def __init__(
         self,
@@ -199,7 +206,7 @@ class Library:
         ``jaz.invoke(tools=lib)`` produces ``tools.bash(...)`` regardless of the root
         module's internal name.
 
-        The body is delegated to :meth:`default_description` so a ``jaz.describe``
+        The body is delegated to :meth:`~Library.default_description` so a ``jaz.describe``
         override can *compose* with the default catalog rather than replace it
         wholesale: ``jaz.get_description`` routes back through this method
         (which the override has replaced), so the default has to be reachable by a
@@ -214,7 +221,7 @@ class Library:
         library's description via ``jaz.describe`` can still reach the default
         rendering and append to it, e.g.::
 
-            jaz.describe(
+            describe(
                 lib, lambda l, name: f"Custom note.\\n\\n{l.default_description(name)}"
             )
 
@@ -227,11 +234,10 @@ class Library:
     def render_prompt_description(self, *, full_docstrings: bool = True) -> str:
         """Render the full library card (name + description + tool catalog).
 
-        Used for the dedicated ``<jaz_library>`` system-prompt block (the always-present
-        JAZ library). The per-object catalog walk is shared with the general
-        ``jaz.Catalog`` render mode via :func:`jaz._catalog.render_catalog`, so the two
-        cannot drift. Each root module is rendered rooted at its own name (real
-        libraries have exactly one root; see ``_single_root_module``).
+        The per-object catalog walk is shared with the general ``jaz.Catalog`` render mode
+        via :func:`jaz._catalog.render_catalog`, so the two cannot drift. Each root module is
+        rendered rooted at its own name (real libraries have exactly one root; see
+        ``_single_root_module``).
 
         ``full_docstrings`` defaults to ``True`` — render comprehensively; pass
         ``False`` to opt into compact (first-line-only) rendering when size matters.

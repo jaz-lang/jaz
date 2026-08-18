@@ -77,9 +77,27 @@ def convert_log(input_path: str) -> str:
         # Derive the total from the iteration counter rather than counting
         # entries present, so the count stays correct even if the log was
         # trimmed (e.g. to metadata + final iteration).
-        num_iters = max(
-            (e.get("iteration", 0) for e in entries if e.get("type") == "iteration"),
-            default=0,
+        # +1 because `iteration` is a 0-based index and this reports a count (#719): the
+        # highest index seen is one less than the number of iterations. `default=-1` keeps an
+        # empty log at 0 rather than reporting a phantom first iteration. Entries missing the
+        # key are skipped rather than counted as index 0, which would pull against that default
+        # by implying a first iteration that was never recorded.
+        #
+        # Logs written before #719 carried 1-based numbers, so this over-reports them by one.
+        # Accepted: pre-#719 logs are out of scope, and the alternative (sniffing whether the
+        # minimum index is 0 or 1) guesses at the format from its contents. Nothing in the file
+        # records which base wrote it — if that ever matters, the fix is a version field in the
+        # metadata entry, not a heuristic here.
+        num_iters = (
+            max(
+                (
+                    e["iteration"]
+                    for e in entries
+                    if e.get("type") == "iteration" and "iteration" in e
+                ),
+                default=-1,
+            )
+            + 1
         )
         lines.append(f"- **Total iterations**: {num_iters}")
         lines.append("")

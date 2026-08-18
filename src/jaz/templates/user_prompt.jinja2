@@ -1,6 +1,6 @@
 {{ inputs_str }}{% if input_names %}{% set plural = input_names | length > 1 %}
 The input variable{{ "s" if plural else "" }} `{{ input_names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
-{% if recursion_available %}{{ "They are" if plural else "It is" }} not automatically available to `jaz.invoke()` calls you make, so making {{ "them" if plural else "it" }} available to sub-invokes requires passing {{ "them" if plural else "it" }} explicitly.
+{% if recursion_available %}{{ "They are" if plural else "It is" }} not automatically available to `invoke()` calls you make, so making {{ "them" if plural else "it" }} available to sub-invokes requires passing {{ "them" if plural else "it" }} explicitly.
 {% endif %}{% endif %}{% if truncation_advice_str %}
 {{ truncation_advice_str }}
 {% endif %}

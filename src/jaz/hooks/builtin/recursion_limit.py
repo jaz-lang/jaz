@@ -20,7 +20,7 @@ agent is depth 1):
 - **Affordance removal at the cap leaf** (``depth == max_depth``): emit ``DisableRecursion``,
   which the primitive honors by binding the REPL and rendering the system prompt WITHOUT the
   recursive ``jaz.invoke`` tool. The at-cap agent never sees the tool — the same UX the old
-  ``jaz_library=None`` gate gave, not a "tool present but the call fails" model.
+  ``invoke_tool=None`` gate gave, not a "tool present but the call fails" model.
 - **Backstop for an over-cap child** (``depth > max_depth``): emit ``Abort`` carrying a
   ``RecursionLimitError``. Affordance removal means an honest agent never gets here, but the
   *public* ``jaz.invoke`` (reached from a human-written tool, or a deliberately injected real
@@ -68,7 +68,7 @@ and that is exactly the case ``setup()`` raises on. ``__enter__`` marks itself s
 For a *propagating* install, stacking a *stricter* ``RecursionLimit`` unions the effects — the
 stricter one fires (disables / aborts) at a shallower depth and can't be loosened — so
 tighten-only composition falls out with no special plumbing, exactly as ``IterationLimit``
-documents for its Aborts.
+documents for its aborts.
 
 ## Why ``on_invoke_enter``, not ``on_llm_query_enter``
 
@@ -191,17 +191,18 @@ class RecursionLimit(Hook):
     #
     # The docstring states the two observable outcomes rather than the effects.
 
-    # A ``@dataclass(eq=False)`` so ``to_dict``/``from_dict`` derive ``{max_depth}`` from the
-    # field automatically (no ``_to_dict_params`` boilerplate). ``eq=False`` keeps identity
-    # semantics (hooks are deduped by ``is``, not value). ``kw_only`` preserves the keyword-only
-    # constructor.
+    # A ``@dataclass(eq=False)`` so the generated ``__repr__`` lists ``max_depth`` — which is
+    # what observability consumers record — without a hand-written one. ``eq=False`` keeps
+    # identity semantics (hooks are deduped by ``is``, not value). ``kw_only`` preserves the
+    # keyword-only constructor.
 
     max_depth: int
 
     # True only for the dynamic extent of ``__enter__`` (the ``with`` install path), so the
     # ``setup()`` that ``__enter__`` triggers knows it is a legitimate propagating install.
-    # ``init=False`` so it is per-instance lifecycle bookkeeping, kept out of the constructor AND
-    # out of serialization (to_dict skips ``init=False`` fields), not a construction param.
+    # ``init=False`` so it is per-instance lifecycle bookkeeping rather than a construction
+    # param, and ``repr=False`` so it stays out of the record — ``init=False`` alone would NOT
+    # have, since the generated ``__repr__`` includes non-init fields.
     _entering_via_context: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:

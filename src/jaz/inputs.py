@@ -1,7 +1,7 @@
 """Input payload resolution — the ``__jaz_get__`` protocol.
 
 An input value may be a *wrapper* that carries metadata while the agent should bind its
-*payload*. The canonical example is :class:`jaz.Library`: ``jaz.invoke(env=lib)`` binds
+*payload*. The canonical example is :class:`jaz.library.Library`: ``jaz.invoke(env=lib)`` binds
 the library's root *module* as ``env`` (so the agent calls ``env.bash(...)``), while the
 ``Library`` itself is bookkeeping and also renders a tool catalog via
 ``__jaz_description__``. The ``__jaz_get__`` protocol — modeled on Python's descriptor
@@ -16,7 +16,7 @@ framework objects (e.g. ``Library``), not by any one REPL, and every REPL that b
 inputs needs the same substitution. So the agent loop resolves inputs *before* handing
 them to ``REPL.initialize`` — each REPL then receives already-bound payloads, and the
 resolved set is the single canonical input set used for namespace binding,
-``__inputs__``, and ``__repl_history__``. The prompt builder keeps the *raw* wrappers so
+``__inputs__``, and ``__history__``. The prompt builder keeps the *raw* wrappers so
 value-attached descriptions (``__jaz_description__`` / ``jaz.Display``) still render;
 resolution feeds binding, not display.
 

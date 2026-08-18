@@ -1,5 +1,5 @@
 import threading
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
 
@@ -62,7 +62,7 @@ class CostTracker:
     Pure accounting: it records LLM calls, propagates local + subtree-cumulative
     spend up its tree, and serializes to the JSON cost tree. It owns **no budget** —
     the one budget, the running aggregate, and all enforcement live on
-    :class:`~jaz.hooks.builtin.budget_pool.BudgetPool` (the pool). Each
+    :class:`~BudgetPool` (the pool). Each
     top-level invoke under the hook is its own root; nested invokes chain off their
     real parent (so the hook holds a *forest*, not a single tree).
     """
@@ -123,13 +123,13 @@ class CostTracker:
         """Mark the start time of this invoke call"""
         if self.start_time is not None:
             raise ValueError("Already started")
-        self.start_time = datetime.now()
+        self.start_time = datetime.now(UTC)
 
     def end(self) -> None:
         """Mark the end time of this invoke call and calculate duration"""
         if self.start_time is None:
             raise ValueError("Must call start() before calling any other methods")
-        self.end_time = datetime.now()
+        self.end_time = datetime.now(UTC)
         if self.start_time is not None:
             self.duration = self.end_time - self.start_time
 

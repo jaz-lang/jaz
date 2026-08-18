@@ -2,8 +2,8 @@
 
 The provider error classes are **defined in ``jaz.exceptions``** (so they share the
 ``JazException`` base — one catch-all — and are importable from the single public home
-``jaz.exceptions`` without exposing the internal ``jaz.providers`` package). They are
-re-exported here for back-compat: ``from jaz.providers.exceptions import X`` still works,
+``jaz.exceptions`` without exposing the internal ``jaz.llm`` package). They are
+re-exported here for back-compat: ``from jaz.llm.exceptions import X`` still works,
 and this remains the module the provider implementations import from. This module also
 hosts the provider-only ``is_content_policy_violation`` helper used by the OpenAI /
 Anthropic error mappers.
@@ -14,7 +14,7 @@ from __future__ import annotations
 # Absolute rather than the relative form used elsewhere in src/jaz, deliberately: this
 # module is a shim onto a *fixed canonical home*, so the import should name that home.
 # `..exceptions` resolves relative to this module's own package, so moving this file to
-# another depth (e.g. providers/llm/exceptions.py) would silently repoint it at a path
+# another depth (e.g. llm/llm/exceptions.py) would silently repoint it at a path
 # that doesn't exist; `jaz.exceptions` survives any move. The usual argument for relative
 # imports — surviving a rename or vendoring of the `jaz` package itself — is the less
 # likely event, and would break this shim's premise anyway.

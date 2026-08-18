@@ -1,30 +1,30 @@
-You are currently in a multiturn REPL session.
-{{ repl_summary }}
+You are in a multiturn REPL session.
 
-<output_format>
-- Respond with ONLY code. Your entire response will be sent verbatim to the REPL and executed as code.
-  Anything in your response that is not valid code is a syntax error.
-  - All natural language prose MUST be written as *comments* in your code.
-  - Do NOT wrap your code in markdown fences or XML tags.
-- Write a brief plan for your next step in comments on the first few lines of your response/code:
+<response_format>
+{{ format_instructions }}
+</response_format>
 
-    # <brief plan for next step>
-    code_for_next_step
-
-</output_format>
-
+<repl_spec>
 {{ repl_specific_instructions }}
-{% if jaz_library %}
+</repl_spec>
+{% if history_description %}
 
-<jaz_library>
-The JAZ library below is already bound in your REPL — do not import it.
+You have access to the `__history__` magic variable containing the history of your interactions with the REPL:
+<__history__ type="list">
+{{ history_description }}
+</__history__>
+{% endif %}
+{% if invoke_tool %}
 
-{{ jaz_library }}
-</jaz_library>
+To launch a sub-invoke (sub-agent or LLM call), call the `invoke` function described below,
+which is already available in your REPL and the REPLs of recursive sub-invokes.
+<invoke type="function">
+{{ invoke_tool }}
+</invoke>
 {% endif %}
 {% if scoped_inputs_str %}
 
 {{ scoped_inputs_str }}{% if scoped_names %}{% set plural = scoped_names | length > 1 %}
 The scoped variable{{ "s" if plural else "" }} `{{ scoped_names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
-{% if show_depth %}{{ "They are" if plural else "It is" }} also automatically available to every `jaz.invoke()` you make, so do not pass {{ "them" if plural else "it" }} explicitly to sub-invokes.
+{% if show_depth %}{{ "They are" if plural else "It is" }} also automatically available to every `invoke()` you make, so do not pass {{ "them" if plural else "it" }} explicitly to sub-invokes.
 {% endif %}{% endif %}{% endif %}
