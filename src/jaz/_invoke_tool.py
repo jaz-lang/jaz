@@ -108,10 +108,10 @@ def get_invoke_tool(
                 config-override object — passed as leading positional arguments.
             **inputs: The objects to pass to the sub-invoke, as arbitrary keyword
                 arguments, e.g., ``invoke(task="...", data=data, tool=tool)``. Inputs
-                may include instructions for the sub-agent, tools the sub-agent is
-                allowed to call, and any other objects it needs access to. Each keyword
-                argument input binds as a variable in the sub-agent's REPL under its
-                keyword name and renders as its own description in the sub-agent's
+                may include instructions for the sub-agent, tools (regular Python callables)
+                the sub-agent is allowed to call, and any other objects it needs access to.
+                Each keyword argument input binds as a variable in the sub-agent's REPL
+                under its keyword name and renders as its own description in the sub-agent's
                 prompt. By default, an input's rendered description is its ``str()``
                 representation, with the following exceptions: a class renders as its
                 docstring and public members; any other callable (a function, a method,
@@ -125,11 +125,11 @@ def get_invoke_tool(
 
         # Split the positional args exactly like the public jaz.invoke: pull out the
         # (at most one) ConfigOverride, then resolve the return type from a positional
-        # ReturnType(...) hook and add the config-level ValidateREPLInput hook. There is no
+        # ReturnType(...) hook. There is no
         # return_type=/config_override= keyword on this surface anymore (#528) — a ReturnType
         # is a Hook so it stays in `hooks_only` for _resolve_invoke_hooks to extract, and
-        # value/input validators reach here as ordinary positional ValidateReturn /
-        # ValidateREPLInput hooks. Same helpers as the host `invoke`. Lazy import: jaz.invoke
+        # return/code validators reach here as ordinary positional ValidateReturn /
+        # ValidateREPLCode hooks. Same helpers as the host `invoke`. Lazy import: jaz.invoke
         # is fully loaded by the time this closure runs, but a module-level import would
         # participate in the jaz.invoke -> jaz._invoke_tool import cycle.
         #
@@ -284,7 +284,7 @@ def get_invoke_tool(
     # The agent-facing sub-invoke is a single full signature: the `invoke` closure itself —
     # `(*local_config_hooks, **inputs)`, the same positional hooks + ConfigOverride surface as
     # the public jaz.invoke. The agent declares a return type / validators / metadata with the
-    # ReturnType / ValidateReturn / ValidateREPLInput / MetaData hooks and a local override with
+    # ReturnType / ValidateReturn / ValidateREPLCode / MetaData hooks and a local override with
     # ConfigOverride — the hook classes must be reachable in the REPL (passed in as inputs by the
     # host). Binding inputs as REPL variables is a SEPARATE concern (not gated here): #568 removed
     # `expose_inputs_in_repl`, inputs always bind, and withholding them is a hook (evals'

@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 
 class ParsedCode(NamedTuple):
-    """The success result of :meth:`BaseProtocol.parse` — the decoded input.
+    """The success result of :meth:`BaseProtocol.parse` — the decoded code.
 
     A named type rather than a bare ``tuple``: the slots are self-documenting, call sites
     aren't coupled to position, and a new field can be added without silently breaking
@@ -90,7 +90,7 @@ class BaseProtocol(ABC):
         loop catches nothing here, so any exception is terminal and ends the invoke — an agent
         that emitted one bad message loses the whole run. Return your best reading instead,
         including the message verbatim when you have none, and let the REPL judge it; that is
-        where malformed input surfaces anyway, as a ``SyntaxError`` inside a recoverable
+        where malformed code surfaces anyway, as a ``SyntaxError`` inside a recoverable
         ``Continue`` the model can react to. An empty message is empty *code*, i.e. a no-op turn.
         """
         ...
@@ -147,16 +147,18 @@ class BaseProtocol(ABC):
         messages or a multi-block message: one ``tool`` message per parallel tool call
         (OpenAI requires one result per ``tool_call_id``), or a single message carrying
         several ``tool_result`` / image content blocks (Anthropic returns all parallel
-        results together in one user message). A ``str`` return could express neither, so
-        the final ``basics.md`` shape is landed now, while ``CodeOnlyProtocol`` is the only
-        implementer, rather than re-breaking this ABC once such a protocol lands.
+        results together in one user message). A ``str`` return could express neither.
 
         The driver appends the returned messages verbatim — persisted history is pure protocol
-        output, with no per-turn footer folded in (#634 removed the budget-status / "Enter your
-        next REPL input" footer). Hook prompt additions, when present, are the *driver's* concern,
-        not the protocol's (``basics.md``: "per-turn warnings are hook additions the driver
-        concatenates").
+        output, with no per-turn footer folded in. Hook prompt additions, when present, are the
+        *driver's* concern, not the protocol's.
         """
+        # The list return is the shape specified in ``design/design_features/basics.md``, landed
+        # while ``CodeOnlyProtocol`` is still the only implementer rather than re-breaking this
+        # ABC once a parallel-tool-call protocol needs it. #634 removed the per-turn footer (the
+        # budget-status / "Enter your next REPL input" block) that used to be folded in here,
+        # which is what makes the verbatim-append guarantee true. ``basics.md`` is also where
+        # "per-turn warnings are hook additions the driver concatenates" is settled.
         ...
 
     @abstractmethod
@@ -198,7 +200,7 @@ class BaseProtocol(ABC):
             depth: This invoke's recursion depth (0 at the top level).
             recursion_available: Whether sub-invokes are still permitted at this depth,
                 for the delegation guidance.
-            repl_language: The REPL's language tag for the rendered input/observation blocks.
+            repl_language: The REPL's language tag for the rendered code/observation blocks.
             input_display_overrides: Per-input display text (relabel/hide), or ``None``.
 
         As with :meth:`~BaseProtocol.render_observation`, the driver folds any hook ``AddInputs`` /
@@ -235,15 +237,14 @@ class BaseProtocol(ABC):
         CodeOnlyProtocol` implements the standard entry. ``llm_response`` is the whole
         ``LLMResponse`` rather than the pre-extracted content string, so an implementation may
         fold in token counts / cost / provider ``extra`` without another signature break. The ``| None`` is an **external-only affordance** (a caller
-        that has no response object): in the loop, ``_llm_response_to_record`` returns an
-        ``LLMResponse`` by construction — its input is a ``str``, not ``str | None`` — so the
-        framework never passes ``None`` here, and a future reader need not hunt for a loop path
-        that does.
+        that has no response object): the loop always has a response object by construction, so
+        the framework never passes ``None`` here.
 
         The core agent loop is the single writer of ``__history__`` and appends one entry per
-        iteration from the finalized (post-effect-composition) result via this method — see
-        ``agent.do_one_repl_iteration`` / ``_record_history``.
+        iteration from the finalized (post-effect-composition) result via this method.
         """
+        # Loop side: ``agent.do_one_repl_iteration`` / ``_record_history`` are the writers, and
+        # ``_llm_response_to_record`` is why the ``| None`` arm is never taken internally.
         ...
 
     def describe_history_entry(self) -> str:

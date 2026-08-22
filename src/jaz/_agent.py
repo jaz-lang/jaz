@@ -38,7 +38,7 @@ from .provenance import (
     set_provenance,
     to_wire_messages,
 )
-from .repl.base import BaseREPL
+from .repl.base import BaseREPL, REPLState
 from .repl.registry import REPL_LANGUAGE_MAP
 from .repl.types import (
     Continue,
@@ -54,7 +54,8 @@ class REPLIterationResult[ReturnT](NamedTuple):
 
     Attributes:
         exec_result: The execution result from the REPL
-        repl: The REPL used for this iteration
+        state: The per-invoke :class:`REPLState` threaded across iterations (#1058); the REPL
+            itself is stateless config, so it is not carried here.
         response_content: The LLM response content. Never None: the no-response cases
             that used to produce one (a failed LLM call, an ``Abort`` at ``LLMQueryEnter``)
             now *raise* out of the query under the abort model, so an iteration result only
@@ -64,7 +65,7 @@ class REPLIterationResult[ReturnT](NamedTuple):
     """
 
     exec_result: ExecResult[ReturnT]
-    repl: BaseREPL
+    state: REPLState
     response_content: str
     code: str | None
 
@@ -120,8 +121,9 @@ class Agent:
         if repl not in REPL_LANGUAGE_MAP:
             raise ValueError(f"Unsupported REPL language: {repl}")
         self.repl_language: str = repl
-        # The configured REPL is a *template*: `initialize` returns a fresh instance per invoke
-        # and leaves this one clean, so one config can serve many invokes (#1056).
+        # The configured REPL is a stateless *template*: `initialize` returns a fresh `REPLState`
+        # per invoke and the template holds no per-invoke state, so one config safely serves many
+        # concurrent invokes (#1056, #1058).
         self.repl_template: BaseREPL = self.config.repl
         self.llm_client: BaseLLM = self.config.llm
         self.model: str = self.llm_client.get_model()
@@ -318,6 +320,15 @@ class Agent:
                     **self.llm_client.request_defaults,
                 )
             result = self._record_llm_response(llm_response, span)
+        # Span closed: a Complete-stage ModifyLLMResponse may have replaced the response
+        # (authoritative — see resolve_llm_modify_results). If so, re-read it: its content is what
+        # the agent parses next, and the same object is what LLMQueryExit carried and BudgetPool
+        # booked, so content / observers / cost all agree. The identity check leaves the common
+        # no-transform path (same object) untouched, and covers the supplied-response path too.
+        final_response = span.get_response()
+        if final_response is not llm_response:
+            self._last_llm_response = final_response
+            result = final_response.content or ""
         return result
 
     def _compose_shown_messages(
@@ -476,14 +487,17 @@ class Agent:
         invoke_id: str,
         iteration: int,
         depth: int,
-    ) -> tuple[str, float | None, REPLExecEnter]:
+    ) -> tuple[float | None, REPLExecEnter]:
         """Record the assistant response and decode it into an execution plan.
 
         Shared by the sync and async iteration paths — which differ *only* in how the
         response is fetched and how the code is executed; everything around that is
         identical and lives here (and in :meth:`_finalize_iteration`) so the two paths
         cannot drift. Appends the assistant message, then parses, and always returns
-        ``(code, exec_timeout_override, enter_event)``.
+        ``(exec_timeout_override, enter_event)``. The parsed code rides on ``enter_event.code``
+        (its edit target); the code that actually *runs* is ``span.committed_code`` — the enter
+        code after any ``InsertCode`` / ``DeleteCode`` — so the bare parsed string is not returned
+        separately (it would be dead at both call sites).
 
         There is exactly one outcome now. This used to return either that tuple or a ready
         ``REPLIterationResult`` carrying a recoverable parse error, which callers told apart with
@@ -523,13 +537,13 @@ class Agent:
             code=code,
             depth=depth,
         )
-        return code, exec_timeout_override, enter_event
+        return exec_timeout_override, enter_event
 
     def _finalize_iteration(
         self,
         span: REPLExecSpan,
         code: str,
-        repl: BaseREPL,
+        state: REPLState,
         response_content: str,
         repl_history: list[object] | None,
     ) -> REPLIterationResult[Any]:
@@ -551,7 +565,7 @@ class Agent:
         )
         return REPLIterationResult(
             exec_result=exec_result,
-            repl=repl,
+            state=state,
             response_content=response_content,
             code=code,
         )
@@ -629,7 +643,7 @@ class Agent:
         depth: int,
         can_recurse: bool,
         messages: list[MessageDict],
-        repl: BaseREPL,
+        state: REPLState,
         invoke_id: str,
         repl_history: list[object] | None = None,
     ) -> REPLIterationResult[Any]:
@@ -656,8 +670,8 @@ class Agent:
         )
         # Apply any persistent message edits (compaction) to the carried-forward buffer.
         self._apply_persistent_message_edits(messages, iteration)
-        code, exec_timeout_override, enter_event = self._record_response_and_parse(
-            messages, response_content, repl, invoke_id, iteration, depth
+        exec_timeout_override, enter_event = self._record_response_and_parse(
+            messages, response_content, self.repl_template, invoke_id, iteration, depth
         )
 
         with self.dispatcher.span_repl_exec(enter_event) as span:
@@ -680,14 +694,15 @@ class Agent:
             # remove a name another effect adds in the same turn (the add now wins). A drop that
             # outlives an add is the same mechanism that lets a stale drop erase one, and the two
             # cannot both hold in a single pass.
-            repl.drop_variables(
+            self.repl_template.drop_variables(
+                state,
                 span.ctx.dropped_variables,
                 allow_missing=span.ctx.dropped_variables_allow_missing,
             )
-            repl.add_variables(span.ctx.added_variables)
-            # REPLExecSend — fires iff the input committed. The namespace deltas above just
-            # ran, so the execution's input (code + committed namespace) is final. Send is
-            # the supply boundary: suppliers (ValidateREPLInput, evals Restrict*) compose
+            self.repl_template.add_variables(state, span.ctx.added_variables)
+            # REPLExecSend — fires iff the code committed. The namespace deltas above just
+            # ran, so the execution's commit (code + committed namespace) is final. Send is
+            # the supply boundary: suppliers (ValidateREPLCode, evals Restrict*) compose
             # here and the resolved short-circuit lands on span.supplied; an Abort raises
             # its carried exception out of span.send() instead (the span closes Aborted —
             # see span_repl_exec).
@@ -697,14 +712,19 @@ class Agent:
                 # the code and use the supplied result instead.
                 exec_result = span.supplied
             else:
-                # Execute the code. (Invoke inputs are folded in once at InvokeEnter, not here:
-                # AddInputs/DropInputs are InvokeEnter-only — #481. Per-turn namespace binds go
-                # through AddVariables/DropVariables above.)
-                exec_result = repl.exec(code, str(iteration), exec_timeout_override)
+                # Execute the COMMITTED code — the enter code after any InsertCode/DeleteCode
+                # edits (span.committed_code == the original when no hook edited it). This is the
+                # same string REPLExecSend observers saw, so what runs matches what was validated.
+                # (Invoke inputs are folded in once at InvokeEnter, not here: AddInputs/DropInputs
+                # are InvokeEnter-only — #481. Per-turn namespace binds go through
+                # AddVariables/DropVariables above.)
+                exec_result = self.repl_template.exec(
+                    state, span.committed_code, str(iteration), exec_timeout_override
+                )
             span.complete(exec_result=exec_result)
 
         return self._finalize_iteration(
-            span, code, repl, response_content, repl_history
+            span, span.committed_code, state, response_content, repl_history
         )
 
     def _append_observation_messages(
@@ -959,32 +979,42 @@ class Agent:
                 if type(self.repl_template).maintains_repl_history
                 else None
             )
-            # The configured REPL comes off the config; `initialize` returns a fresh instance
-            # carrying this run's state and leaves the template clean for the next invoke.
-            repl = self.repl_template.initialize(
-                inputs=resolved_bound,
-                invoke_tool=effective_invoke_tool,
-                session_id=session_id,
-                initial_repl_history=repl_history,
-            )
+            # Build the REPL state and the opening prompt only when no result was supplied at
+            # Send: a SupplyInvokeResult short-circuits the whole invoke, and `initialize` resolves
+            # the invoke's inputs (possibly with I/O) while `render_initial_message_list` can run
+            # arbitrary custom-protocol work — neither should run for a supplied invoke, and a
+            # failure building them must not discard the supplied result. They stay None on that
+            # path; the loop below breaks on `span.supplied` before it would read either.
+            state: REPLState | None = None
+            messages: list[MessageDict] | None = None
+            if span.supplied is None:
+                # The configured REPL is a stateless template; `initialize` returns this run's
+                # `REPLState` (#1058), threaded into every exec below. The protocol opener still
+                # gets the config template (it reads only config: description, history capability).
+                state = self.repl_template.initialize(
+                    inputs=resolved_bound,
+                    invoke_tool=effective_invoke_tool,
+                    session_id=session_id,
+                    initial_repl_history=repl_history,
+                )
 
-            messages: list[MessageDict] = self.protocol.render_initial_message_list(
-                inputs,
-                scope,
-                repl,
-                invoke_tool=effective_invoke_tool,
-                depth=depth,
-                recursion_available=can_recurse,
-                repl_language=self.repl_language,
-                input_display_overrides=None,
-            )
-            # A custom BaseProtocol must return a non-empty opener. Guard it loudly
-            # here (the load-bearing half of the old iteration-0 footer assert, #705): an
-            # empty list otherwise slips past _stamp_seed_provenance and surfaces later as a
-            # muddier empty-message-list error at the first query.
-            assert messages, "render_initial_message_list returned an empty opener"
+                messages = self.protocol.render_initial_message_list(
+                    inputs,
+                    scope,
+                    self.repl_template,
+                    invoke_tool=effective_invoke_tool,
+                    depth=depth,
+                    recursion_available=can_recurse,
+                    repl_language=self.repl_language,
+                    input_display_overrides=None,
+                )
+                # A custom BaseProtocol must return a non-empty opener. Guard it loudly
+                # here (the load-bearing half of the old iteration-0 footer assert, #705): an
+                # empty list otherwise slips past _stamp_seed_provenance and surfaces later as a
+                # muddier empty-message-list error at the first query.
+                assert messages, "render_initial_message_list returned an empty opener"
 
-            self._stamp_seed_provenance(messages)
+                self._stamp_seed_provenance(messages)
 
             # (Invoke-level AddInputs/DropInputs were already folded into inputs/scope/
             # resolved_bound above via _apply_input_effects, before the REPL and prompt were
@@ -1018,8 +1048,8 @@ class Agent:
             # Consequences to keep straight, since a 0-based *position* now sits next to counts:
             # ``max_iterations`` stays a COUNT (50 means 50 turns, indices 0-49), so IterationLimit
             # hard-stops on ``iteration >= max_iterations`` and its last allowed index is
-            # ``max_iterations - 1``; ATIF ``total_steps`` and rlm_log_viewer's total are counts too,
-            # so they are ``final index + 1``. IterationLimit's approaching-limit warning reads
+            # ``max_iterations - 1``; ATIF ``total_steps`` is a count too, so it is
+            # ``final index + 1``. IterationLimit's approaching-limit warning reads
             # the remaining turns straight off this 0-based index (``max_iterations - iteration``),
             # an absolute turn count rather than a fraction of the cap (see
             # ``IterationLimit.warn_remaining``, and the sibling ``BudgetPool.warn_*_remaining``).
@@ -1035,6 +1065,20 @@ class Agent:
             # Watch for falsiness when adding a consumer: iteration 0 is falsy, so ``if iteration:``
             # silently means "not the first turn". Use ``is not None``.
             for i in itertools.count():
+                # A hook supplied this invoke's terminal result at InvokeSend (span.supplied, set
+                # once by span.send() before the loop): complete with it instead of running any
+                # turn, so a supplied invoke makes zero LLM calls — and no REPL or opener were built
+                # (see the `if span.supplied is None` guard above). Checked at the top of the first
+                # pass — itertools.count() always enters, so there is no empty-loop hole. The
+                # InvokeComplete transform still fires as the span closes (ReturnType /
+                # ValidateReturn / ModifyInvokeResult apply to the supplied result), mirroring
+                # SupplyExecResult flowing through REPLExecComplete.
+                if span.supplied is not None:
+                    span.complete(result=span.supplied)
+                    break
+                # Past the supplied short-circuit: state/messages are None only on the supplied
+                # path (built under the guard above otherwise), and that path broke out one line up.
+                assert state is not None and messages is not None
                 # Update prehook so nested invokes know which iteration spawned them
                 if self.prehook is not None:
                     self.prehook.parent_repl_iteration = i
@@ -1044,13 +1088,13 @@ class Agent:
                     depth,
                     can_recurse,
                     messages,
-                    repl,
+                    state,
                     invoke_id,
                     repl_history=repl_history,
                 )
 
                 exec_result = repl_iter_result.exec_result
-                repl = repl_iter_result.repl
+                state = repl_iter_result.state
 
                 match exec_result:
                     case Continue():
@@ -1124,6 +1168,15 @@ class Agent:
                     **self.llm_client.request_defaults,
                 )
             result = self._record_llm_response(llm_response, span)
+        # Span closed: a Complete-stage ModifyLLMResponse may have replaced the response
+        # (authoritative — see resolve_llm_modify_results). If so, re-read it: its content is what
+        # the agent parses next, and the same object is what LLMQueryExit carried and BudgetPool
+        # booked, so content / observers / cost all agree. The identity check leaves the common
+        # no-transform path (same object) untouched, and covers the supplied-response path too.
+        final_response = span.get_response()
+        if final_response is not llm_response:
+            self._last_llm_response = final_response
+            result = final_response.content or ""
         return result
 
     async def do_one_repl_iteration_async(
@@ -1132,7 +1185,7 @@ class Agent:
         depth: int,
         can_recurse: bool,
         messages: list[MessageDict],
-        repl: BaseREPL,
+        state: REPLState,
         invoke_id: str,
         repl_history: list[object] | None = None,
     ) -> REPLIterationResult[Any]:
@@ -1157,20 +1210,21 @@ class Agent:
         )
         # Apply any persistent message edits (compaction) to the carried-forward buffer.
         self._apply_persistent_message_edits(messages, iteration)
-        code, exec_timeout_override, enter_event = self._record_response_and_parse(
-            messages, response_content, repl, invoke_id, iteration, depth
+        exec_timeout_override, enter_event = self._record_response_and_parse(
+            messages, response_content, self.repl_template, invoke_id, iteration, depth
         )
 
         with self.dispatcher.span_repl_exec(enter_event) as span:
             # Apply DropVariables then AddVariables (see the sync path for rationale): unbind the
             # composed names, then bind, before this turn's code runs — drop-first so a
             # drop-then-add pair re-binds; consistent across the override/exec branches.
-            repl.drop_variables(
+            self.repl_template.drop_variables(
+                state,
                 span.ctx.dropped_variables,
                 allow_missing=span.ctx.dropped_variables_allow_missing,
             )
-            repl.add_variables(span.ctx.added_variables)
-            # REPLExecSend — fires iff the input committed (see the sync path's comment):
+            self.repl_template.add_variables(state, span.ctx.added_variables)
+            # REPLExecSend — fires iff the code committed (see the sync path's comment):
             # after the namespace deltas; suppliers compose here and the resolved
             # short-circuit lands on span.supplied (an Abort raises out of span.send).
             span.send()
@@ -1179,16 +1233,18 @@ class Agent:
                 # the code and use the supplied result instead.
                 exec_result = span.supplied
             else:
-                # Execute the code. (Invoke inputs are folded in once at InvokeEnter, not here:
+                # Execute the COMMITTED code — the enter code after any InsertCode/DeleteCode
+                # edits (== the original when no hook edited it), the same string REPLExecSend
+                # observers saw. (Invoke inputs are folded in once at InvokeEnter, not here:
                 # AddInputs/DropInputs are InvokeEnter-only — #481. Per-turn namespace binds go
                 # through AddVariables/DropVariables above.)
-                exec_result = await repl.aexec(
-                    code, str(iteration), exec_timeout_override
+                exec_result = await self.repl_template.aexec(
+                    state, span.committed_code, str(iteration), exec_timeout_override
                 )
             span.complete(exec_result=exec_result)
 
         return self._finalize_iteration(
-            span, code, repl, response_content, repl_history
+            span, span.committed_code, state, response_content, repl_history
         )
 
     async def ainvoke(
@@ -1264,42 +1320,62 @@ class Agent:
                 if type(self.repl_template).maintains_repl_history
                 else None
             )
-            # The configured REPL comes off the config; `initialize` returns a fresh instance
-            # carrying this run's state and leaves the template clean for the next invoke.
-            repl = self.repl_template.initialize(
-                inputs=resolved_bound,
-                invoke_tool=effective_invoke_tool,
-                session_id=session_id,
-                initial_repl_history=repl_history,
-            )
+            # Build the REPL state and the opening prompt only when no result was supplied at Send
+            # (the sync path documents why); they stay None for a supplied invoke, which the loop
+            # below short-circuits before reading either.
+            state: REPLState | None = None
+            messages: list[MessageDict] | None = None
+            if span.supplied is None:
+                # The configured REPL is a stateless template; `initialize` returns this run's
+                # `REPLState` (#1058). The protocol opener still gets the config template.
+                state = self.repl_template.initialize(
+                    inputs=resolved_bound,
+                    invoke_tool=effective_invoke_tool,
+                    session_id=session_id,
+                    initial_repl_history=repl_history,
+                )
 
-            # NOTE: the async path historically does NOT unwrap jaz.Display display
-            # overrides (only sync invoke() calls unwrap_display), so it passes
-            # input_display_overrides=None — preserved here verbatim. Unifying the
-            # sync/async paths is tracked separately (see #566 roadmap).
-            messages: list[MessageDict] = self.protocol.render_initial_message_list(
-                inputs,
-                scope,
-                repl,
-                invoke_tool=effective_invoke_tool,
-                depth=depth,
-                recursion_available=can_recurse,
-                repl_language=self.repl_language,
-                input_display_overrides=None,
-            )
-            # A custom BaseProtocol must return a non-empty opener. Guard it loudly
-            # here (the load-bearing half of the old iteration-0 footer assert, #705): an
-            # empty list otherwise slips past _stamp_seed_provenance and surfaces later as a
-            # muddier empty-message-list error at the first query.
-            assert messages, "render_initial_message_list returned an empty opener"
+                # NOTE: the async path historically does NOT unwrap jaz.Display display
+                # overrides (only sync invoke() calls unwrap_display), so it passes
+                # input_display_overrides=None — preserved here verbatim. Unifying the
+                # sync/async paths is tracked separately (see #566 roadmap).
+                messages = self.protocol.render_initial_message_list(
+                    inputs,
+                    scope,
+                    self.repl_template,
+                    invoke_tool=effective_invoke_tool,
+                    depth=depth,
+                    recursion_available=can_recurse,
+                    repl_language=self.repl_language,
+                    input_display_overrides=None,
+                )
+                # A custom BaseProtocol must return a non-empty opener. Guard it loudly
+                # here (the load-bearing half of the old iteration-0 footer assert, #705): an
+                # empty list otherwise slips past _stamp_seed_provenance and surfaces later as a
+                # muddier empty-message-list error at the first query.
+                assert messages, "render_initial_message_list returned an empty opener"
 
-            self._stamp_seed_provenance(messages)
+                self._stamp_seed_provenance(messages)
 
             # (AddInputs/DropInputs already folded into inputs/resolved_bound above via
             # _apply_input_effects — no post-init REPL mutation needed; see sync invoke().)
 
             # ``i`` is 0-based, as in sync invoke() — see the iteration-numbering note there (#719).
             for i in itertools.count():
+                # A hook supplied this invoke's terminal result at InvokeSend (span.supplied, set
+                # once by span.send() before the loop): complete with it instead of running any
+                # turn, so a supplied invoke makes zero LLM calls — and no REPL or opener were built
+                # (see the `if span.supplied is None` guard above). Checked at the top of the first
+                # pass — itertools.count() always enters, so there is no empty-loop hole. The
+                # InvokeComplete transform still fires as the span closes (ReturnType /
+                # ValidateReturn / ModifyInvokeResult apply to the supplied result), mirroring
+                # SupplyExecResult flowing through REPLExecComplete.
+                if span.supplied is not None:
+                    span.complete(result=span.supplied)
+                    break
+                # Past the supplied short-circuit: state/messages are None only on the supplied
+                # path (built under the guard above otherwise), and that path broke out one line up.
+                assert state is not None and messages is not None
                 # Update prehook so nested invokes know which iteration spawned them
                 if self.prehook is not None:
                     self.prehook.parent_repl_iteration = i
@@ -1309,13 +1385,13 @@ class Agent:
                     depth,
                     can_recurse,
                     messages,
-                    repl,
+                    state,
                     invoke_id,
                     repl_history=repl_history,
                 )
 
                 exec_result = repl_iter_result.exec_result
-                repl = repl_iter_result.repl
+                state = repl_iter_result.state
 
                 match exec_result:
                     case Continue():

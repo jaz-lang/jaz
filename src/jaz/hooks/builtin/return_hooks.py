@@ -6,8 +6,8 @@ belongs entirely to ``**inputs``:
 - :class:`ReturnType` carries the expected return type as a self-contained hook — ``invoke``,
   ``agent``, and the REPL know nothing about return types. It drives the ``<return_type>``
   prompt block (a persistent user message at the first ``LLMQueryEnter``) and enforces the type
-  via ``ModifyExecResult`` — a recoverable ``Continue`` at ``REPLExecComplete`` and a terminal
-  ``Raise`` backstop at ``InvokeComplete``. Passed as the FIRST positional argument, a typed
+  with a recoverable ``Continue`` at ``REPLExecComplete`` (``ModifyExecResult``) and a terminal
+  ``Raise`` backstop at ``InvokeComplete`` (``ModifyInvokeResult``). Passed as the FIRST positional argument, a typed
   overload keyed on ``ReturnType[T]`` recovers the static ``-> T`` return type. As a context
   manager it propagates into nested / delegated invokes.
 
@@ -29,11 +29,12 @@ The return *type* check (``ReturnType``) is distinct from the return *value* pre
 (``ValidateReturn``): a type mismatch is a contract violation on the shape of the result; a value
 rejection is a predicate on an already-well-typed result.
 
-Why these hooks stay ``ModifyExecResult`` even at their failure caps — where
-``ValidateREPLInput`` escalates to ``Abort``: a return validator only ever reshapes a
+Why these hooks stay result-transforms (``ModifyExecResult`` at ``REPLExecComplete``,
+``ModifyInvokeResult`` at ``InvokeComplete``) even at their failure caps — where
+``ValidateREPLCode`` escalates to ``Abort``: a return validator only ever reshapes a
 *terminal the agent already produced* (its ``Return`` becomes a ``Continue`` refusal, or a
 ``Raise`` at the cap), so the run was ending either way and a transform expresses that
-faithfully. ``ValidateREPLInput``'s cap instead ends a run that would otherwise continue —
+faithfully. ``ValidateREPLCode``'s cap instead ends a run that would otherwise continue —
 the agent submitted more work — which is control-plane authority and belongs to ``Abort``.
 """
 
@@ -47,7 +48,7 @@ from beartype.roar import BeartypeException
 
 from jaz.exceptions import ReturnTypeError
 from jaz.hooks.dispatcher import Hook
-from jaz.hooks.effects import AddMessages, Effect, ModifyExecResult
+from jaz.hooks.effects import AddMessages, Effect, ModifyExecResult, ModifyInvokeResult
 from jaz.hooks.events import (
     InvokeComplete,
     InvokeExit,
@@ -192,8 +193,8 @@ class ReturnType[ReturnT](Hook):
     # repeated), ``REPLExecComplete`` (the per-turn check — a mismatched ``Return`` is downgraded
     # via ``ModifyExecResult`` to a ``Continue`` carrying a ``ReturnTypeError``) and
     # ``InvokeComplete`` (a terminal backstop that downgrades a still-mismatched final ``Return``
-    # to a ``Raise``, message augmented with the offending value, matching ``ValidateReturn``'s
-    # terminal path). ``on_invoke_exit`` only releases per-invoke state — cleanup lives at Exit
+    # to a ``Raise`` via ``ModifyInvokeResult``, message augmented with the offending value, matching
+    # ``ValidateReturn``'s terminal path). ``on_invoke_exit`` only releases per-invoke state — cleanup lives at Exit
     # (fires on every outcome) while the transform lives at Complete (fires iff a result exists).
     #
     # The backstop exists because another hook's ``REPLExecComplete`` override can reinstate a
@@ -249,7 +250,7 @@ class ReturnType[ReturnT](Hook):
         # aborts), so ``0`` is valid and meaningful — abort on the first wrong type. Only a
         # negative is junk: it would abort before any failure, behaving identically to ``0``.
         # Reject negatives; ``None`` remains "never abort". (Same guard on the sibling
-        # ``ValidateReturn`` / ``ValidateREPLInput``.)
+        # ``ValidateReturn`` / ``ValidateREPLCode``.)
         if max_failures is not None and max_failures < 0:
             raise ValueError(f"max_failures must be >= 0, got {max_failures!r}")
         self.max_failures = max_failures
@@ -348,7 +349,7 @@ class ReturnType[ReturnT](Hook):
             error = _return_type_error(result.return_value, self.return_type)
             if error is not None:
                 return [
-                    ModifyExecResult(
+                    ModifyInvokeResult(
                         result=Raise(
                             exception=_terminal_type_error(error, result.return_value),
                         )
@@ -406,7 +407,8 @@ class ValidateReturn[ReturnT](Hook):
     # Mechanics: handles ``REPLExecComplete`` (per-turn check on the produced ``Return``),
     # ``InvokeComplete`` (the terminal backstop) and ``InvokeExit`` (releasing the per-invoke
     # state — cleanup lives at Exit, which fires on every outcome, while the transforms live
-    # at the Complete boundaries); emits ``ModifyExecResult``.
+    # at the Complete boundaries); emits ``ModifyExecResult`` at ``REPLExecComplete`` and
+    # ``ModifyInvokeResult`` at ``InvokeComplete``.
     # Behavior mirrors ``BudgetForcing``: a rejected value is downgraded to a recoverable
     # ``Continue`` whose output leads with a ``Return value validation failed with <Type>:
     # <message>`` header and carries the raw exception. The core loop records the FINAL,
@@ -434,7 +436,7 @@ class ValidateReturn[ReturnT](Hook):
         # ``max_failures`` is a count of *tolerated* rejections (``count > max_failures`` raises),
         # so ``0`` is valid and meaningful — raise on the first rejection. Only a negative is junk:
         # it would raise before any rejection, behaving identically to ``0``. Reject negatives;
-        # ``None`` remains "never escalate". (Same guard on ``ReturnType`` / ``ValidateREPLInput``.)
+        # ``None`` remains "never escalate". (Same guard on ``ReturnType`` / ``ValidateREPLCode``.)
         if max_failures is not None and max_failures < 0:
             raise ValueError(f"max_failures must be >= 0, got {max_failures!r}")
         self.max_failures = max_failures
@@ -463,7 +465,7 @@ class ValidateReturn[ReturnT](Hook):
             try:
                 self.validator(result.return_value)
             except Exception as exc:  # noqa: BLE001 — any validator exception is a rejection
-                effects = [ModifyExecResult(result=Raise(exception=exc))]
+                effects = [ModifyInvokeResult(result=Raise(exception=exc))]
         return effects
 
     def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:

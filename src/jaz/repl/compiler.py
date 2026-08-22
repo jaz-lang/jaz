@@ -79,11 +79,14 @@ def validate_builtin_type_annotation(
 class PrintLastExprTransformer(ast.NodeTransformer):
     """Auto-print a non-None trailing expression and bind it to the standard REPL ``_``.
 
-    Unconditional now (#568): a trailing expression's value is always printed and stored in
-    ``_`` — a plain Python-REPL convenience, no longer gated by the removed ``repl_history``
-    flag / ``store_last_expr`` param. The former per-input ``_N`` variables (``_7``, …) were
-    removed (YAGNI — no known use case), so this no longer needs the REPL input id.
+    Unconditional: a trailing expression's value is always printed and stored in ``_``, a plain
+    Python-REPL convenience.
     """
+
+    # Unconditional as of #568, which removed the ``repl_history`` flag / ``store_last_expr``
+    # param that used to gate it, along with the per-turn ``_N`` variables (``_7``, …) — YAGNI,
+    # no known use case. Those variables were the only thing that ever needed the REPL code id,
+    # so ``secure_compile``'s ``code_id`` parameter has been dead ever since; this change drops it.
 
     def visit_Module(self, node: ast.Module):
         if len(node.body) == 0 or not isinstance(node.body[-1], ast.Expr):
@@ -320,7 +323,7 @@ type CompileMode = Literal["exec", "eval", "single"]
 
 def secure_compile(
     src: str,
-    input_id: str,
+    *,
     filename: str = "<repl>",
     mode: CompileMode = "exec",
     allow_top_level_await: bool = False,
@@ -355,6 +358,11 @@ def secure_compile(
     separately from reads; ``None`` (the default) applies ``allowed_attributes`` to both, so a
     caller that does not care about the distinction sees no change.
     """
+    # Keyword-only past ``src``. The dropped ``code_id`` used to sit at position 2, so a stale
+    # positional caller would otherwise bind its id string to ``filename`` — which feeds
+    # ``ast.parse``, the ``linecache`` key, and ``compile()``, so the damage is a wrong filename
+    # in every traceback rather than an error. A bare ``*`` makes that a ``TypeError`` at the
+    # call instead. Free: every call site already passes these by keyword.
     if tree is None:
         tree = ast.parse(src, filename=filename, mode=mode)
     match mode:

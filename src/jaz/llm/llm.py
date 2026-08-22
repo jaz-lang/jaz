@@ -2,7 +2,7 @@
 
 A :class:`BaseLLM` owns everything about talking to one model service — the HTTP call, error
 mapping, retry, cost accounting and model metadata. It is selected by a single tag
-(``"litellm"``, ``"sglang"``, ``"rlm"``, plus anything ``@register_llm``\\ ed) and built from
+(``"litellm"``, ``"sglang"``, plus anything ``@register_llm``\\ ed) and built from
 that tag's params: ``LLM_REGISTRY[tag].from_dict(params)``.
 
 A backend declares its ``__init__`` (whose signature declares its config surface) and implements
@@ -600,7 +600,7 @@ class BaseLLM(ABC):
                 Receives a tenacity ``RetryCallState``. If not provided, retries
                 are logged at WARNING level.
             retry_policy: Per-call override; defaults to ``self.retry_policy``.
-                LiteLLM-style per-exception attempt budgets (see ``_retryer``).
+                LiteLLM-style per-exception attempt budgets.
             **kwargs: Passed through to ``complete()``.
 
         Returns:
@@ -635,8 +635,10 @@ class BaseLLM(ABC):
 
         Same retry policy and parameters, so async callers get the same
         transient-error resilience as sync callers. The Agent's async path calls
-        this via ``_make_llm_retry_fn``, passing its hook-dispatching ``on_retry``.
+        this with its own hook-dispatching ``on_retry``.
         """
+        # The agent builds the retry wrapper via ``_make_llm_retry_fn``; per-exception attempt
+        # budgets are applied by ``self._retryer``.
         retryer = self._retryer(
             max_retries=self._retry_default("max_retries", max_retries),
             wait_multiplier=self._retry_default(

@@ -64,26 +64,33 @@
 
 ## Determine the workflow type
 
-- If all that there is to do is to answer a question that can be answered directly, hard-code your response:
+The very first user message contains the prompt from your caller. Before writing the code for
+your first REPL iteration, determine the most appropriate workflow for responding to it.
+
+- If responding to the first user message can be done with just a direct answer, then hard-code your response:
 
     return <hard-coded response>
 
-- If it involves computing a result programmatically, write a program:
+- If responding to it can be done with direct computation, then write a program:
 
     <program computing the result>
     return <computed result>
 
-- If it is neither a directly-answerable question nor a programming problem, then you must use
+- If the first user message is neither directly-answerable nor a simple programming problem, then you must use
   a *multi-step agentic workflow*. You must split your work across multiple REPL iterations so that
-  you can inspect intermediate output in between iterations. Write the code for only the immediate
-  next step and defer later steps to future iterations. Do NOT return while any next step remains - instead
-  print intermediate output to inform future steps. Return only once no next step remains -- the step you
-  just completed was the last one and nothing further is left to do.
+  you can inspect intermediate output in between iterations.
 
+  - Take *small, incremental* steps.
+  - Write the code for only the immediate next step, then print the intermediate result and STOP -
+    defer later steps to future iterations.
+  - Do NOT return while any next step remains — instead print intermediate output to inform future steps:
+
+    # <plan for immediate next step only>
     <code for the *immediate next step* (non-final)>
-    print(<intermediate output>)  # do NOT return
+    print(<intermediate output>)  # print, NOT return, because there is remaining work to do
 
-*OR*
+  Return only when the step you just completed was the last step of your entire workflow and nothing further is left to do:
 
+    # <plan for last step>
     <code for the *last step* of the workflow>
-    return <final result>
+    return <final result>  # return only when there is nothing left to do: this ends the REPL session

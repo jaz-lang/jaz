@@ -19,10 +19,15 @@ message provenance and compaction edits, letting it be the sole conversation-his
 format:
 
 - ``extra.provenance`` on system/user steps: the message's :class:`MessageProvenance`
-  (``provenance_of(msg).to_dict()``) — its true origin plus a stable per-message id.
-- ``extra.edits`` on the turn's observation step: the compaction drops/adds composed for that
-  query (``{"dropped": [...], "added": [...]}``). A drop names the dropped message by its id
-  (its content already lives in that message's own step); adds carry their content.
+  (``provenance_of(msg).to_dict()``) — its true origin plus a stable per-message id — and
+  ``extra.index``, the message's slot in the buffer at the enter it was first seen.
+- ``extra.edits`` on the **last message emitted the turn the edits were composed**: the compaction
+  drops/adds for that query, ``{"iteration": N, "dropped": [...], "added": [...]}``. ``iteration`` is
+  the query the edits shaped (block-level, once) — distinct from the anchor step's own
+  ``extra.iteration``, since the edits are composed at enter N but hang on the last message of turn
+  N-1's output. A drop is ``{id, index, persistent}`` (its content already lives in that message's
+  own step); an added message is ``{role, content, index}`` (+ ``provenance`` when stamped).
+  ``index`` is the edit's input coordinate (the resolved slot). See ``on_llm_query_send``.
 
 See:
     https://www.harborframework.com/docs/agents/trajectory-format
@@ -266,12 +271,13 @@ class ATIFTrace(Hook):
         state = self._invokes.get(event.invoke_id)
         if not state:
             return []
-        # Record this turn's compaction edits on the turn's observation step (#565 review), not
-        # the agent step — see the anchor rule in on_llm_query_enter. The records arrive
-        # pre-resolved on the event (LLMQuerySend.edits): a drop carries the dropped message
-        # itself (its stable id read via provenance, #599 — the content already lives in that
-        # message's own step, so the id is a non-redundant reference) and adds carry their
-        # content. This replaced the former exit-time resolution against a per-hook snapshot
+        # Record this turn's compaction edits on the anchor step (the last message emitted this turn;
+        # see on_llm_query_enter), not the agent step. The records arrive pre-resolved on the event
+        # (LLMQuerySend.edits): each drop is {id, index, persistent} and each added message is
+        # {role, content, index} (+ provenance when stamped), under a block-level `iteration` = the
+        # query these edits shaped. Per-record iteration is not repeated. A dropped message's content
+        # already lives in its own step (#599), so the id is a non-redundant
+        # reference. This replaced the former exit-time resolution against a per-hook snapshot
         # of LLMQueryEnter.messages (this hook kept its own enter-buffer copy and reused the
         # effects layer's private index resolver): the dispatcher now resolves once against
         # the same snapshot the buffer fold used, so the trace agrees with the buffer by
@@ -293,20 +299,38 @@ class ATIFTrace(Hook):
             dropped: list[dict[str, Any]] = []
             for record in edits.drops:
                 drop_prov = provenance_of(record.message)
+                # A drop is "which message" (id) + "where it sat when dropped" (index). No per-record
+                # iteration: the turn the drop happens is the block's ``iteration`` (below), and the
+                # dropped message's own origin turn lives on its own step (via provenance).
                 dropped.append(
                     {
                         "id": drop_prov.id if drop_prov is not None else None,
+                        "index": record.position,
                         "persistent": record.persistent,
                     }
                 )
-            added = [
-                {
-                    "persistent": record.persistent,
-                    "messages": [_serialize_message(m) for m in record.messages],
-                }
-                for record in edits.adds
-            ]
+            added: list[dict[str, Any]] = []
+            for record in edits.adds:
+                messages: list[dict[str, Any]] = []
+                for m in record.messages:
+                    serialized = _serialize_message(
+                        m
+                    )  # role + content (+ provenance if stamped)
+                    # index is ``record.position`` -- the add's input coordinate (the resolved
+                    # insert-before slot), not a computed final slot: several adds landing at earlier
+                    # positions shift the later ones, so ``position + offset`` would not be the true
+                    # post-fold index. A stamped (persistent) add also keeps its ``provenance`` (with
+                    # id); a transient add has none. Per-record iteration is not needed -- the whole
+                    # block carries one (below).
+                    serialized["index"] = record.position
+                    messages.append(serialized)
+                added.append({"persistent": record.persistent, "messages": messages})
+            # ``iteration`` is the query these edits were composed for (``event.iteration``), carried
+            # once for the whole block. It is NOT the anchor step's ``extra.iteration``: the edits are
+            # composed at enter N but hang on the last message of turn N-1's output, so the step reads
+            # N-1 while the edits belong to N -- recording it here is what makes that unambiguous.
             state.edits_anchor_step.setdefault("extra", {})["edits"] = {
+                "iteration": event.iteration,
                 "dropped": dropped,
                 "added": added,
             }
@@ -335,16 +359,15 @@ class ATIFTrace(Hook):
         # this turn records identical times. Event stamps are aware UTC already.
         now = event.timestamp.isoformat()
         state.edits_anchor_step = None
-        # A turn can emit more than one step, so the anchor is chosen, not "the last one": the
-        # FIRST observation wins. CodeOnlyProtocol returns TWO messages when the REPL output was
-        # truncated (the output, then the truncation advice), both stamped OBSERVATION, so taking
-        # the last would hang the turn's edits on the advice -- and consumers that locate an
-        # observation positionally ("the first user message following an assistant", per
-        # code_only.render_observation) would then read the wrong step. Falling back to the last
-        # emitted step covers iteration 1, whose only steps are seeds.
-        first_observation_step: dict[str, Any] | None = None
+        # The turn's edits hang on the LAST message emitted this enter -- the simplest rule and the
+        # least surprising mental model: the edits are applied to the buffer as it stands right after
+        # that last message, so they belong immediately after it. It is also chronologically correct
+        # when a turn emits more than one observation (CodeOnlyProtocol appends a truncation-advice
+        # observation after the output one): the edits act on the buffer after BOTH, so anchoring on
+        # the last renders them after both, whereas the first-observation rule would wrongly slot them
+        # between the two. On iteration 1 the last emitted step is a seed, which works the same way.
         last_emitted_step: dict[str, Any] | None = None
-        for msg in event.messages:
+        for position, msg in enumerate(event.messages):
             if not isinstance(msg, dict):
                 continue
             prov = provenance_of(msg)
@@ -352,23 +375,39 @@ class ATIFTrace(Hook):
                 continue  # an un-stamped, hand-built message has no identity -- skip it
             if prov.kind is MessageKind.ASSISTANT:
                 # The agent step was emitted at the previous exit, before this assistant message
-                # was stamped, so fill its provenance/id in now -- so a drop that names this
-                # message's id can resolve to its step. (An assistant always carries an int
-                # iteration; the guard is for the type-checker.)
+                # was stamped, so fill its provenance/id -- and its index -- in now, so a drop that
+                # names this message's id can resolve to its step. (An assistant always carries an
+                # int iteration; the guard is for the type-checker.) NOTE the resulting cross-frame
+                # pairing: extra.iteration is the assistant's turn N (stamped at exit), but the
+                # backfilled index is its slot at THIS enter (N+1) -- the first snapshot it appears
+                # in, since the turn-N assistant is appended after turn N's query. `setdefault` pins
+                # that first-seen slot against the assistant's re-appearance in later enters.
                 if prov.iteration is not None:
                     agent_step = state.agent_step_by_iteration.get(prov.iteration)
                     if agent_step is not None:
-                        agent_step.setdefault("extra", {}).setdefault(
-                            "provenance", prov.to_dict()
-                        )
+                        agent_extra = agent_step.setdefault("extra", {})
+                        agent_extra.setdefault("provenance", prov.to_dict())
+                        agent_extra.setdefault("index", position)
                 continue
             if prov.kind is MessageKind.ADDED:
                 continue  # recorded in extra.edits at send, not a conversation step of its own
             if prov.id in state.emitted_ids:
                 continue
-            extra: dict[str, Any] = {"provenance": prov.to_dict()}
-            if state.current_iteration is not None:
-                extra["iteration"] = state.current_iteration
+            # ``index`` is the message's slot in this enter snapshot, captured the first time it is
+            # seen (right after it entered the buffer). A live buffer position, so it drifts as later
+            # turns add/drop around it; provenance's id + iteration are the stable identity.
+            #
+            # ``iteration`` is the message's own provenance iteration -- the turn it was PRODUCED, not
+            # the enter it is first shown. These differ for an OBSERVATION (produced at turn N-1, first
+            # emitted at enter N), so stamping ``current_iteration`` here would tag it N, off by one;
+            # ``prov.iteration`` keeps it N-1, matching how the assistant step (stamped at its own
+            # exit) already agrees with its provenance. It is ``None`` for a seed, which belongs to no
+            # REPL iteration (it exists before the loop) -- an honest absence, not a turn number.
+            extra: dict[str, Any] = {
+                "provenance": prov.to_dict(),
+                "index": position,
+                "iteration": prov.iteration,
+            }
             step_data: dict[str, Any] = {
                 "step_id": state.next_step_id(),
                 "source": msg.get("role", "user"),
@@ -380,9 +419,7 @@ class ATIFTrace(Hook):
             state.steps.append(step_data)
             state.emitted_ids.add(prov.id)
             last_emitted_step = step_data
-            if prov.kind is MessageKind.OBSERVATION and first_observation_step is None:
-                first_observation_step = step_data
-        state.edits_anchor_step = first_observation_step or last_emitted_step
+        state.edits_anchor_step = last_emitted_step
         return []
 
     def on_llm_query_retry(self, event: LLMQueryRetry) -> list:

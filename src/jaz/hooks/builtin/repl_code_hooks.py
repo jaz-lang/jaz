@@ -1,19 +1,19 @@
-"""REPL-input validation as a hook: ``ValidateREPLInput``.
+"""REPL-code validation as a hook: ``ValidateREPLCode``.
 
 The pre-execution counterpart to :class:`~ValidateReturn`.
 Where ``ValidateReturn`` inspects a ``return``'s *value* at ``REPLExecComplete`` (after the
-code ran), ``ValidateREPLInput`` inspects the *source code* at ``REPLExecSend`` (the committed
-input, before it runs) and can veto it. REPL-input validation lives in the effect system
+code ran), ``ValidateREPLCode`` inspects the *source code* at ``REPLExecSend`` (the committed
+code, before it runs) and can veto it. REPL-code validation lives in the effect system
 rather than inside the REPL, so the REPL does not special-case it.
 
 The two boundaries use different effects because they sit on opposite sides of execution:
 
 - ``ValidateReturn`` uses ``ModifyExecResult`` at ``REPLExecComplete`` — it *transforms* a result
   that already exists (the ``Return``), folding onto the real output.
-- ``ValidateREPLInput`` uses ``SupplyExecResult`` at ``REPLExecSend`` — it *supplies* a result
-  in place of running the code at all, so a rejected input is never executed (matching the old
+- ``ValidateREPLCode`` uses ``SupplyExecResult`` at ``REPLExecSend`` — it *supplies* a result
+  in place of running the code at all, so rejected code is never executed (matching the old
   ``_validate_input`` short-circuit, which returned an error result before ``exec``). Send is
-  the committed-input veto slot: the validator sees exactly the input that would run.
+  the committed-code veto slot: the validator sees exactly the code that would run.
 
 At the ``max_failures`` cap the per-turn supply gives way to an ``Abort``: ending a run that
 would otherwise keep going is control-plane authority, not a result (see the cap comment in
@@ -31,8 +31,8 @@ from jaz.repl.types import Continue
 from jaz.string_utils import summarize_exception
 
 
-class ValidateREPLInput(Hook):
-    """Validate REPL input *before* execution, rejecting invalid input as a recoverable error.
+class ValidateREPLCode(Hook):
+    """Validate REPL code *before* execution, rejecting invalid code as a recoverable error.
 
     On rejection the code never runs: the agent is shown the validator's exception and retries.
     The agent may be rejected ``max_failures`` times and recover; the *next* rejection ends the
@@ -45,20 +45,26 @@ class ValidateREPLInput(Hook):
     rather than drawing down its parent's.
 
     Args:
-        validator: Called with the input source string; it should raise iff the input is
+        validator: Called with the code as a source string; it should raise iff the code is
             rejected. The exception it raises is shown to the agent as a recoverable error,
             except for the one past the cap, which aborts the invoke carrying that exception.
-        max_failures: How many rejected inputs the agent may recover from before the next
+        max_failures: How many rejections the agent may recover from before the next
             rejection aborts the invoke — a tolerance, not a total (``0`` aborts on the first
             rejection; ``2`` allows two recoveries, aborting on the third). Counted
             **cumulatively across the whole invoke**: a rejection on one turn and an unrelated one
-            many turns later draw on the same budget, and a valid input does not reset it. ``None``
+            many turns later draw on the same budget, and valid code does not reset it. ``None``
             (the default) never aborts on rejection — the agent may keep revising indefinitely, so
             ``IterationLimit`` / ``BudgetPool`` is the backstop, not this hook. Must be ``>= 0``.
 
     Raises:
         ValueError: At construction, if ``max_failures`` is negative.
     """
+
+    # Named ``...REPLCode``, not ``...REPLInput``: "input" is already taken by the *invoke*
+    # input — the ``name=value`` pairs passed to ``jaz.invoke`` and bound in the REPL namespace
+    # (``AddInputs`` / ``DropInputs`` / ``__inputs__`` / ``REPLInputConflictError``). Under the
+    # old spelling this hook read as "validate the invoke's inputs", which is the one thing it
+    # does not do. The pre-rename name stays importable as an alias (bottom of this module).
 
     # Handles ``REPLExecSend`` (the check) and ``InvokeExit`` (releasing the per-invoke count);
     # emits ``SupplyExecResult`` (a recoverable ``Continue``) per rejection, and ``Abort`` at
@@ -67,12 +73,12 @@ class ValidateREPLInput(Hook):
     # Multiple suppliers compose: ``SupplyExecResult`` supplies at ``REPLExecSend`` fold by the
     # same precedence the transform boundary uses (see ``resolve_supply_results``), so two
     # validators — or a validator co-installed with another supplier like the evals
-    # ``RestrictReturnValue`` — rejecting the *same* input each contribute a recoverable
+    # ``RestrictReturnValue`` — rejecting the *same* code each contribute a recoverable
     # ``Continue``: their outputs concatenate and their exceptions group into one rejection,
-    # rather than raising a hard internal error. A propagating ``with ValidateREPLInput(fn):``
+    # rather than raising a hard internal error. A propagating ``with ValidateREPLCode(fn):``
     # and a per-call one therefore stack cleanly. The one unresolvable case is two suppliers
     # naming *distinct* ``Return`` values (``ReturnValueConflictError``) — a validator only ever
-    # supplies ``Continue``, so it never hits that. Two validators capping on the same input
+    # supplies ``Continue``, so it never hits that. Two validators capping on the same code
     # each emit an ``Abort``; the aborts' exceptions group, so neither is dropped.
 
     def __init__(
@@ -116,10 +122,10 @@ class ValidateREPLInput(Hook):
                 # return validators (return_hooks.py): they only reshape a terminal the
                 # agent ALREADY produced, so they correctly stay ModifyExecResult.
                 # Unlike ValidateReturn there is no return value to augment the message
-                # with — the offending input is the code itself, already visible.
+                # with — the offending code is already visible to the agent.
                 return [Abort(error=exc)]
             # Recoverable: supply a Continue carrying the validator's error, so the code is
-            # skipped and the agent sees why and revises its next input. The output leads with an
+            # skipped and the agent sees why and revises its next turn. The output leads with an
             # explicit header naming the exception type + message (mirrors ValidateReturn), so the
             # <repl_output> block is self-describing instead of empty.
             return [
@@ -130,7 +136,7 @@ class ValidateREPLInput(Hook):
                         # ``str()`` renders only a sub-exception count, dropping every child's
                         # text; the summary expands them.
                         output=(
-                            "REPL input validation failed with "
+                            "REPL code validation failed with "
                             f"{summarize_exception(exc)}"
                         ),
                         exception=exc,
@@ -138,3 +144,10 @@ class ValidateREPLInput(Hook):
                 )
             ]
         return []
+
+
+#: Deprecated alias for the pre-rename spelling — see the rationale block in
+#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
+#: site so the deep-path import keeps working and so the alias map stays checkable
+#: (``test_legacy_hook_names_still_importable``).
+ValidateREPLInput = ValidateREPLCode

@@ -5,11 +5,15 @@ Reads an ATIF trace as written by ``ATIFTrace`` (schema v1.7) and expands it int
 a directory tree. Each invoke trajectory becomes a directory with:
 
     overview.md          — metadata, prompt, iteration index
-    iter_1/step.md       — repl_input + repl_output
-    iter_1/repl_input.txt
+    iter_1/step.md       — repl_code + repl_output
+    iter_1/repl_code.txt
     iter_1/repl_output.txt
     iter_1/subagent_0/   — recursively nested child invokes
     iter_2/...
+
+Trees dumped before the REPL-input -> REPL-code rename name the code file ``repl_input.txt``
+and its ``step.md`` heading ``## REPL Input``; a reader that must handle both should accept
+either spelling.
 
 Usage::
 
@@ -99,15 +103,15 @@ def _write_iteration(
 
     # The agent step's message IS the code — there is no wrapper tag to extract (the XML
     # protocol was removed). Metrics carry the per-call cost/tokens.
-    repl_input = agent_step.get("message", "") or ""
+    repl_code = agent_step.get("message", "") or ""
     metrics = agent_step.get("metrics") or {}
     cost = metrics.get("cost_usd")
     prompt_tokens = metrics.get("prompt_tokens")
     completion_tokens = metrics.get("completion_tokens")
 
-    # Write repl_input.txt
-    if repl_input:
-        (iter_dir / "repl_input.txt").write_text(repl_input + "\n")
+    # Write repl_code.txt
+    if repl_code:
+        (iter_dir / "repl_code.txt").write_text(repl_code + "\n")
 
     # Write repl_output.txt
     if repl_output:
@@ -127,8 +131,8 @@ def _write_iteration(
         lines.append(f"*{' | '.join(cost_parts)}*")
         lines.append("")
 
-    if repl_input:
-        lines.extend(["## REPL Input", "", "```python", repl_input, "```", ""])
+    if repl_code:
+        lines.extend(["## REPL Code", "", "```python", repl_code, "```", ""])
 
     if repl_output:
         lines.extend(["## REPL Output", "", "```", repl_output, "```", ""])
@@ -146,7 +150,7 @@ def _write_iteration(
     (iter_dir / "step.md").write_text("\n".join(lines))
 
     # Return summary for the overview
-    summary = repl_input[:70].replace("\n", " ").strip()
+    summary = repl_code[:70].replace("\n", " ").strip()
     return summary
 
 

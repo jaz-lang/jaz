@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaz-lang"
-version = "0.2.0a2"
+version = "0.2.0a3"
 description = "JAZ: The language of building and optimizing LLM-agents"
 authors = [
     { name = "Zhening Li", email = "zli11010@mit.edu" },
@@ -41,6 +41,7 @@ tokens = [
 
 [project.urls]
 Homepage = "https://github.com/jaz-lang/jaz"
+Changelog = "https://github.com/jaz-lang/jaz/blob/main/CHANGELOG.md"
 
 [tool.setuptools.package-data]
 jaz = [

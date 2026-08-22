@@ -457,17 +457,14 @@ def _component_catalogue(group: str, entries: Mapping[str, type], default: type)
 def _registered_components() -> dict[str, Mapping[str, type]]:
     """Every registered component per group, resolving deferred entries.
 
-    ``LLM_REGISTRY`` alone would miss a backend whose module is imported on first use (``rlm``),
-    so the tags come from :func:`~jaz.llm.registry.registered_llm_tags` and each is
-    resolved through :func:`~jaz.llm.registry.resolve_llm`, which materialises those.
+    ``LLM_REGISTRY`` alone would miss a backend whose module is imported on first use (a lazy
+    optional backend), so the tags come from :func:`~jaz.llm.registry.registered_llm_tags` and each
+    is resolved through :func:`~jaz.llm.registry.resolve_llm`, which materialises those.
     """
     # `ImportError` is skipped rather than fatal: this builds a *document*, and one entry
-    # failing to import must not take the settings helper down with it.
-    #
-    # NOT what the built-in `rlm` does — it imports its optional dependency inside
-    # `RLMClient.__init__`/`complete`, so it resolves and is listed even with `rlm` absent.
-    # The guard is for an out-of-tree lazy backend that imports its dependency at module
-    # scope, which is the ordinary way to write one.
+    # failing to import must not take the settings helper down with it. The guard is for an
+    # out-of-tree lazy backend that imports its optional dependency at module scope (the ordinary
+    # way to write one), so the import fails when that dependency is absent.
     # Imported from the registry modules, not the `jaz.protocol` / `jaz.repl` package
     # re-exports: those are flagged experimental and emit `NonPublicAPIWarning` on attribute
     # access, which a console path must not do (pinned by

@@ -1,17 +1,16 @@
 import ast
-import copy
 import math
 import numbers
 import re
 import sys
 import threading
 import traceback
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from enum import StrEnum
 from io import StringIO
 from types import CodeType, TracebackType
-from typing import Any, Self, override
+from typing import Any, override
 
 from typing_extensions import TypedDict
 
@@ -40,7 +39,7 @@ from ._exec_guards import (
     new_owner,
 )
 from ._glob_allowlist import allows_everything
-from .base import BaseREPL
+from .base import BaseREPL, REPLState
 from .compiler import secure_compile
 from .permissions import REPLPermissionPolicy, build_allowed_builtins
 from .registry import register_repl
@@ -166,7 +165,7 @@ class PythonREPLConfig(TypedDict, total=False):
     # for -R, suppress recursion (install RecursionLimit(max_depth=1) so the agent has no
     # recursive jaz.invoke)
     reject_finish_on_printed_output: (
-        # True (default): a finishing `return`/`raise` is rejected if that same input also
+        # True (default): a finishing `return`/`raise` is rejected if that same code also
         # printed output (so the agent reviews it before finishing); False: finish anyway.
         bool
     )
@@ -204,7 +203,7 @@ class PythonREPLConfig(TypedDict, total=False):
 # what stops ``x.__class__`` / ``__globals__`` / ``__subclasses__``, but every name here is
 # ordinary-looking and non-dunder, so a bare ``["*", "!__*"]`` allows all of them.
 #
-# That is not theoretical — on the bare default this input escapes, using no dunder attribute and
+# That is not theoretical — on the bare default this code escapes, using no dunder attribute and
 # no import:
 #
 #     def gen():
@@ -418,12 +417,12 @@ _DEFAULT_ALLOWED_IMPORTS: list[str] = []
 # component that consumes it.
 _DEFAULT_EXEC_TIMEOUT: float | None = 30.0
 
-# The per-exec timeout pragma: `# timeout: <seconds>` among the comment lines that OPEN an input.
+# The per-exec timeout pragma: `# timeout: <seconds>` among the comment lines that OPEN the code.
 #
 # Scanned over the leading run of comment/blank lines and no further — the first line of real code
 # ends the search. That run needs no tokenizer to identify: if every preceding line is blank or a
 # comment then no string literal is open, so a leading `#` can only be a comment. Which matters,
-# because the input may not parse at all (a syntax error still gets the timeout its author asked
+# because the code may not parse at all (a syntax error still gets the timeout its author asked
 # for), and because a `# timeout:` further down — including inside a string literal the agent is
 # authoring — stays ordinary content.
 #
@@ -452,9 +451,9 @@ _TIMEOUT_PRAGMA_REGEX = re.compile(r"#\s*timeout:(?P<value>.*)")
 
 
 def _parse_timeout_pragma(src: str) -> float | None:
-    """Return the timeout in seconds an input requests via ``# timeout: <seconds>``, else ``None``.
+    """Return the timeout in seconds the code requests via ``# timeout: <seconds>``, else ``None``.
 
-    The pragma may sit on any of the comment lines that open the input, so it can appear above or
+    The pragma may sit on any of the comment lines that open the code, so it can appear above or
     below the agent's plan comment; the first line of real code ends the search. A trailing ``#``
     comment after the number is allowed (``# timeout: 120  # long build``).
 
@@ -880,9 +879,10 @@ class PythonREPL(BaseREPL):
             as ordinary Python and not treated as a finish).
     """
 
-    repl_state_locals: dict[str, object]
-    invoke_tool: InvokeTool | None
-    session_id: str | None
+    # The REPL holds NO per-invoke state (#1058): ``initialize`` returns a ``REPLState`` and every
+    # stateful method (``exec``/``add_variables``/``drop_variables``) takes it back as an argument.
+    # A configured REPL is a pure, reusable template — two invokes cannot bleed into each other
+    # because there is no ``self`` for either to write to.
     allow_raise: bool
     allowed_imports: list[str]
     allowed_attributes: list[str]
@@ -946,8 +946,9 @@ class PythonREPL(BaseREPL):
         eval-configuration concern and are **baked** into the evals description meta-template at
         config time (the harness's ``bake_template``) — never passed at render time. Core
         deliberately has no generic vars escape hatch: a template that references an unbaked toggle
-        raises here (``_jinja_env`` is StrictUndefined), by design.
+        raises here rather than rendering an empty string, by design.
         """
+        # The strictness comes from ``_jinja_env`` being configured with StrictUndefined.
         # The sandbox text used to be *appended* here by three prompt-building helpers, to whatever
         # template was configured; it now lives inside the template, which is what makes that
         # template the whole description rather than most of it. Two consequences, both accepted
@@ -1000,7 +1001,7 @@ class PythonREPL(BaseREPL):
         How much of the traceback the agent sees is governed by
         ``self.traceback_verbosity`` (a :class:`TracebackVerbosity`); see that enum
         for the level definitions. REPL frames have filenames like
-        "<repl_session_id_input_id>" (not ending in .py); library/engine frames
+        "<repl_session_id_code_id>" (not ending in .py); library/engine frames
         end in .py.
 
         ``format_exception`` renders not just ``exception`` but its whole
@@ -1141,14 +1142,14 @@ class PythonREPL(BaseREPL):
                 ``allow_timeout_pragma`` is False.
             exec_memory_limit: Process-wide RSS ceiling in bytes, per exec (None = off).
             allow_timeout_pragma: If True (default), a leading ``# timeout: <seconds>`` comment
-                in an input sets that execution's wall-clock bound, overriding ``exec_timeout``
+                in the code sets that execution's wall-clock bound, overriding ``exec_timeout``
                 with no ceiling. Set False to make ``exec_timeout`` a bound the agent cannot
                 raise; the comment is then ordinary text and is not described in the prompt.
             allow_raise: If True (default), a top-level ``raise`` exits the REPL with
                 that exception. If False, only ``return`` is available for finishing.
             repl_description_template: Jinja2 template name for the REPL description.
             reject_finish_on_printed_output: If True (default), a finishing ``return``/``raise``
-                is rejected (not executed) when the same input also printed output — the agent
+                is rejected (not executed) when the same code also printed output — the agent
                 must review the output and re-run only the ``return``/``raise``. If False,
                 finishing is allowed even with printed output.
             allowed_imports: Import allow-list. ``None`` applies the fail-closed default
@@ -1257,12 +1258,6 @@ class PythonREPL(BaseREPL):
             if allowed_write_paths is None
             else allowed_write_paths
         )
-        # Per-invoke state, populated by `initialize`. Declared here so a configured-but-not-yet-
-        # initialized REPL has the attributes (empty) rather than raising AttributeError from
-        # somewhere far from the missing `initialize()` call.
-        self.repl_state_locals: dict[str, object] = {}
-        self.invoke_tool: InvokeTool | None = None
-        self.session_id: str | None = None
         try:
             self.traceback_verbosity = TracebackVerbosity(traceback_verbosity)
         except ValueError:
@@ -1271,17 +1266,13 @@ class PythonREPL(BaseREPL):
                 f"{[d.value for d in TracebackVerbosity]}."
             ) from None
 
-        # Native ``return`` / ``raise`` compile down to references to ``_JazReturnSignal`` and
-        # ``self._tag_raise``. These are injected into the transformed code as compile-time
+        # Native ``return`` / ``raise`` compile down to references to ``_JazReturnSignal`` and a
+        # per-exec ``tag_raise`` closure. These are injected into the transformed code as compile-time
         # *cookies* (co_consts substitution — see ._cookies and _parse_and_transform), NOT bound in
         # ``__builtins__``: a nameable binding (the old ``builtins["_JazReturnSignal"] = …``) let
         # agent code ``except _JazReturnSignal:`` swallow its own finish, and read/forge the
         # sentinel. Cookies keep them reachable by the compiled bytecode but unnameable by the agent
         # — closing that exposure (this replaced a standing TODO asking exactly that).
-        # Exceptions the agent raised via a rewritten top-level ``raise`` this exec. Reset at the
-        # start of every ``_exec`` / ``_aexec``; the boundary uses identity membership to tell an
-        # agent-authored finishing ``raise`` from an incidental error. See ``_tag_raise``.
-        self._tagged_raises: list[BaseException] = []
 
     @override
     def initialize(
@@ -1291,8 +1282,8 @@ class PythonREPL(BaseREPL):
         allowed_builtins: dict[str, object] | None = None,
         session_id: str = "",
         initial_repl_history: list[object] | None = None,
-    ) -> Self:
-        """Return a **new** REPL carrying this one's configuration plus one invoke's state.
+    ) -> REPLState:
+        """Build one invoke's :class:`REPLState`; the REPL is left as a reusable config template.
 
         Takes only the *invoke-time* arguments — everything here belongs to one run rather than
         to the REPL's configuration, which was fixed at construction. Builds the namespace
@@ -1406,53 +1397,21 @@ class PythonREPL(BaseREPL):
         # it would clobber the sandbox dict. Refuse it here too for a uniform guarantee.
         init_repl_state_locals.update(inputs)
 
-        # Copied here rather than at the top of the method so the property this whole change
-        # rests on — nothing writes `self` between the copy and the rebinds — is checkable at a
-        # glance instead of by scanning eighty lines. It also removes the temptation to read
-        # `new.*` mid-body, where it would silently equal `self.*` right up until it did not.
-        #
-        # `copy.copy`, not a re-construction from params: the constructor arguments are not
-        # retained as a bag, and reconstructing would mean either keeping one (a second source of
-        # truth for the configuration) or reading the attributes back out and hoping the mapping
-        # stays exact as `__init__` grows.
-        new = copy.copy(self)
-
-        # EVERY mutable attribute is rebound, not just the three that carry per-invoke state.
-        # A shallow copy shares them, and two of the five bite:
-        #
-        # - The allow-lists are a *sandbox boundary*, and `secure_compile` re-reads them on every
-        #   exec — so an in-place `allowed_imports.append(...)` on one instance widens the sandbox
-        #   for its siblings and for the template immediately, not merely for later invokes. The
-        #   constructor already guards this one level down ("a fresh list is taken so a caller
-        #   mutating the result cannot corrupt the shared default"); sharing here would reintroduce
-        #   exactly that hazard, and holding one template per config is what makes it reachable —
-        #   under a fresh-REPL-per-invoke regime such a mutation was scoped to its own invoke.
-        # - `_tagged_raises` is per-*exec* state that only looks safe because `_exec`/`_aexec`
-        #   happen to reset it at the top of every run. Relying on that would be asserting a
-        #   coincidence as a design property.
-        #
-        # The invariant to hold is therefore "no mutable attribute is shared", not "nothing
-        # mutates what is shared" — pinned by `test_no_mutable_attribute_is_shared_with_template`,
-        # which walks `__dict__` and so also catches whatever mutable attribute is added next.
-        #
-        # TODO(#1058): this per-attribute care is the cost of keeping per-invoke state on the REPL
-        # at all. Making `BaseREPL` stateless and threading an explicit `REPLState` removes the whole
-        # class of hazard rather than guarding it — the intended end state; this is the cheap
-        # approximation until then.
-        new._tagged_raises = []
-        new.allowed_imports = list(self.allowed_imports)
-        new.allowed_attributes = list(self.allowed_attributes)
-        new.allowed_write_attributes = list(self.allowed_write_attributes)
-        new.allowed_read_paths = list(self.allowed_read_paths)
-        new.allowed_write_paths = list(self.allowed_write_paths)
-
-        new.repl_state_locals = init_repl_state_locals
-        new.invoke_tool = invoke_tool
-        new.session_id = session_id
-        return new
+        # Return the per-invoke state as one object (#1058); the REPL itself is untouched. There is
+        # no ``copy.copy`` and no per-attribute rebinding: the whole "no mutable attribute is
+        # shared" hazard is gone because the REPL holds nothing per-invoke to share. The sandbox
+        # allow-lists live only on the config REPL and are read (never mutated) on every exec, so
+        # one configured REPL safely serves every invoke; the native-``raise`` tagging scratch is
+        # call-local per exec (``_new_raise_tagger``), not an attribute, so concurrent execs from
+        # sibling invokes on the shared template don't race on it.
+        return REPLState(
+            repl_state_locals=init_repl_state_locals,
+            invoke_tool=invoke_tool,
+            session_id=session_id,
+        )
 
     @override
-    def add_inputs(self, inputs: dict[str, object]) -> None:
+    def add_inputs(self, state: REPLState, inputs: dict[str, object]) -> None:
         """Add inputs to the REPL environment.
 
         Applies the same ``__jaz_get__`` payload substitution as initialization, through
@@ -1467,10 +1426,10 @@ class PythonREPL(BaseREPL):
         Args:
             inputs: Dictionary of variable name -> value to add
         """
-        self.repl_state_locals.update(resolve_inputs(inputs))
+        state.repl_state_locals.update(resolve_inputs(inputs))
 
     @override
-    def add_variables(self, variables: dict[str, object]) -> None:
+    def add_variables(self, state: REPLState, variables: dict[str, object]) -> None:
         """Bind ``variables`` into the REPL namespace **raw** — the per-turn, namespace-level
         counterpart of ``add_inputs``.
 
@@ -1483,8 +1442,8 @@ class PythonREPL(BaseREPL):
         the namespace should get exactly that object, not its ``__jaz_get__`` payload). The
         prompt is untouched either way.
 
-        ``__builtins__`` is refused (it holds the compiler sandbox, #688/#690) — composition
-        raises ``SandboxKeyError`` on it via the shared conflict-error rule (``_coalesce_add``), so
+        ``__builtins__`` is refused (it holds the compiler sandbox) — composition
+        raises ``SandboxKeyError`` on it via the shared conflict-error rule, so
         it never reaches here through the effect path; this skip is a defensive backstop. Does NOT
         update the ``__inputs__`` snapshot (same as ``add_inputs``).
 
@@ -1501,20 +1460,26 @@ class PythonREPL(BaseREPL):
         Args:
             variables: Dictionary of variable name -> value to bind (verbatim).
         """
+        # Why `__builtins__` is refused: #688/#690 moved the compiler sandbox into that dict,
+        # and the composition-time rule that rejects it is ``_coalesce_add``.
+        # so binding over it would hand the agent the sandbox itself.
         for name, value in variables.items():
             if name == "__builtins__":
                 continue
-            if name in self.repl_state_locals:
+            if name in state.repl_state_locals:
                 raise REPLInputConflictError(
                     f"AddVariables target {name!r} is already bound in the REPL namespace; a "
                     "namespace add must not silently overwrite an existing variable (a top-level "
                     "input, a prior binding, or the agent's own). To re-bind, DropVariables it first."
                 )
-            self.repl_state_locals[name] = value
+            state.repl_state_locals[name] = value
 
     @override
     def drop_variables(
-        self, names: Iterable[str], allow_missing: Iterable[str] = ()
+        self,
+        state: REPLState,
+        names: Iterable[str],
+        allow_missing: Iterable[str] = (),
     ) -> None:
         """Remove ``names`` from the REPL namespace (the inverse of ``add_inputs``).
 
@@ -1535,23 +1500,25 @@ class PythonREPL(BaseREPL):
         already un-passed the input) is skipped when absent instead of raising.
 
         ``__builtins__`` *itself* is never removed even if named: it holds the compiler
-        sandbox (#688/#690), and unbinding the dict would strip import/attribute/builtins
+        sandbox, and unbinding the dict would strip import/attribute/builtins
         policy. (Composition raises ``SandboxKeyError`` on it before reaching here, so via the effect
         path this never runs; this ``continue`` is a defensive backstop.) Removing an individual
         *key inside* ``__builtins__`` (e.g. ``__history__``) is fine — it only hides that
         name, it does not disable the sandbox.
         """
+        # The compiler sandbox lives in `__builtins__` as of #688/#690, which is what makes
+        # unbinding the dict a policy bypass rather than a mere name removal.
         # ``__builtins__`` is always our sandbox dict (``allowed_builtins``, set at REPL init and
         # never dropped — the loop skips it below), so index + assert directly, matching
         # ``_capture_print``. It is never the CPython builtins *module*: we set the key explicitly,
         # so the interpreter never auto-injects the module form.
-        builtins = self.repl_state_locals["__builtins__"]
+        builtins = state.repl_state_locals["__builtins__"]
         assert isinstance(builtins, dict)
         allow_missing = set(allow_missing)
         for name in names:
             if name == "__builtins__":
                 continue
-            if name not in self.repl_state_locals and name not in builtins:
+            if name not in state.repl_state_locals and name not in builtins:
                 if name in allow_missing:
                     continue  # a defensive drop that tolerates the name already being unbound
                 raise MissingDropTargetError(
@@ -1559,11 +1526,13 @@ class PythonREPL(BaseREPL):
                     "dropping an absent name is a hook bug (drop it only when it is present, "
                     "e.g. once on the first REPLExecEnter)."
                 )
-            self.repl_state_locals.pop(name, None)
+            state.repl_state_locals.pop(name, None)
             builtins.pop(name, None)
 
     @contextmanager
-    def _capture_print(self, string_io: StringIO) -> Generator[None, None, None]:
+    def _capture_print(
+        self, state: REPLState, string_io: StringIO
+    ) -> Generator[None, None, None]:
         """Capture this exec's stdout into ``string_io``.
 
         Two composed layers (see repl/stdout_proxy.py):
@@ -1582,7 +1551,7 @@ class PythonREPL(BaseREPL):
         )
         from jaz.repl.stdout_proxy import reset_current_buffer, set_current_buffer
 
-        builtins = self.repl_state_locals["__builtins__"]
+        builtins = state.repl_state_locals["__builtins__"]
         assert isinstance(builtins, dict)
         if "print" in builtins:
             old_print = builtins["print"]
@@ -1606,13 +1575,16 @@ class PythonREPL(BaseREPL):
             if old_print_exists:
                 builtins["print"] = old_print
 
-    def _parse_and_transform(self, src: str) -> tuple[ast.Module, CookieJar] | None:
+    def _parse_and_transform(
+        self, src: str, tag_raise: Callable[[object], object]
+    ) -> tuple[ast.Module, CookieJar] | None:
         """Parse *src*, rewrite native ``return`` / ``raise``, and inject the except-guards.
 
         Returns ``(tree, jar)`` on success, ``None`` on syntax error. The returned :class:`CookieJar`
         carries the return-signal / tag-raise / exception references as co_consts cookies (seeded
         here, where all three are in scope); :func:`secure_compile` substitutes them into the
-        compiled code object. Parsing — including the module-level-``return`` tolerance and the
+        compiled code object. ``tag_raise`` is the caller's per-exec tagger (see
+        ``_new_raise_tagger``). Parsing — including the module-level-``return`` tolerance and the
         (defensive) def-wrap fallback — is delegated to :func:`parse_allowing_toplevel_return`.
         """
         tree = parse_allowing_toplevel_return(src)
@@ -1620,7 +1592,7 @@ class PythonREPL(BaseREPL):
             return None
         jar = CookieJar()
         jar.seed("return_signal", _JazReturnSignal)
-        jar.seed("tag_raise", self._tag_raise)
+        jar.seed("tag_raise", tag_raise)
         jar.seed("exception", Exception)
         # FatalError is Exception-rooted, so Defense B's narrowing to `Exception` does NOT
         # protect it and its base class no longer does either — the cookie guard is what keeps
@@ -1633,27 +1605,33 @@ class PythonREPL(BaseREPL):
         return tree, jar
 
     def _compile_native(
-        self, src: str, input_id: str, filename: str, *, allow_top_level_await: bool
+        self,
+        src: str,
+        code_id: str,
+        filename: str,
+        *,
+        allow_top_level_await: bool,
+        tag_raise: Callable[[object], object],
     ) -> CodeType | ExecResult[Any]:
         """Parse + transform native ``return``/``raise`` and compile. Returns the compiled
         code object, or an error ``ExecResult`` to short-circuit. Shared by the sync ``_exec``
         and async ``_aexec`` - they differ only in ``allow_top_level_await`` and the (sync vs
-        async) execution call.
+        async) execution call. ``tag_raise`` is the caller's per-exec tagger (see
+        ``_new_raise_tagger``), seeded into the compiled code's cookie jar.
 
         Return-*type* and return-*value* enforcement do not happen here; they live in hooks
         (``ReturnType`` / ``ValidateReturn``) on the REPLExecExit effect path, so this method
-        only parses, transforms, and compiles the input.
+        only parses, transforms, and compiles the code.
         """
-        result = self._parse_and_transform(src)
+        result = self._parse_and_transform(src, tag_raise)
         if result is None:
-            return self._handle_syntax_error(src, input_id, filename)
+            return self._handle_syntax_error(src, code_id, filename)
         tree, jar = result
 
         # ---- Apply policy visitors and compile ----
         try:
             return secure_compile(
                 src,
-                input_id,
                 filename=filename,
                 mode="exec",
                 allow_top_level_await=allow_top_level_await,
@@ -1681,7 +1659,7 @@ class PythonREPL(BaseREPL):
         """ExecResult for a non-signal exception from native-return exec (shared sync/async).
 
         A foreign (outer) timeout or fatal exception cannot become a Continue the
-        inner agent reacts to: it **re-raises** out of ``exec`` (via ``_reraise_if_fatal``),
+        inner agent reacts to: it **re-raises** out of ``exec``,
         so the sub-invoke's spans close and the exception propagates to the parent exec
         that owns the deadline (or, for a fatal, past every agent). Everything else is
         recoverable feedback.
@@ -1696,7 +1674,7 @@ class PythonREPL(BaseREPL):
     def _handle_native_return(
         self, value: object, string_io: StringIO
     ) -> Return[Any] | Continue | Raise:
-        # Reject a finishing ``return`` when this same input also printed output, so the agent
+        # Reject a finishing ``return`` when this same code also printed output, so the agent
         # reviews the output before finishing (KEEP from the old RETURN-command path). Gated by
         # reject_finish_on_printed_output; when it fires the return is NOT executed and the
         # agent must re-run only the ``return`` statement.
@@ -1720,9 +1698,11 @@ class PythonREPL(BaseREPL):
         # REPL no longer knows the return type.
         return Return(return_value=value)
 
-    def _tag_raise(self, exception: object) -> object:
-        """Record *exception* by identity as an agent-authored top-level ``raise``, then return
-        it so ``raise _jaz_tag_raise(exc)`` raises the real exception.
+    @staticmethod
+    def _new_raise_tagger() -> tuple[list[BaseException], Callable[[object], object]]:
+        """Fresh per-exec scratch for native top-level ``raise`` tagging: a ``(tagged, tag_raise)``
+        pair, where ``tag_raise`` records an exception by identity into ``tagged`` and returns it so
+        ``raise _jaz_tag_raise(exc)`` raises the real exception.
 
         The exec boundary treats a *tagged* exception that escapes as a finishing ``Raise``; a
         tagged exception the agent's own ``except`` catches simply never reaches the boundary,
@@ -1730,9 +1710,20 @@ class PythonREPL(BaseREPL):
         never a finish. Tagging a non-exception is harmless — ``raise`` then fails with Python's
         own ``TypeError``, which (being untagged) surfaces as a recoverable error.
         """
-        if isinstance(exception, BaseException):
-            self._tagged_raises.append(exception)
-        return exception
+        # Call-local, NOT on ``self``: one config REPL is shared across every invoke at a depth
+        # (#1058 — there is no per-invoke copy anymore), so a single shared list would be raced by
+        # concurrent execs from sibling invokes (e.g. ``asyncio.gather`` over multiple ``ainvoke``
+        # under one config) — one exec's reset would wipe another's tag and misclassify its
+        # finishing ``raise`` as a recoverable ``Continue``. Per-exec scratch keeps the template
+        # holding no exec state.
+        tagged: list[BaseException] = []
+
+        def tag_raise(exception: object) -> object:
+            if isinstance(exception, BaseException):
+                tagged.append(exception)
+            return exception
+
+        return tagged, tag_raise
 
     def _handle_native_raise(
         self,
@@ -1744,7 +1735,7 @@ class PythonREPL(BaseREPL):
         # were already set by Python's own ``raise`` machinery (we keep the ``from`` clause on the
         # rewritten raise), so no traceback-chaining fix-up is needed here.
 
-        # Reject a finishing ``raise`` when this same input also printed output, so the agent
+        # Reject a finishing ``raise`` when this same code also printed output, so the agent
         # reviews the output before finishing (KEEP from the old RAISE-command path). Gated by
         # reject_finish_on_printed_output; when it fires the finish is turned into a recoverable
         # Continue and the agent must re-run only the ``raise`` statement.
@@ -1763,7 +1754,7 @@ class PythonREPL(BaseREPL):
             )
         return Raise(exception=exception)
 
-    def _handle_syntax_error(self, src: str, input_id: str, filename: str) -> Continue:
+    def _handle_syntax_error(self, src: str, code_id: str, filename: str) -> Continue:
         """Handle syntax errors (native ``return``/``raise`` model: no old-style command hints)."""
         # TODO: Improve handling of syntax errors
         try:
@@ -1778,29 +1769,29 @@ class PythonREPL(BaseREPL):
 
         raise _JazInternalError("Unreachable code in PythonREPL._handle_syntax_error")
 
-    def _repl_filename(self, input_id: str) -> str:
+    def _repl_filename(self, state: REPLState, code_id: str) -> str:
         # session_id in the filename avoids linecache collisions across sessions
-        if self.session_id is not None:
-            return f"<repl_{self.session_id}_{input_id}>"
-        return f"<repl_{input_id}>"
+        if state.session_id is not None:
+            return f"<repl_{state.session_id}_{code_id}>"
+        return f"<repl_{code_id}>"
 
-    # Pre-execution REPL-input validation moved to the ValidateREPLInput hook (#528): it
+    # Pre-execution REPL-code validation moved to the ValidateREPLCode hook (#528): it
     # runs the validator at REPLExecSend and supplies a SupplyExecResult (skipping exec) on
     # rejection — the effect-path equivalent of the old _validate_input short-circuit here.
 
     def _resolve_timeout(
         self, src: str, exec_timeout_override: float | None
     ) -> float | None:
-        """This exec's wall-clock bound: the input's own ``# timeout:`` pragma if it has one,
+        """This exec's wall-clock bound: the code's own ``# timeout:`` pragma if it has one,
         else the caller's per-exec override, else the configured ``exec_timeout``. With
         ``allow_timeout_pragma=False`` the pragma is skipped entirely — not even parsed, so a
-        malformed one cannot fail an input the REPL is meant to treat as an ordinary comment.
+        malformed one cannot fail code the REPL is meant to treat as an ordinary comment.
 
         Raises:
-            REPLTimeoutPragmaError: The input's leading ``# timeout:`` comment is malformed.
+            REPLTimeoutPragmaError: The code's leading ``# timeout:`` comment is malformed.
         """
         # The pragma outranks the caller's override, not merely the configured default: it is the
-        # most specific statement about *this* input, and the agent that wrote the code is the
+        # most specific statement about *this* execution, and the agent that wrote the code is the
         # party that knows the step is a ten-minute build.
         #
         # EXECUTIVE CALL (user, 2026-08-10): the requested value is honored verbatim, with no
@@ -1827,13 +1818,15 @@ class PythonREPL(BaseREPL):
 
     def _exec(
         self,
+        state: REPLState,
         src: str,
-        input_id: str,
+        code_id: str,
         timeout: float | None,
     ) -> ExecResult[Any]:
-        filename = self._repl_filename(input_id)
+        tagged, tag_raise = self._new_raise_tagger()
+        filename = self._repl_filename(state, code_id)
         compiled = self._compile_native(
-            src, input_id, filename, allow_top_level_await=False
+            src, code_id, filename, allow_top_level_await=False, tag_raise=tag_raise
         )
         if not isinstance(compiled, CodeType):
             return compiled
@@ -1844,12 +1837,11 @@ class PythonREPL(BaseREPL):
         # _reraise_if_fatal.
         timeout_owner = new_owner()
         string_io = StringIO()
-        self._tagged_raises = []  # reset per exec; populated by _tag_raise during the run
         try:
-            with self._capture_print(string_io):
+            with self._capture_print(state, string_io):
                 guarded_exec(
                     compiled,
-                    self.repl_state_locals,
+                    state.repl_state_locals,
                     timeout,
                     memory_limit_bytes=self.exec_memory_limit,
                     owner_id=timeout_owner,
@@ -1860,38 +1852,39 @@ class PythonREPL(BaseREPL):
             # A tagged exception is an agent-authored top-level ``raise`` that escaped its own
             # try/except → finish (Raise). Anything else is incidental/fatal/foreign and goes
             # to _native_exception_result (recoverable Continue, or propagated when fatal).
-            if any(e is tagged for tagged in self._tagged_raises):
+            if any(e is t for t in tagged):
                 return self._handle_native_raise(e, string_io)
             return self._native_exception_result(e, string_io, timeout_owner)
         return Continue(output=string_io.getvalue())
 
     async def _aexec(
         self,
+        state: REPLState,
         src: str,
-        input_id: str,
+        code_id: str,
         timeout: float | None,
     ) -> ExecResult[Any]:
         """Async exec: compiles with top-level-await enabled and runs the code as a
         coroutine, so the agent can ``await`` (e.g. ``x = await ainvoke()`` then native
         ``return x``) - #567. Dispatched from ``aexec`` (which owns the shared timeout
-        setup). The whole input runs on the async path; there is no separate command syntax
-        to route synchronously.
+        setup). The whole submission runs on the async path; there is no separate command
+        syntax to route synchronously.
         """
-        filename = self._repl_filename(input_id)
+        tagged, tag_raise = self._new_raise_tagger()
+        filename = self._repl_filename(state, code_id)
         compiled = self._compile_native(
-            src, input_id, filename, allow_top_level_await=True
+            src, code_id, filename, allow_top_level_await=True, tag_raise=tag_raise
         )
         if not isinstance(compiled, CodeType):
             return compiled
 
         timeout_owner = new_owner()
         string_io = StringIO()
-        self._tagged_raises = []  # reset per exec; populated by _tag_raise during the run
         try:
-            with self._capture_print(string_io):
+            with self._capture_print(state, string_io):
                 await guarded_aexec(
                     compiled,
-                    self.repl_state_locals,
+                    state.repl_state_locals,
                     timeout,
                     memory_limit_bytes=self.exec_memory_limit,
                     owner_id=timeout_owner,
@@ -1899,7 +1892,7 @@ class PythonREPL(BaseREPL):
         except _JazReturnSignal as sig:
             return self._handle_native_return(sig.value, string_io)
         except BaseException as e:
-            if any(e is tagged for tagged in self._tagged_raises):
+            if any(e is t for t in tagged):
                 return self._handle_native_raise(e, string_io)
             return self._native_exception_result(e, string_io, timeout_owner)
         return Continue(output=string_io.getvalue())
@@ -1907,12 +1900,13 @@ class PythonREPL(BaseREPL):
     @override
     def exec(
         self,
+        state: REPLState,
         src: str,
-        input_id: str,
+        code_id: str,
         exec_timeout_override: float | None = None,
     ) -> ExecResult[Any]:
         # TODO: Fix static types
-        """Executes a REPL input and mutates state in place.
+        """Executes REPL code and mutates ``state`` in place.
 
         Runs the Python code in the REPL. A top-level ``return`` statement exits the REPL
         with that return value; a top-level ``raise`` (when ``allow_raise``) exits with that
@@ -1920,17 +1914,17 @@ class PythonREPL(BaseREPL):
         back into the REPL as a recoverable :class:`~jaz.repl.Continue` — except a *fatal*
         exception (:class:`~jaz.exceptions.FatalError`, non-``Exception`` signals) or an
         enclosing exec's timeout/memory breach, which **re-raises** out of this call so it
-        propagates out of the invoke (see ``_reraise_if_fatal``).
+        propagates out of the invoke.
 
-        The input sets its own wall-clock bound with a ``# timeout: <seconds>`` comment among the
-        lines that open it (before any code), which overrides both ``exec_timeout_override`` and
-        the configured ``exec_timeout`` for this call only. A malformed value there is reported as
-        a recoverable :class:`~jaz.repl.Continue` and the input is not executed. Configuring
+        The code sets its own wall-clock bound with a ``# timeout: <seconds>`` comment among the
+        lines that open it (before any real code), which overrides both ``exec_timeout_override``
+        and the configured ``exec_timeout`` for this call only. A malformed value there is reported
+        as a recoverable :class:`~jaz.repl.Continue` and the code is not executed. Configuring
         ``allow_timeout_pragma=False`` turns that comment back into ordinary text.
 
         Arguments:
             src: The REPL command to execute
-            input_id: The unique identifier for the REPL input
+            code_id: The unique identifier for the REPL code
 
         Returns:
             An :class:`~jaz.repl.ExecResult` — exactly one of :class:`~jaz.repl.Continue`
@@ -1939,7 +1933,7 @@ class PythonREPL(BaseREPL):
             or :class:`~jaz.repl.Raise` (finished by raising ``exception``). The REPL state is
             mutated in place.
         """
-        # TODO: Rename input_id to iteration index? (The agent loop passes `str(iteration)`, which
+        # TODO: Rename code_id to iteration index? (The agent loop passes `str(iteration)`, which
         # is 0-based since #719 — this name predates that and says nothing about the base.)
         try:
             timeout = self._resolve_timeout(src, exec_timeout_override)
@@ -1959,30 +1953,34 @@ class PythonREPL(BaseREPL):
         # keeps history a single-writer, core-owned concept and lets a result-override
         # hook (e.g. BudgetForcing) be reflected without the REPL knowing (#448).
         return self._exec(
+            state,
             src,
-            input_id,
+            code_id,
             timeout,
         )
 
     @override
     async def aexec(
         self,
+        state: REPLState,
         src: str,
-        input_id: str,
+        code_id: str,
         exec_timeout_override: float | None = None,
     ) -> ExecResult[Any]:
-        """Async ``exec``: the input runs as a coroutine on the event loop, so the agent
-        can use top-level ``await`` (e.g. ``result = await ainvoke(...)``) — #567. The whole
-        input takes the async path (there is no separate command syntax to route
+        """Async ``exec``: the code runs as a coroutine on the event loop, so the agent
+        can use top-level ``await`` (e.g. ``result = await ainvoke(...)``). The whole
+        submission takes the async path (there is no separate command syntax to route
         synchronously); native ``return`` / ``raise`` still finish the REPL.
 
         The ``# timeout: <seconds>`` pragma applies here exactly as it does to ``exec``.
 
         Like sync ``exec``, this does not write ``__history__`` — the core agent loop
-        is the single writer (see ``exec``'s NOTE; #448/#527).
+        is the single writer (see ``exec``'s NOTE).
         """
+        # Top-level `await` support is #567. The single-writer rule for `__history__` is
+        # #448/#527 — the loop owns the record so a REPL-side write cannot desync it.
         try:
             timeout = self._resolve_timeout(src, exec_timeout_override)
         except REPLTimeoutPragmaError as e:
             return Continue(output=summarize_exception(e), exception=e)  # see `exec`
-        return await self._aexec(src, input_id, timeout)
+        return await self._aexec(state, src, code_id, timeout)

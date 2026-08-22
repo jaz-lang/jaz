@@ -30,7 +30,7 @@ bumping the floor so 3.12/3.13 users keep full functionality minus the syntax.
 Executive design decisions (settled with the user; see also ``Display`` in
 :mod:`jaz._display` and ``jaz.describe`` in :mod:`jaz.descriptions`):
 
-- **Every interpolation binds its object** as a REPL input; the ``{expr}`` position in
+- **Every interpolation binds its object** as an invoke input; the ``{expr}`` position in
   the sentence becomes a `` `name` `` backtick reference so the prose reads naturally and
   points the agent at the bound variable. This mirrors the explicit input form.
 - **Default prompt rendering of the bound object is its ``__jaz_description__``** — i.e.

@@ -782,8 +782,8 @@ def register_code(code: CodeType) -> None:
     compiled it:
 
     - Agent-defined functions and classes persist in the REPL namespace
-      (``repl_state_locals``) across inputs, so one compiled under no deadline
-      is routinely called by a *later* input that has one -- the same
+      (``repl_state_locals``) across turns, so one compiled under no deadline
+      is routinely called by a *later* turn's code that has one -- the same
       registered code object then runs under that later exec's deadline.
     - A registered code object can run on a worker thread that *adopts* an
       outstanding deadline at spawn time (see Layer 1 above).

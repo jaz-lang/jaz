@@ -51,7 +51,7 @@ proposal ──[edits]──▸ committed input ──[work or supply]──▸ 
 *Enter     observes the proposal          controls edits + abort      fires always
 *Send      observes the committed input   controls supply + abort     fires iff the input committed
 *Complete  observes the raw result        controls modify + abort     fires iff a raw result exists
-*Exit      observes the outcome union     controls nothing (terminal) fires whenever the span opened*
+*Exit      observes the outcome union     per-turn: abort (any arm)   fires whenever the span opened*
 ```
 
 Events mark **value states becoming fixed**, not phases of the machinery: an event's payload
@@ -78,16 +78,21 @@ Anchor events:
 Typed outputs from hooks that express how they want to influence execution. Effects are order-independent and composed by the dispatcher.
 
 Examples:
-- `Abort` - Abort the invoke: its carried exception raises out of `jaz.invoke()` and the invoke's spans close `Aborted` (loop/budget hard-stops). Valid at **every control event** (`*Enter`/`*Send`/`*Complete`; the `*Exit` events are observation-only).
+- `Abort` - Abort the invoke: its carried exception raises out of `jaz.invoke()` and the invoke's spans close `Aborted` (loop/budget hard-stops). Valid at **every control event** (`*Enter`/`*Send`/`*Complete`), and — for the per-turn spans only — at `LLMQueryExit`/`REPLExecExit` on **every** arm (on the abnormal arms it is folded into the already-unwinding exception via an `ExceptionGroup` rather than replacing it). `InvokeExit` stays observation-only.
 - `SupplyExecResult` - Supply an `ExecResult` at `REPLExecSend`, skipping execution.
-- `ModifyExecResult` - Transform the raw result at `REPLExecComplete` / `InvokeComplete` (e.g. budget-forcing a refusal).
+- `SupplyInvokeResult` - Supply an invoke's terminal result at `InvokeSend`, skipping the whole agent loop (carries only `Return` / `Raise`).
+- `ModifyExecResult` - Transform the raw result at `REPLExecComplete` (e.g. budget-forcing a refusal).
+- `ModifyInvokeResult` - Transform the invoke's terminal result at `InvokeComplete` (carries only `Return` / `Raise`).
+- `InsertCode` / `DeleteCode` - Edit the proposed REPL *code* at `REPLExecEnter` (insert at / delete a character range by offset, resolved against the original code — the code-string twins of `AddMessages`/`DropMessages`)
 - `AddMessages` - Add message(s) (e.g. instruction text) to the query at `LLMQueryEnter`
 - `SupplyLLMResponse` - Supply a pre-computed LLM response at `LLMQuerySend`, skipping the API call
+- `ModifyLLMResponse` - Transform the LLM response at `LLMQueryComplete` (content and/or token/cost fields, field-wise partial override); authoritative — the agent then acts on the modified response
 
-The two exec-result effects each carry a full `ExecResult`: `SupplyExecResult` *supplies* one at
-`REPLExecSend` (execution is skipped; multiple **fold** among themselves), `ModifyExecResult`
-*transforms* the raw result at the `*Complete` boundaries (multiple **fold** — carried `Continue`s
-concat output + group exceptions). Suppliers live at `*Send` and transformers at `*Complete`
+`SupplyExecResult` carries a full `ExecResult` and *supplies* one at `REPLExecSend` (execution is
+skipped; multiple **fold** among themselves). `ModifyExecResult` *transforms* the raw result at
+`REPLExecComplete`, and `ModifyInvokeResult` does the same at `InvokeComplete` but carries only a
+terminal result (an invoke never completes on a `Continue`) — both **fold** by the same precedence
+(carried `Continue`s concat output + group exceptions). Suppliers live at `*Send` and transformers at `*Complete`
 because each must see the value state its decision is about: a supplier decides on the committed
 input (at `*Enter`, composition may still rewrite it), a transformer on the raw result. `Abort` is
 *termination* — un-bundled from these (#481) — and is valid at **every
@@ -95,13 +100,17 @@ control event except `LLMQueryRetry`**, so loop/budget control has an always-pre
 effect at an event that does not accept it raises `InvalidEffectError` — out-of-stage
 effects are hook bugs and fail loudly.
 
-At `LLMQueryComplete`, `Abort` is the *only* valid effect. The query has already completed and been
-paid for, so an abort there does not un-do it — it stops the turn before the agent acts on the
-response, meaning the code the model just proposed is never executed. That last part is the
-whole difference from deferring to the next `LLMQueryEnter`, and it is *not* a saving in spend:
-an abort at the next enter fires before the query, so no extra call is paid either way. What the
-deferral costs is an **execution** — the code from the turn that prompted the decision runs in
-between.
+At `LLMQueryComplete`, `ModifyLLMResponse` (transform the response) and `Abort` are the valid
+effects. The query has already completed and been paid for, so an abort there does not un-do it — it
+stops the turn before the agent acts on the response, meaning the code the model just proposed is
+never executed. That last part is the whole difference from deferring to the next `LLMQueryEnter`,
+and it is *not* a saving in spend: an abort at the next enter fires before the query, so no extra
+call is paid either way. What the deferral costs is an **execution** — the code from the turn that
+prompted the decision runs in between.
+
+A `ModifyLLMResponse` instead rewrites the response the agent *does* act on: the transform is
+authoritative, so the modified content is parsed into the next turn, and `LLMQueryExit` observers
+and cost accounting see it too.
 
 **Conditional vs unconditional events (a contract every enforcement hook must
 know):** a span that opened always closes with its `*Exit`, on every path — an in-flight
@@ -128,15 +137,15 @@ actually did, and the subsequent `*Exit` carries the post-transform result). Thi
 Typed contracts between the dispatcher and agent containing composed effects. Each event type has a specific context type.
 
 Examples:
-- `REPLExecContext` - REPL execution *enter*: namespace edits (AddVariables/DropVariables) or abort (Abort)
+- `REPLExecContext` - REPL execution *enter*: namespace edits (AddVariables/DropVariables), code edits (InsertCode/DeleteCode), or abort (Abort)
 - `REPLExecSendContext` - REPL execution *send*: supply a result (SupplyExecResult) or abort
 - `REPLExecCompleteContext` - REPL execution *complete*: transform the result (ModifyExecResult) or abort
 - `LLMQueryContext` - LLM query *enter*: prompt edits (AddMessages/DropMessages) or abort
 - `LLMQuerySendContext` - LLM query *send*: override the response (SupplyLLMResponse) or abort
-- `LLMQueryCompleteContext` - LLM query *complete*: abort only
+- `LLMQueryCompleteContext` - LLM query *complete*: transform the response (ModifyLLMResponse) or abort
 - `InvokeContext` - Invoke *enter*: add/drop invoke inputs, disable recursion, or abort (Abort)
-- `InvokeSendContext` - Invoke *send*: abort only (no invoke supplier effect exists)
-- `InvokeCompleteContext` - Invoke *complete*: transform the terminal result (ModifyExecResult) or abort
+- `InvokeSendContext` - Invoke *send*: supply the terminal result (SupplyInvokeResult) or abort
+- `InvokeCompleteContext` - Invoke *complete*: transform the terminal result (ModifyInvokeResult) or abort
 
 ### Hooks
 Extension points that process events and return effects. Hooks inherit from the `Hook` base class and support the context manager protocol.
@@ -530,7 +539,7 @@ with dispatcher.span_repl_exec(enter_event) as span:
         # A Send-composed SupplyExecResult short-circuits execution.
         exec_result = span.supplied
     else:
-        # Execute REPL code (REPL inputs are injected once at InvokeEnter, not here —
+        # Execute REPL code (invoke inputs are injected once at InvokeEnter, not here —
         # AddInputs is InvokeEnter-only, #481)
         exec_result = repl.exec(code, ...)
 
@@ -546,20 +555,23 @@ exec_result = span.get_final_exec_result()
 
 The dispatcher applies explicit composition rules when combining effects from multiple hooks:
 
-### Exec-result / abort effects (`SupplyExecResult` / `ModifyExecResult` / `Abort`)
-`SupplyExecResult` is valid only at `REPLExecSend` (supply, with the committed input in view),
-`ModifyExecResult` only at the `*Complete` transform boundaries (`REPLExecComplete` /
-`InvokeComplete`); `Abort` is valid at every control event. Where they co-occur they compose into
-the REPL result types (`Continue` / `Return` / `Raise`):
+### Exec-result / abort effects (`SupplyExecResult` / `ModifyExecResult` / `ModifyInvokeResult` / `Abort`)
+`SupplyExecResult` is valid only at `REPLExecSend` (supply, with the committed code in view),
+`ModifyExecResult` only at the `REPLExecComplete` transform boundary, and `ModifyInvokeResult` only
+at the `InvokeComplete` transform boundary (it carries a terminal `Return` / `Raise`, since an
+invoke never completes on a `Continue`); `Abort` is valid at every control event. Where they co-occur
+they compose into the REPL result types (`Continue` / `Return` / `Raise`):
 
 - **Send (`SupplyExecResult`)**: execution is skipped and the supplied result is used. Multiple
   `SupplyExecResult`s **fold** among themselves (no `exec_result` to fold onto yet) by the same
   precedence as the transform boundary — carried `Continue`s concatenate their `output` and group
-  their exceptions, so two hooks vetoing the same input (e.g. a `ValidateREPLInput` and the evals
+  their exceptions, so two hooks vetoing the same code (e.g. a `ValidateREPLCode` and the evals
   `RestrictReturnValue`) compose into one recoverable rejection; distinct carried `Return` *values*
   still raise `ReturnValueConflictError`. `Abort` supersedes them.
-- **Complete (`ModifyExecResult`)**: the composed result supersedes the raw `exec_result`; multiple
-  **fold** by carried-result kind precedence `Raise` > `Return` > `Continue`. Carried `Continue`s
+- **Complete (`ModifyExecResult` at `REPLExecComplete`, `ModifyInvokeResult` at `InvokeComplete`)**:
+  the composed result supersedes the raw `exec_result`; multiple
+  **fold** by carried-result kind precedence `Raise` > `Return` > `Continue` (the invoke boundary
+  can only ever carry `Return` / `Raise`). Carried `Continue`s
   concatenate their `output` onto the original's and group their exceptions into an
   `ExceptionGroup`; carried `Return`s cannot merge (two distinct values raise
   `ReturnValueConflictError`, identical ones coalesce); carried `Raise`s group their exceptions. The original's

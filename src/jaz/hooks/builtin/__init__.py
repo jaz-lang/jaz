@@ -9,7 +9,7 @@ from .iteration_limit import IterationLimit
 from .loggers import FileLogger, PrintLogger
 from .metadata import MetaData
 from .recursion_limit import RecursionLimit
-from .repl_input_hooks import ValidateREPLInput
+from .repl_code_hooks import ValidateREPLCode
 from .replay import ATIFReplay
 from .return_hooks import ReturnType, ValidateReturn
 from .rollout import FlatSample, Rollout, RolloutRecorder, TurnSample
@@ -43,7 +43,7 @@ __all__ = [
     "WorkflowReplay",
     "ReturnType",
     "ValidateReturn",
-    "ValidateREPLInput",
+    "ValidateREPLCode",
     # Rollout recording (token-native backends)
     "RolloutRecorder",
     "Rollout",
@@ -68,6 +68,9 @@ CompactionHook = Compaction
 ContextWindow = ContextWindowWarning
 ContextWindowHook = ContextWindowWarning
 IterationLimitHook = IterationLimit
+# ValidateREPLInput: the pre-"REPL code" spelling — not a ``Hook``-suffix drop, but kept here
+# for the same reason (it was in ``__all__``).
+ValidateREPLInput = ValidateREPLCode
 # Two pre-rename generations of ATIFReplay (ReplayHook → Replay → ATIFReplay); both were
 # importable from this namespace, so both stay bound here.
 Replay = ATIFReplay

@@ -18,18 +18,18 @@ if TYPE_CHECKING:
 # exactly one class, and `LLM_REGISTRY[tag].from_dict(params)` is the whole instantiation path.
 LLM_REGISTRY: dict[str, type["BaseLLM"]] = {}
 
-# Backends whose module is imported only on first use, because their dependency is optional
-# (RLM needs the `rlm` package, which importing jaz must not require). Materialized into
-# `LLM_REGISTRY` by `resolve_llm`.
+# Backends whose module is imported only on first use, because their dependency is optional and
+# importing jaz must not require it. Maps ``tag -> "module:attr"``; materialized into
+# `LLM_REGISTRY` by `resolve_llm`, which imports the module (whose `@register_llm` does the
+# registration). Currently empty — the sole in-tree lazy backend (RLM) moved to the eval repo
+# (#774) — but the mechanism stays as the extension point for an out-of-tree optional backend.
 #
 # This is NOT the old `_NON_PROVIDER_LLM_TAGS`, which was a *second registry with different
 # semantics* — a separate lookup, holding import strings instead of classes, consulted by
 # separate branches in `create_llm`. This is deferred materialization
 # within the one namespace: `known_llm_tags` counts these, `resolve_llm` returns the same class
 # object either way, and no caller branches on which side a tag came from.
-_LAZY_LLM_MODULES: dict[str, str] = {
-    "rlm": "jaz.llm_client_rlm:RLMClient",
-}
+_LAZY_LLM_MODULES: dict[str, str] = {}
 
 # Valid backend tags — the same character class as the model "tag/" prefix.
 LLM_TAG_RE = re.compile(r"^[a-zA-Z0-9_]+$")
@@ -58,7 +58,7 @@ def resolve_llm(tag: str) -> "type[BaseLLM] | None":
     # Importing the module is the whole job: a lazy target MUST carry its own `@register_llm`,
     # so the import populates `LLM_REGISTRY` through the decorator. Assigning here as well would
     # be a write to global state from a *lookup*, bypassing `register_llm`'s already-registered
-    # guard — dead in the case it exists for (RLMClient self-registers) and load-bearing only for
+    # guard — dead in the case it exists for (a self-registering target) and load-bearing only for
     # a target that does not, which is exactly when that guard should have fired.
     module_name, _, attr = target.partition(":")
     cls = getattr(importlib.import_module(module_name), attr)

@@ -43,14 +43,23 @@ class REPLExecEnter(Event):
     - :class:`Abort` — abort the invoke.
     - :class:`AddVariables` — bind names into the REPL namespace before the code runs.
     - :class:`DropVariables` — unbind names from the REPL namespace before the code runs.
+    - :class:`InsertCode` — insert source into the proposed code before it runs.
+    - :class:`DeleteCode` — delete a character range from the proposed code before it runs.
+
+    ``InsertCode`` / ``DeleteCode`` edit the *code* (the LLM-message twins are ``AddMessages`` /
+    ``DropMessages``); ``AddVariables`` / ``DropVariables`` edit the *namespace*. Both edit this
+    event's proposal — ``code`` here is the LLM's original, and the composed edits produce the
+    committed code that :class:`REPLExecSend` carries and the REPL runs.
 
     Suppliers do not compose here: :class:`SupplyExecResult` is a :class:`REPLExecSend`
-    effect — a supplier decides on the basis of the committed input, which at this event
+    effect — a supplier decides on the basis of the committed code, which at this event
     composition may still rewrite.
 
     Attributes:
         iteration: The agent-loop iteration this execution belongs to.
-        code: The REPL source about to be executed.
+        code: The REPL source proposed by the LLM, *before* any enter-time ``InsertCode`` /
+            ``DeleteCode`` edits (which produce the committed code carried by
+            :class:`REPLExecSend`).
     """
 
     iteration: int
@@ -59,7 +68,7 @@ class REPLExecEnter(Event):
 
 @dataclass(frozen=True)
 class REPLExecSend(Event):
-    """Fired when an execution's input has committed — code + namespace deltas are final.
+    """Fired when an execution's code has committed — code + namespace deltas are final.
 
     Fires after :class:`REPLExecEnter`'s :class:`AddVariables` / :class:`DropVariables` have
     been applied to the REPL namespace, before the code runs — including when a supply then
@@ -69,7 +78,7 @@ class REPLExecSend(Event):
 
     - :class:`SupplyExecResult` — supply a result in place of running the code; the code is
       not executed and the supplied result becomes the turn's raw result.
-    - :class:`Abort` — abort the invoke, declining the committed input.
+    - :class:`Abort` — abort the invoke, declining the committed code.
 
     Attributes:
         iteration: The agent-loop iteration this execution belongs to.
@@ -80,11 +89,11 @@ class REPLExecSend(Event):
             composed :class:`DropVariables` effects — a frozenset.
     """
 
-    # Send marks the *input commit*, not the dispatch to ``repl.exec`` — which is why it
+    # Send marks the *code commit*, not the dispatch to ``repl.exec`` — which is why it
     # still fires when a supply short-circuits execution (span_event_lifecycle.md, the
     # default-action framing on LLMQuerySend). Suppliers live HERE, not at Enter: a
-    # supplier/validator decides on the basis of the input, and the input it must see is the
-    # committed one (``ValidateREPLInput`` and the evals suppliers read ``event.code``).
+    # supplier/validator decides on the basis of the code, and the code it must see is the
+    # committed one (``ValidateREPLCode`` and the evals suppliers read ``event.code``).
 
     iteration: int
     code: str
@@ -149,9 +158,17 @@ class REPLExecExit(Event):
     fires); :class:`Failed` carries every other error that escaped before a result existed
     (``outcome.exception``; it still propagates after the event fires).
 
-    Observation-only: no effect is valid here — the outcome is already final (an effect
-    returned here raises :class:`~jaz.exceptions.InvalidEffectError`). To change a
-    result, transform it at :class:`REPLExecComplete`.
+    Allowed effects — narrow: a hook may return :class:`Abort` (and only ``Abort``), on **every**
+    arm. On the :class:`Completed` arm this stops the run on the basis of the **final,
+    post-transform** result (the thing :class:`REPLExecComplete` can't see, since a
+    ``ModifyExecResult`` there composes after every Complete hook has run). On the
+    :class:`Aborted` / :class:`Failed` arms a terminating exception is already unwinding, so an abort
+    here cannot *replace* it: it is folded *into* it via an ``ExceptionGroup`` (the in-flight
+    exception stays present, so ``is_fatal`` still governs how far the combined error travels). Any
+    effect other than ``Abort`` raises :class:`~jaz.exceptions.InvalidEffectError` on the ``Completed``
+    arm and is dropped with an error log on the abnormal arms (a loud raise there would replace the
+    exception that must win). To *transform* a result rather than abort on it, use
+    :class:`ModifyExecResult` at :class:`REPLExecComplete`.
 
     Timing: like every event, this exit carries only :attr:`~jaz.hooks.events.Event.timestamp`
     (its emission time); the span's duration is ``Exit.timestamp - Enter.timestamp``.
@@ -162,6 +179,9 @@ class REPLExecExit(Event):
             (``Completed[ExecResult] | Aborted | Failed``).
     """
 
+    # #892 settled the abnormal-arm rule: an abort raised while an exception is already
+    # unwinding folds into that exception rather than replacing it.
+    #
     # No time fields: the former start_time/end_time (interval-on-record, #1011) were
     # replaced by the base ``Event.timestamp`` — see its field comment in hooks/base.py
     # for the decision record.
@@ -185,6 +205,10 @@ class REPLExecContext(ExecutionContext):
       the prompt is untouched). The per-turn namespace counterpart of the invoke-level :class:`AddInputs`.
     - **Drop namespace names** via :class:`DropVariables` — the names to delete from the REPL
       namespace before this turn's code runs, unioned into ``dropped_variables``.
+    - **Edit the proposed code** via :class:`InsertCode` / :class:`DeleteCode` — collected into
+      ``code_inserts`` / ``code_deletes`` and folded against the enter-time code by
+      ``span_repl_exec`` into the committed code (the code-string counterpart of the namespace
+      edits above; the LLM-message twins are ``AddMessages`` / ``DropMessages``).
     - Record metrics
 
     Inputs (:class:`AddInputs`/:class:`DropInputs`) are NOT here: they are :class:`InvokeEnter`-only (#481) — fixed
@@ -211,6 +235,14 @@ class REPLExecContext(ExecutionContext):
     # from the "dropping an unbound name raises ``MissingDropTargetError``" check (a defensive drop
     # that tolerates the name already being absent). Union across hooks: one opt-in exempts the name.
     dropped_variables_allow_missing: set[str] = field(default_factory=set)
+
+    # InsertCode / DeleteCode effects editing the proposed code (accumulated, not conflict-checked
+    # at collection — like AddMessages/DropMessages; the fold in ``apply_code_edits`` unions deletes
+    # and orders same-offset inserts). Left untyped-element (plain ``list``) for the same reason as
+    # the *Complete contexts' effect lists: importing the effect classes here creates an
+    # events→effects cycle. ``_compose_repl_exec`` is the only writer and appends the right types.
+    code_inserts: list = field(default_factory=list)
+    code_deletes: list = field(default_factory=list)
 
 
 @dataclass
@@ -254,7 +286,7 @@ class REPLExecSpan:
             if span.supplied is not None:
                 exec_result = span.supplied  # a hook supplied the result at Send
             else:
-                exec_result = repl.exec(...)
+                exec_result = repl.exec(span.committed_code, ...)  # the post-edit code
             span.complete(exec_result=exec_result)
         # REPLExecComplete-composed ModifyExecResult is applied here:
         exec_result = span.get_final_exec_result()
@@ -277,6 +309,14 @@ class REPLExecSpan:
         # the CM). When set, the caller should skip executing the REPL code. None until
         # ``send()`` runs.
         self.supplied: ExecResult | None = None
+        # The committed REPL source the agent should run — the enter code after enter-time
+        # InsertCode / DeleteCode edits are folded in (``apply_code_edits``). Set by
+        # ``span_repl_exec`` before ``yield`` (== the enter code when no hook edits), and read by
+        # the agent for ``repl.exec`` in place of the local code, so what runs is what
+        # ``REPLExecSend`` observers (e.g. ``ValidateREPLInput``) saw. Mirrors ``supplied`` — a
+        # resolved value the CM computes and the agent consumes. ``""`` on a hand-built span until
+        # the CM sets it.
+        self.committed_code: str = ""
         # Emitter for REPLExecSend, installed by ``span_repl_exec`` (the span is pure data
         # and must not import the dispatcher; the CM closes over the enter event + composed
         # namespace deltas, and stores the Send-composed supply on ``supplied``). None on a
@@ -284,10 +324,10 @@ class REPLExecSpan:
         self._emit_send: Callable[[], None] | None = None
 
     def send(self) -> None:
-        """Fire :class:`REPLExecSend` for this execution's committed input.
+        """Fire :class:`REPLExecSend` for this execution's committed code.
 
         Called by the agent loop once the composed namespace deltas have been applied to
-        the REPL — i.e. exactly when the input commits, before the code runs. Send-composed
+        the REPL — i.e. exactly when the code commits, before it runs. Send-composed
         :class:`SupplyExecResult` effects are resolved and stored on :attr:`supplied`,
         which the caller reads to decide whether to run the code; a Send-composed
         :class:`Abort` raises its carried exception from this call (the span closes

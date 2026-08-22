@@ -12,16 +12,22 @@ Where each effect composes, per pipeline stage (see :mod:`jaz.hooks.events` for 
 
     Enter    (edit the proposal)     InvokeEnter:   AddInputs, DropInputs, DisableRecursion
                                      LLMQueryEnter: AddMessages, DropMessages
-                                     REPLExecEnter: AddVariables, DropVariables
+                                     REPLExecEnter: AddVariables, DropVariables, InsertCode, DeleteCode
     Send     (supply the result,     LLMQuerySend:  SupplyLLMResponse
               skipping the work)     REPLExecSend:  SupplyExecResult
-                                     InvokeSend:    (no supplier exists)
-    Complete (transform the raw      InvokeComplete / REPLExecComplete: ModifyExecResult
-              result)                LLMQueryComplete: (no modifier exists)
-    Exit     (observation-only)      no effects, at any span
+                                     InvokeSend:    SupplyInvokeResult
+    Complete (transform the raw      REPLExecComplete:  ModifyExecResult
+              result)                InvokeComplete:    ModifyInvokeResult
+                                     LLMQueryComplete:  ModifyLLMResponse
+    Exit     (observe the outcome)   LLMQueryExit / REPLExecExit: Abort (every arm)
+                                     InvokeExit: (observation-only)
 
-:class:`Abort` is additionally valid at every ``Enter``/``Send``/``Complete`` above, and
-:class:`BlackboardWrite` at every event including ``Exit``.
+:class:`Abort` is additionally valid at every ``Enter``/``Send``/``Complete`` above, and — for
+the per-turn spans only — at ``LLMQueryExit`` / ``REPLExecExit`` on **every** arm (to stop the run
+on the *post-transform* result/response, the one the ``*Complete`` transform can't yet see; on the
+``Aborted`` / ``Failed`` arms the abort is folded into the already-unwinding exception via an
+``ExceptionGroup`` rather than replacing it). ``InvokeExit`` stays observation-only.
+:class:`BlackboardWrite` is valid at every event including every ``Exit``.
 
 **Experimental.** The hook system is an experimental feature; its interfaces may change
 in a future release.
@@ -29,15 +35,22 @@ in a future release.
 
 from __future__ import annotations
 
+import enum
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from jaz._llm_client import LLMResponse
+    from jaz.tokens import TurnRecord
 
 from jaz.exceptions import (
+    CodeEditOffsetError,
     MessageEditIndexError,
     ReturnValueConflictError,
 )
 from jaz.llm import MessageDict
-from jaz.repl.types import Continue, ExecResult, Raise, Return
+from jaz.repl.types import Continue, ExecResult, Raise, Return, TerminalExecResult
 
 # The public effect surface (`jaz.hooks.effects`) — the typed values a hook handler
 # returns to influence execution. `Effect` is the base for annotating handler returns.
@@ -45,6 +58,8 @@ __all__ = [
     "Effect",
     "SupplyExecResult",
     "ModifyExecResult",
+    "ModifyInvokeResult",
+    "SupplyInvokeResult",
     "Abort",
     "BlackboardWrite",
     "DisableRecursion",
@@ -52,9 +67,13 @@ __all__ = [
     "DropInputs",
     "AddVariables",
     "DropVariables",
+    "InsertCode",
+    "DeleteCode",
     "DropMessages",
     "AddMessages",
     "SupplyLLMResponse",
+    "ModifyLLMResponse",
+    "UNSET",
 ]
 
 
@@ -83,12 +102,29 @@ class Effect:
 # the former field-carrying ``ContinueEffect`` / ``ReturnEffect`` pair:
 #
 #   ``SupplyExecResult(result)``  supplies a result in place of running the code — valid at
-#     ``REPLExecSend`` (the committed input is in view; work is *pending*). It is the
+#     ``REPLExecSend`` (the committed code is in view; work is *pending*). It is the
 #     supply-stage "supply instead" effect.
 #   ``ModifyExecResult(result)``    transforms the result that ran — valid at
-#     ``REPLExecComplete`` (where a raw result *exists*). It is the transform-stage effect.
+#     ``REPLExecComplete`` (where a raw result *exists*). It is the REPL transform-stage effect.
+#   ``ModifyInvokeResult(result)``  the *invoke* transform-stage effect — valid at
+#     ``InvokeComplete``, carrying only a ``TerminalExecResult`` (``Return`` | ``Raise``).
+#   ``SupplyInvokeResult(result)``  supplies an invoke result in place of running the whole agent
+#     loop — valid at ``InvokeSend``, carrying only a ``TerminalExecResult``. The invoke-boundary
+#     twin of ``SupplyExecResult``; it completes the supply/modify grid (every span now has a
+#     Send supplier and a Complete transform).
 #
-# Both **fold** by the same precedence (``_fold_carried_results``): carried ``Continue``s
+# ``ModifyExecResult`` and ``ModifyInvokeResult`` are a deliberate split of one former shared
+# effect (executive call, see ``TerminalExecResult`` in ``jaz.repl.types``): the REPL boundary
+# admits the full ``ExecResult`` (a hook downgrades a terminal to a ``Continue`` to force another
+# turn), while the invoke boundary admits only a terminal one (the loop has already broken, so a
+# ``Continue`` there is meaningless). The two carry different valid domains, so they are different
+# effect types — but the *merge* is identical, so both resolve through the same
+# ``_fold_carried_results`` (``resolve_modify_results`` / ``resolve_invoke_modify_results``). What
+# is shared is the fold, not the wrapper. ``ModifyInvokeResult`` rejects a ``Continue`` at
+# construction (``__post_init__``), moving what was a strippable late ``assert`` in ``span_invoke``
+# to the emitting hook's own call site.
+#
+# All three **fold** by the same precedence (``_fold_carried_results``): carried ``Continue``s
 # concatenate their outputs and group their exceptions; carried ``Return``s cannot merge (two
 # distinct values conflict, identical ones coalesce); carried ``Raise``s group their
 # exceptions. At the transform
@@ -102,7 +138,7 @@ class Effect:
 # The two boundaries once diverged — supply required its results to be *equal* (a supply "names
 # THE result", so two distinct supplies raised ``ResultConflictError``) while transform
 # folded. They were unified to fold because independent enter-point vetoes (two hooks each
-# rejecting the same input with a recoverable ``Continue``) should compose exactly as independent
+# rejecting the same code with a recoverable ``Continue``) should compose exactly as independent
 # transforms do, not crash on a hard internal error; distinct ``Return`` *values* still conflict
 # at both boundaries (they genuinely can't merge).
 #
@@ -120,7 +156,7 @@ class Effect:
 class SupplyExecResult(Effect):
     """Supply a result in place of running the turn's code.
 
-    Valid at :class:`REPLExecSend` only — the committed input is in view and a result must
+    Valid at :class:`REPLExecSend` only — the committed code is in view and a result must
     not yet exist to be supplied. The code is not executed and the carried ``result``
     becomes the turn's outcome.
 
@@ -140,10 +176,10 @@ class SupplyExecResult(Effect):
     """
 
     # This is the supply-boundary "supply instead" slot for sandbox/approval hooks generally.
-    # ``ValidateREPLInput`` emits it: on a rejected REPL input it supplies a ``Continue``
+    # ``ValidateREPLCode`` emits it: on rejected REPL code it supplies a ``Continue``
     # (recoverable), or a ``Raise`` at the failure cap. See ``resolve_supply_results``.
     #
-    # The ``Continue`` merge is what lets two such hooks reject the SAME input without one of
+    # The ``Continue`` merge is what lets two such hooks reject the SAME code without one of
     # them losing or the fold raising — their outputs concatenate and their exceptions group.
     # Kept out of the docstring: the rule ("two Continue results concatenate their outputs and
     # group their exceptions") already says it without the jargon.
@@ -155,8 +191,9 @@ class SupplyExecResult(Effect):
 class ModifyExecResult(Effect):
     """Replace a result that already exists with the carried one.
 
-    Valid at :class:`REPLExecComplete` and :class:`InvokeComplete` — both are transform
-    boundaries, so a result must exist to replace.
+    Valid at :class:`REPLExecComplete` only — the REPL transform boundary, where a result
+    exists to replace. The *invoke* transform boundary (:class:`InvokeComplete`) takes
+    :class:`ModifyInvokeResult` instead, since an invoke completes only on a terminal result.
 
     Composition: multiple transforms fold by carried kind. Kind precedence is :class:`Raise` >
     :class:`Return` > :class:`Continue` — when transforms of different kinds meet, the highest
@@ -189,11 +226,108 @@ class ModifyExecResult(Effect):
 
 
 @dataclass(frozen=True)
+class ModifyInvokeResult(Effect):
+    """Replace an invoke's terminal result with the carried one.
+
+    Valid at :class:`InvokeComplete` only — the invoke transform boundary. The carried
+    ``result`` must be terminal (a :class:`Return` or a :class:`Raise`): the agent loop has
+    already finished, so — unlike :class:`ModifyExecResult` at ``REPLExecComplete`` — there is no
+    next turn a :class:`Continue` could resume, and one is rejected at construction.
+
+    Composition: multiple transforms fold by carried kind, exactly as :class:`ModifyExecResult`
+    does, but the fold can only ever yield a :class:`Return` or
+    :class:`Raise` here because no :class:`Continue` can be carried. Kind precedence is
+    :class:`Raise` > :class:`Return`; two distinct :class:`Return` values raise
+    :class:`~jaz.exceptions.ReturnValueConflictError` (identical values coalesce). A :class:`Abort`
+    supersedes the fold.
+
+    Attributes:
+        result: The :class:`Return` / :class:`Raise` to replace the invoke's terminal result with.
+
+    Raises:
+        TypeError: At construction, if ``result`` is a :class:`Continue`.
+    """
+
+    # The fold is shared with ``ModifyExecResult`` via ``_fold_carried_results``.
+    #
+    # This is the split half of the former single ``ModifyExecResult`` that was valid at both
+    # ``*Complete`` boundaries. See the module-level "Exec-result effects" comment and
+    # ``TerminalExecResult`` (``jaz.repl.types``) for the executive call: the invoke boundary's
+    # valid domain is genuinely narrower than the REPL boundary's, so it gets its own effect whose
+    # *field type* states the invariant and whose ``__post_init__`` enforces it — instead of the
+    # old strippable ``assert`` in ``span_invoke``, which failed late (at span close, not at the
+    # offending hook) and vanished under ``python -O``. Only ``ReturnType`` / ``ValidateReturn``
+    # emit it (their terminal ``Raise`` backstop); both already carry a ``Raise``, so the guard
+    # never fires for them — it exists for a future hook that mistakes this for ``ModifyExecResult``.
+
+    result: TerminalExecResult
+
+    def __post_init__(self) -> None:
+        if isinstance(self.result, Continue):
+            raise TypeError(
+                "ModifyInvokeResult carries a terminal result (Return | Raise); got a Continue. "
+                "An invoke's transform boundary runs after the agent loop has broken, so there is "
+                "no next turn a Continue could resume — downgrade-to-Continue is a REPLExecComplete "
+                "operation (ModifyExecResult). Emit a Raise to end the invoke with an error."
+            )
+
+
+@dataclass(frozen=True)
+class SupplyInvokeResult(Effect):
+    """Supply an invoke's terminal result, skipping the entire agent loop.
+
+    Valid at :class:`InvokeSend` only — the supplier sees the invoke's committed inputs and no
+    work has run yet. The agent loop (its REPL turns and LLM calls) is not executed and the
+    carried ``result`` becomes the invoke's outcome. The invoke transform boundary still fires,
+    so a :class:`ModifyInvokeResult` — and the ``ReturnType`` / ``ValidateReturn`` backstops —
+    still apply to the supplied result (mirroring how a :class:`SupplyExecResult` still flows
+    through :class:`REPLExecComplete`).
+
+    The carried ``result`` must be terminal (a :class:`Return` or a :class:`Raise`): an invoke
+    never completes on a :class:`Continue`, so there is no :class:`Continue` to supply in place of
+    running it, and one is rejected at construction (as with :class:`ModifyInvokeResult`).
+
+    Composition: multiple supplies fold among themselves, exactly as :class:`SupplyExecResult`
+    does at :class:`REPLExecSend` but on terminal results only — a :class:`Raise` supersedes a
+    :class:`Return`; two distinct :class:`Return` values raise
+    :class:`~jaz.exceptions.ReturnValueConflictError` (identical values coalesce). A :class:`Abort`
+    supersedes the whole fold.
+
+    Attributes:
+        result: The :class:`Return` / :class:`Raise` to use instead of running the invoke.
+
+    Raises:
+        TypeError: At construction, if ``result`` is a :class:`Continue`.
+    """
+
+    # The invoke-Send supplier — the invoke-boundary twin of ``SupplyExecResult`` (``REPLExecSend``),
+    # which is what fills the last open cell of the supply/modify grid for the invoke span (the
+    # ``InvokeSend`` boundary previously had no supplier). It folds like ``SupplyExecResult``
+    # (``resolve_invoke_supply_results`` → ``_fold_carried_results`` with ``original=None``) but on
+    # the terminal domain, and rejects a ``Continue`` at construction like ``ModifyInvokeResult`` —
+    # the same ``TerminalExecResult`` invariant, stated in the field type and enforced here.
+
+    result: TerminalExecResult
+
+    def __post_init__(self) -> None:
+        if isinstance(self.result, Continue):
+            raise TypeError(
+                "SupplyInvokeResult carries a terminal result (Return | Raise); got a Continue. "
+                "An invoke completes only on a terminal result, so there is no Continue to supply "
+                "in place of running it. Supply a Return or a Raise."
+            )
+
+
+@dataclass(frozen=True)
 class Abort(Effect):
     """Abort **this invoke**: ``error`` propagates out of ``jaz.invoke()`` as a raised exception.
 
     Valid at every control event — the ``*Enter``, ``*Send``, and ``*Complete`` events of all
-    three spans. The ``*Exit`` events are observation-only and accept no effects.
+    three spans — and, for the per-turn spans, at ``LLMQueryExit`` / ``REPLExecExit`` on **every**
+    arm (``Completed`` is the post-transform, pre-act point; on the ``Aborted`` / ``Failed`` arms an
+    exception is already unwinding, so the abort is folded *into* it via an ``ExceptionGroup`` rather
+    than replacing it).
+    ``InvokeExit`` stays observation-only.
 
     At :class:`LLMQueryComplete` the query has already completed and been paid for; the
     abort stops the turn before the agent acts on the response, so the code the model
@@ -294,7 +428,7 @@ class DisableRecursion(Effect):
 # dropped rather than kept as dead code.
 
 
-# REPL input effects
+# Invoke-input effects
 
 
 @dataclass(frozen=True)
@@ -523,6 +657,143 @@ class DropVariables(Effect):
     allow_missing: bool = False
 
 
+@dataclass(frozen=True)
+class InsertCode(Effect):
+    """Insert source into the proposed REPL code, before it runs.
+
+    Valid at :class:`REPLExecEnter` only — the "edit the proposal" stage, alongside
+    :class:`AddVariables` / :class:`DropVariables` (which edit the namespace, not the code). The
+    LLM-message twin is :class:`AddMessages`.
+
+    The offset is a character position in the ORIGINAL proposed code (:class:`REPLExecEnter`'s
+    ``code``), so composition is order-independent — every effect names a position in the code the
+    hook saw, not in the post-edit string. Two inserts at the same offset both apply, ordered by
+    ``sort_key``; an insert whose offset falls inside a :class:`DeleteCode` range still inserts
+    (new content survives a delete — this is how a hook *replaces* a span: delete it and insert at
+    the same offset).
+
+    A code edit is observable through the events — :class:`REPLExecEnter` carries the original
+    proposal and :class:`REPLExecSend` the committed (edited) code — but the agent's ``__history__``
+    records the LLM's raw response, not the parsed/edited code, so the edit is not reflected there.
+
+    Attributes:
+        text: The source to insert.
+        at: Character offset to insert *before*, in ``[0, len]`` of the original code; a negative
+            offset counts from the end (``-1`` = before the last character), matching list
+            semantics. An out-of-range offset raises :class:`~jaz.exceptions.CodeEditOffsetError`.
+        sort_key: Orders inserts that share an offset (lower first; default ``0.0``), ties broken
+            by the inserted text — so same-offset inserts are deterministic without depending on
+            hook order. Mirrors :class:`AddMessages`.
+    """
+
+    text: str
+    at: int
+    sort_key: float = 0.0
+
+
+@dataclass(frozen=True)
+class DeleteCode(Effect):
+    """Delete a character range from the proposed REPL code, before it runs.
+
+    Valid at :class:`REPLExecEnter` only — the "edit the proposal" stage. The LLM-message twin is
+    :class:`DropMessages`.
+
+    The range ``[start, end)`` is resolved against the ORIGINAL proposed code's offsets, so
+    composition is order-independent. Overlapping ranges from multiple hooks **union**: each
+    resolves to the set of character positions it covers, and the sets union exactly as
+    :class:`DropMessages` unions its indices — so no two deletes ever conflict.
+
+    Attributes:
+        start: First offset to delete (inclusive). Negative counts from the end.
+        end: Offset one past the last character to delete (exclusive). Negative counts from the
+            end; ``start == end`` deletes nothing. Both offsets lie in ``[0, len]`` of the original
+            code and ``start <= end`` after resolution, else
+            :class:`~jaz.exceptions.CodeEditOffsetError` is raised.
+    """
+
+    start: int
+    end: int
+
+
+def _code_insert_sort_key(ins: InsertCode) -> tuple[float, str]:
+    """Within-offset ordering for an ``InsertCode``: ``sort_key`` first, then the inserted text —
+    a total order that keeps same-offset inserts deterministic without depending on hook
+    accumulation order (the character-offset twin of :func:`_add_sort_key`)."""
+    return (ins.sort_key, ins.text)
+
+
+def _resolve_code_offset(offset: int, n: int, *, kind: str) -> int:
+    """Resolve a possibly-negative code-edit character offset against code length ``n``.
+
+    List / NumPy semantics, mirroring :func:`_resolve_edit_index`: a negative offset counts from
+    the end (``offset + n``). Both an insert offset and a delete bound lie in ``[0, n]`` (``n`` =
+    end of string), else :class:`~jaz.exceptions.CodeEditOffsetError` is raised — an out-of-range
+    offset is a hook bug (it was computed against the code the hook saw), and normalizing here,
+    before the fold, keeps composition commutative.
+
+    The upper bound is ``n``, not ``n - 1`` as for a ``DropMessages`` *position*: every offset here
+    names a boundary *between* characters (an insert slot, or a half-open delete bound), not a
+    character index, and there are ``n + 1`` such boundaries — including ``n``, the end of the
+    string (append / delete-to-end). ``DropMessages`` drops a message *at* an index, so its cap is
+    ``n - 1``; the append-slot cap ``n`` there is the ``AddMessages`` analogue of this one.
+    """
+    resolved = offset + n if offset < 0 else offset
+    if not (0 <= resolved <= n):
+        raise CodeEditOffsetError(
+            f"{kind} offset {offset} is out of range for {n}-character code"
+        )
+    return resolved
+
+
+def apply_code_edits(
+    code: str,
+    inserts: list[InsertCode],
+    deletes: list[DeleteCode],
+) -> str:
+    """Fold code insert/delete edits over ``code``, anchored to its original offsets.
+
+    **Pure** — returns a new string, never mutates ``code``. The character-offset twin of
+    :func:`apply_message_edits`: every insert offset and delete range is resolved against the
+    ORIGINAL code (the single-coordinate-system rule that keeps edits commutative), then a single
+    left-to-right pass emits, at each offset, any inserts there (ordered by
+    :func:`_code_insert_sort_key`) followed by the original character unless it falls in a deleted
+    range. Overlapping deletes union; an insert at a deleted offset still inserts (new content
+    survives a delete), which is how a hook replaces a span.
+
+    Offsets follow list semantics (negatives count from the end); an out-of-range offset — or a
+    delete whose resolved ``start`` exceeds its ``end`` — raises
+    :class:`~jaz.exceptions.CodeEditOffsetError` rather than being ignored or clamped, the same
+    fail-loud contract as ``apply_message_edits`` (an out-of-range offset is a hook bug, and the
+    raise aborts the invoke).
+    """
+    n = len(code)
+    deleted: set[int] = set()
+    for d in deletes:
+        start = _resolve_code_offset(d.start, n, kind="DeleteCode start")
+        end = _resolve_code_offset(d.end, n, kind="DeleteCode end")
+        if start > end:
+            raise CodeEditOffsetError(
+                f"DeleteCode start {d.start} resolves after end {d.end} "
+                f"for {n}-character code"
+            )
+        deleted.update(range(start, end))
+
+    inserts_by_offset: dict[int, list[InsertCode]] = {}
+    for ins in inserts:
+        at = _resolve_code_offset(ins.at, n, kind="InsertCode at")
+        inserts_by_offset.setdefault(at, []).append(ins)
+    for group in inserts_by_offset.values():
+        group.sort(key=_code_insert_sort_key)
+
+    parts: list[str] = []
+    for i in range(n + 1):
+        for ins in inserts_by_offset.get(i, []):
+            parts.append(ins.text)
+        if i < n and i not in deleted:
+            parts.append(code[i])
+    return "".join(parts)
+
+
 # Blackboard effects
 
 
@@ -721,23 +992,127 @@ class SupplyLLMResponse(Effect):
     Composition: identical overrides compose to one; two *distinct* overrides raise
     :class:`~jaz.exceptions.LLMResponseConflictError`.
 
+    The fields mirror :class:`~jaz.llm.LLMResponse` one-to-one — the supplier constructs a
+    whole response, so each field is a direct value (``None`` means the constructed response carries
+    ``None`` there, *not* "keep", since a supply has no original). ``extra`` defaults to an empty
+    dict.
+
     Attributes:
         content: The response text, or ``None``.
         prompt_tokens: Input token count to record, if known.
         completion_tokens: Output token count to record, if known.
+        cached_tokens: Cached-input token count (subset of ``prompt_tokens``), if known.
         cost_usd: Cost in US dollars to record for this call, if known.
+        extra: Provider-specific metrics (e.g. ``reasoning_tokens``); ``None`` ⇒ empty dict.
+        raw_response: The raw provider payload a protocol may read (tool calls / finish reason).
+        tokens: Per-turn token record for a token-native backend, if any.
     """
 
-    # Mirrors `LLMResponse`'s metric fields, so it tracks that type's ATIF v1.7 alignment:
-    # `cost` became `cost_usd` and `total_tokens` was dropped (see the comment on
-    # `LLMResponse`). A supplied total had nowhere to land once the response itself has no
-    # such field, and keeping a second spelling of one concept here is what let jaz's old
-    # client/provider split drift apart in the first place.
+    # Mirrors `LLMResponse` one-to-one, so it tracks that type's ATIF v1.7 alignment: `cost` became
+    # `cost_usd` and `total_tokens` was dropped (see the comment on `LLMResponse`) — sum
+    # `prompt_tokens` + `completion_tokens`. Full coverage (not just the metrics) so a supplied
+    # response can carry a `raw_response` a tool-calling protocol reads and the `extra` / `tokens`
+    # a live call would have — without it a Replay/mock could not faithfully stand in for the real
+    # response. Keeping a second spelling of one concept here is what let jaz's old client/provider
+    # split drift apart in the first place.
 
     content: str | None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    cached_tokens: int | None = None
     cost_usd: float | None = None
+    extra: dict[str, Any] | None = None
+    raw_response: Any = None
+    tokens: TurnRecord | None = None
+
+
+class _Unset(enum.Enum):
+    """The ``ModifyLLMResponse`` "field untouched" sentinel — a keep-marker distinct from ``None``.
+
+    A single-member enum (rather than a bare ``object()``) so it has a real type for annotations
+    (``T | None | _Unset``) and narrows under an ``is`` check, and so its ``repr`` is stable.
+    """
+
+    UNSET = enum.auto()
+
+
+#: Sentinel marking a :class:`ModifyLLMResponse` field as "leave the original untouched" — used
+#: because ``None`` is a settable value there (see the effect's docstring). Rarely written
+#: explicitly (omit the field to get it as the default); exposed so a hook that computes overrides
+#: conditionally can assign ``UNSET`` to mean "don't touch this one".
+UNSET = _Unset.UNSET
+
+
+@dataclass(frozen=True)
+class ModifyLLMResponse(Effect):
+    """Transform the LLM response after the call returned, before the agent acts on it.
+
+    Valid at :class:`LLMQueryComplete` only — the response-transform boundary, the LLM-query twin
+    of :class:`ModifyExecResult` at :class:`REPLExecComplete`. The transform is **authoritative**:
+    the modified response is what the agent parses into its next REPL turn *and* what
+    :class:`LLMQueryExit` observers and cost accounting (``BudgetPool``) see — so a content rewrite
+    changes the agent's behavior, not just the record.
+
+    A **partial override** over :class:`~jaz.llm.LLMResponse`'s full field set: each field
+    defaults to :data:`UNSET` meaning "leave the original's value untouched"; any *other* value —
+    **including ``None``** — replaces that field. The :data:`UNSET` sentinel (not ``None``) marks
+    "keep" precisely because ``None`` is a legitimate value for ``content`` / ``raw_response`` /
+    ``tokens`` (a refusal has ``content is None``), so this effect *can* set them to ``None``. A
+    field left :data:`UNSET` is preserved from the original via ``dataclasses.replace`` — so a
+    content rewrite keeps the real provider payload, tokens, and cost intact, and a re-price keeps
+    the content.
+
+    Composition: **field-wise merge**. Multiple effects compose by taking, for each field,
+    whichever value is not :data:`UNSET`; two effects setting the *same* field to *different*
+    values raise
+    :class:`~jaz.exceptions.LLMResponseConflictError` (identical values coalesce). This is
+    order-independent — a content-redacting hook and a re-pricing hook compose cleanly because they
+    touch disjoint fields. A :class:`Abort` supersedes the whole merge.
+
+    Attributes:
+        content: Replacement response text (:data:`UNSET` = keep; ``None`` sets a null completion).
+        prompt_tokens: Replacement input token count (:data:`UNSET` = keep).
+        completion_tokens: Replacement output token count (:data:`UNSET` = keep).
+        cached_tokens: Replacement cached-input token count (:data:`UNSET` = keep).
+        cost_usd: Replacement cost in US dollars (:data:`UNSET` = keep). Note: this re-prices the
+            cost *booked* at ``LLMQueryExit``, but it cannot rescue an uncosted-model turn — the
+            ``BudgetPool`` backstop aborts on the *raw* ``cost_usd is None`` at ``LLMQueryComplete``
+            before this override resolves (abort supersedes the transform).
+        extra: Replacement provider-metrics dict (:data:`UNSET` = keep; replaces wholesale).
+        raw_response: Replacement raw provider payload (:data:`UNSET` = keep; ``None`` clears it).
+        tokens: Replacement per-turn token record (:data:`UNSET` = keep; ``None`` clears it).
+    """
+
+    # The LLM-query Complete-stage transform — the cell the effect grid left empty (the slot was
+    # "documented-but-empty by design" on ``LLMQueryComplete`` until a consumer motivated it). It
+    # mirrors ``SupplyLLMResponse``'s full field set rather than carrying a whole ``LLMResponse``,
+    # so a content-only rewrite can't silently zero the tokens / cost / raw payload — the resolver
+    # folds only the set fields onto the original via ``dataclasses.replace``, preserving the rest.
+    # The merge is field-wise (not the ``ExecResult`` precedence fold) because an ``LLMResponse``
+    # has no kind precedence; conflict-on-same-field keeps it order-independent.
+    #
+    # ``UNSET`` sentinel (not ``None``) for "keep" (executive call, this conversation): ``None`` is
+    # a settable value here — a response legitimately carries ``content`` / ``raw_response`` /
+    # ``tokens`` of ``None`` — so overloading it as the keep-marker (as ``SupplyLLMResponse`` can,
+    # since a supply has no original to keep) would make those un-settable. The sentinel costs a
+    # ``| _Unset`` on each annotation but buys full, unambiguous override coverage.
+    #
+    # Authoritative feedback (executive call, this conversation): the transformed response is routed
+    # back into what the agent parses (``_query_with_messages`` re-reads ``span.get_response()``
+    # after the span closes), not merely shown to Exit observers — otherwise "modify the response"
+    # would not change behavior. Cost booked at ``LLMQueryExit`` reflects the override; the
+    # same-boundary uncosted-model *abort* backstop (``BudgetPool.on_llm_query_complete``) reads the
+    # raw pre-transform response deliberately — it guards against a provider reporting no cost, not
+    # against what a hook re-prices.
+
+    content: str | None | _Unset = UNSET
+    prompt_tokens: int | None | _Unset = UNSET
+    completion_tokens: int | None | _Unset = UNSET
+    cached_tokens: int | None | _Unset = UNSET
+    cost_usd: float | None | _Unset = UNSET
+    extra: dict[str, Any] | _Unset = UNSET
+    raw_response: Any = UNSET
+    tokens: TurnRecord | None | _Unset = UNSET
 
 
 # Composition helpers for Abort / SupplyExecResult / ModifyExecResult
@@ -847,9 +1222,9 @@ def resolve_supply_results(
 
     No execution has run yet, so there is no original result; the suppliers' carried results
     fold **among themselves** via ``_fold_carried_results`` (``original=None``) — the same
-    precedence/merge the *transform* boundary uses. Two hooks vetoing the same input with
+    precedence/merge the *transform* boundary uses. Two hooks vetoing the same code with
     recoverable ``Continue``s therefore merge (outputs concatenated, exceptions grouped) rather
-    than conflicting — e.g. the evals ``RestrictReturnValue`` co-installed with a ``ValidateREPLInput``.
+    than conflicting — e.g. the evals ``RestrictReturnValue`` co-installed with a ``ValidateREPLCode``.
     Distinct carried ``Return`` *values* still can't merge (``ReturnValueConflictError``): a
     supplied return names THE value, and order-independence forbids picking a winner.
 
@@ -874,7 +1249,7 @@ def resolve_modify_results(
     modify_effects: list[ModifyExecResult],
     original: ExecResult,
 ) -> ExecResult | None:
-    """Resolve ``ModifyExecResult`` at the *transform* boundary (``*Complete``).
+    """Resolve ``ModifyExecResult`` at the REPL *transform* boundary (``REPLExecComplete``).
 
     ``original`` is the actual ``exec_result``. Each ``ModifyExecResult`` carries a full
     replacement ``ExecResult``; multiple **fold** by carried-result kind, preserving the merge
@@ -908,3 +1283,115 @@ def resolve_modify_results(
     # Fold the carried replacements onto the executed result — the same precedence/merge the
     # supply boundary uses among its suppliers, but with a real ``original`` to fold onto.
     return _fold_carried_results([m.result for m in modify_effects], original=original)
+
+
+def resolve_invoke_modify_results(
+    *,
+    modify_effects: list[ModifyInvokeResult],
+    original: TerminalExecResult,
+) -> TerminalExecResult | None:
+    """Resolve ``ModifyInvokeResult`` at the invoke transform boundary (``InvokeComplete``).
+
+    The invoke-boundary twin of ``resolve_modify_results``: it delegates to the *same*
+    ``_fold_carried_results``, so the merge semantics are identical. The difference is entirely in
+    the domain — ``original`` and every carried result are terminal (``Return`` | ``Raise``), so
+    the fold's ``Continue`` branch is unreachable and the override is itself terminal. That is the
+    guarantee the shared ``resolve_modify_results`` could *not* make: it accepted a carried
+    ``Continue`` and would downgrade the terminal result to it, which at an invoke's completion is
+    a leaked non-terminal outcome (previously caught only by a strippable ``assert`` in
+    ``span_invoke``). Here it cannot arise, because ``ModifyInvokeResult`` rejects a ``Continue`` at
+    construction.
+
+    Returns the folded terminal override, or ``None`` when nothing was emitted (keep ``original``).
+    """
+    folded = _fold_carried_results(
+        [m.result for m in modify_effects], original=original
+    )
+    # Terminal-in ⇒ terminal-out: no ``Continue`` is carried (the effect forbids it) and
+    # ``original`` is terminal, so ``_fold_carried_results`` took its ``Raise`` or ``Return``
+    # branch, never ``Continue``. The generic fold is typed ``ExecResult | None``; narrow it here
+    # since the branch that would produce a ``Continue`` is unreachable on this path.
+    return cast("TerminalExecResult | None", folded)
+
+
+def resolve_invoke_supply_results(
+    *,
+    supply_effects: list[SupplyInvokeResult],
+) -> TerminalExecResult | None:
+    """Resolve ``SupplyInvokeResult`` at the invoke *supply* boundary (``InvokeSend``).
+
+    The invoke twin of ``resolve_supply_results``: no work has run, so the suppliers' carried
+    terminal results fold **among themselves** via ``_fold_carried_results`` (``original=None``),
+    the same precedence/merge the REPL supply boundary uses — restricted to terminal results,
+    since ``SupplyInvokeResult`` cannot carry a ``Continue``. Distinct carried ``Return`` values
+    still can't merge (``ReturnValueConflictError``): a supplied return names THE value.
+
+    Returns the folded terminal result, or ``None`` when nothing was supplied (run the invoke).
+    """
+    folded = _fold_carried_results(
+        [eff.result for eff in supply_effects], original=None
+    )
+    # Terminal-in ⇒ terminal-out, as in ``resolve_invoke_modify_results`` (here there is no
+    # ``original`` either, so the ``Continue`` branch is doubly unreachable). Narrow the generic
+    # ``ExecResult | None`` accordingly.
+    return cast("TerminalExecResult | None", folded)
+
+
+# The fields ``ModifyLLMResponse`` may override; everything else on an ``LLMResponse``
+# (``raw_response``, ``extra``, ``cached_tokens``, ``tokens``) is always preserved from the
+# original. Kept as a tuple so the resolver and any test iterate the same source of truth.
+_LLM_MODIFY_FIELDS = (
+    "content",
+    "prompt_tokens",
+    "completion_tokens",
+    "cached_tokens",
+    "cost_usd",
+    "extra",
+    "raw_response",
+    "tokens",
+)
+
+
+def resolve_llm_modify_results(
+    *,
+    modify_effects: list[ModifyLLMResponse],
+    original: LLMResponse,
+) -> LLMResponse | None:
+    """Resolve ``ModifyLLMResponse`` at the response-transform boundary (``LLMQueryComplete``).
+
+    The LLM-query twin of ``resolve_modify_results``, but the merge is **field-wise** rather than
+    the ``ExecResult`` precedence fold (an ``LLMResponse`` has no kind precedence): for each of the
+    response's fields (see ``_LLM_MODIFY_FIELDS``) it takes the single non-``UNSET`` value the
+    effects carry, and two effects setting the *same* field to *different* values raise
+    ``ReturnValueConflictError``\\ 's LLM sibling ``LLMResponseConflictError`` (identical values
+    coalesce). Order-independent, so a content-redactor and a re-pricer compose. ``UNSET`` (not
+    ``None``) is the "keep" marker, so an override *to* ``None`` is honored; a field left ``UNSET``
+    by every effect is preserved from ``original`` by ``dataclasses.replace``.
+
+    Returns a new ``LLMResponse`` when any field was overridden, or ``None`` when nothing was
+    (keep ``original`` — the identity the agent's post-close ``is``-check relies on to leave the
+    non-transform path untouched).
+    """
+    from jaz.exceptions import LLMResponseConflictError
+
+    overrides: dict[str, object] = {}
+    for field_name in _LLM_MODIFY_FIELDS:
+        # The distinct values any effect actually sets for this field (UNSET = untouched).
+        values = [
+            v for eff in modify_effects if (v := getattr(eff, field_name)) is not UNSET
+        ]
+        if not values:
+            continue
+        first = values[0]
+        if any(v != first for v in values[1:]):
+            raise LLMResponseConflictError(
+                f"Multiple ModifyLLMResponse effects set '{field_name}' to distinct values "
+                f"({values!r}) at one LLMQueryComplete boundary; field-wise merge is "
+                "order-independent, so a field's value cannot be resolved without relying on hook "
+                "registration / with-nesting order. Have at most one hook set a given field."
+            )
+        overrides[field_name] = first
+
+    if not overrides:
+        return None
+    return replace(original, **overrides)

@@ -59,7 +59,7 @@ def register_repl(language: str):
                 new.namespace = dict(inputs)      # per-invoke state on the copy
                 return new
 
-            def exec(self, src, input_id, ...):
+            def exec(self, src, code_id, ...):
                 # Implementation
                 ...
 

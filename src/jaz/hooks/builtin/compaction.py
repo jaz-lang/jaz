@@ -78,7 +78,7 @@ _DEFAULT_SUMMARY_PROMPT = (
     "You are compacting an agent's conversation to fit its context window. Summarize the "
     "earlier turns below concisely but faithfully — preserve the key decisions, facts, "
     "results, and any state needed to continue the task. Do NOT execute any other code or "
-    "use any tools. Respond with EXACTLY one REPL input returning the summary as a string, "
+    "use any tools. Respond with EXACTLY one REPL submission returning the summary as a string, "
     "in this exact form (triple-quoted so multi-line summaries are valid):\n\n"
     'return """<your summary here>"""'
 )

@@ -664,11 +664,11 @@ def _resolve_invoke_hooks(
     stays in the hook list and dispatches like any other. ``invoke`` / ``agent`` / the REPL no
     longer know anything about return types.
 
-    Return-value validation (``ValidateReturn``) and REPL-input validation (``ValidateREPLInput``)
+    Return-value validation (``ValidateReturn``) and REPL-code validation (``ValidateREPLCode``)
     are ordinary positional hooks too. The ``return_validator=`` / ``repl_input_validator=``
     keywords were removed (#528), and so was the config-level input validator
     (``jaz.configure(repl_input_validator=fn)`` + ``max_repl_input_validation_failures``): a
-    propagating ``ValidateREPLInput`` context manager is the direct replacement, so this resolver
+    propagating ``ValidateREPLCode`` context manager is the direct replacement, so this resolver
     no longer synthesizes any hook from config — it just guards and returns the hook list.
 
     Guards against more than one ``ReturnType`` (an invoke has a single return type).

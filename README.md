@@ -35,7 +35,7 @@ To pin a specific release, or to install one that has not reached PyPI, use the
 distribution repo and a release tag:
 
 ```bash
-pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a2"
+pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a3"
 ```
 
 ### API Keys
@@ -276,7 +276,7 @@ jaz/
 | Hook | Purpose |
 |------|---------|
 | `ReturnType` | Declare + enforce the invoke's return type |
-| `ValidateReturn` / `ValidateREPLInput` | Validate the return value / veto REPL input before it runs |
+| `ValidateReturn` / `ValidateREPLCode` | Validate the return value / veto REPL code before it runs |
 | `BudgetPool` | Shared LLM cost / call-count budget with hard-stop enforcement |
 | `IterationLimit` / `RecursionLimit` | Per-level turn cap / invoke-nesting cap |
 | `BudgetForcing` | Refuse early finishes so the agent keeps working |

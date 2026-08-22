@@ -165,20 +165,8 @@ def make_private_module_shim(
     # (`agent`, `catalog`, `llm_client`, `parent_output`) each define something reachable as
     # `jaz.<name>`, so the `from jaz.<module> import <name>` form is a second route to a name
     # the package already warns about — closing one while leaving the other open is the gap
-    # this exists for.
-    #
-    # `jaz.llm_client_rlm` reads like a fifth candidate under the broader rule (one name,
-    # `RLMClient`, not in `__all__`) and is deliberately excluded: `RLMClient` is not in
-    # `_DEMOTED`, so `jaz.RLMClient` was never a route and there is no already-warning path to
-    # keep consistent. Shimming it would also force `jaz/__init__.py` to import a module gated
-    # behind the optional `rlm` extra just to bind the submodule attribute — paying an import
-    # cost, on every caller, for a name no one was told they could use. The consequence is
-    # that `from jaz.llm_client_rlm import RLMClient` stays silent; it is a private module by
-    # convention only.
-    #
-    # Reviewed and left as-is deliberately (#994): `RLMClient` is slated for removal, so
-    # wiring a warning onto a route nobody was told about buys one release of signal on a
-    # module that is going away. Revisit only if it outlives that plan.
+    # this exists for. A module holding a name that is NOT in `_DEMOTED` (so `jaz.<name>` was
+    # never a route) is left un-shimmed: there is no already-warning path to keep consistent.
 
     def __getattr__(name: str) -> object:
         # Leading underscore: the shim forwards the module's public surface only. Dunders in

@@ -21,8 +21,8 @@ from ._secure_methods.secure_open import make_secure_open
 # policy-bound wrappers), NOT ``builtins.__dict__.copy()``. This makes the name surface
 # fail-closed — anything not listed is simply unbound (``NameError``), including builtins nobody
 # thought to forbid and any *future* Python builtin. It replaces the former
-# ``ForbiddenNamesChecker`` denylist, which was near-inert (a 1.85M-input sweep: fired on 0.18%
-# of inputs, entirely ``SystemExit``) while the genuinely dangerous primitives (``eval``/``exec``/
+# ``ForbiddenNamesChecker`` denylist, which was near-inert (a 1.85M-submission sweep: fired on
+# 0.18% of submissions, entirely ``SystemExit``) while the genuinely dangerous primitives (``eval``/``exec``/
 # ``compile``/``__import__``) were exposed by default. Same fail-closed posture as
 # ``allowed_imports=[]`` (#797) and ``allowed_attributes=["*", "!__*"]`` (#800).
 #

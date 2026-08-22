@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from jaz._invoke_tool import InvokeTool
-from jaz.repl.types import ExecResult, Raise, Return
+from jaz.repl.types import Raise, Return, TerminalExecResult
 
 from ..base import Event, ExecutionContext
 from .base import Aborted, Completed, Failed
@@ -107,10 +107,9 @@ class InvokeSend(Event):
 
     Allowed effects:
 
+    - :class:`SupplyInvokeResult` — supply the invoke's terminal result and skip the whole agent
+      loop (the invoke-boundary twin of :class:`SupplyExecResult` at :class:`REPLExecSend`).
     - :class:`Abort` — abort the invoke, declining the committed input set.
-
-    No invoke supplier effect exists today, so the supply slot the other spans' ``*Send``
-    events host is uniform here but unused.
 
     Attributes:
         inputs: The invoke's committed explicit inputs (resolved values, post add/drop), as
@@ -157,7 +156,7 @@ class InvokeComplete(Event):
 
     Allowed effects:
 
-    - :class:`ModifyExecResult` — replace the invoke's terminal result.
+    - :class:`ModifyInvokeResult` — replace the invoke's terminal result.
     - :class:`Abort` — abort the invoke with an error.
 
     Attributes:
@@ -171,8 +170,12 @@ class InvokeComplete(Event):
     # invalid return can't escape even when another hook's ``REPLExecComplete`` override
     # reinstated a ``Return`` past the per-turn check. The transformed result is what
     # ``InvokeExit`` then carries, and what the invoke actually returns.
+    #
+    # Typed ``TerminalExecResult`` (not the full ``ExecResult``): an invoke completes only on a
+    # terminal result — the loop breaks solely on its Return/Raise arm — so the raw result a hook
+    # sees here is never a ``Continue``. This is the same narrowing ``ModifyInvokeResult`` carries.
 
-    result: ExecResult
+    result: TerminalExecResult
 
 
 @dataclass(frozen=True)
@@ -181,7 +184,7 @@ class InvokeExit(Event):
 
     **Fires once per invoke**, not per turn. ``outcome`` is the tagged union
     :data:`InvokeOutcome`: :class:`Completed` carries the invoke's **final, post-transform**
-    terminal result (``outcome.result`` — any :class:`ModifyExecResult` composed at
+    terminal result (``outcome.result`` — any :class:`ModifyInvokeResult` composed at
     :class:`InvokeComplete` already applied), exactly what the invoke returns or raises to
     its caller. :class:`Aborted` means this invoke's own hook control plane ended it via
     :class:`Abort` — at whichever stage the effect composed (``outcome.exception``
@@ -191,8 +194,13 @@ class InvokeExit(Event):
     abort passing through; the error still propagates after the event fires.
 
     Observation-only: no effect is valid here — the outcome is already final (an effect
-    returned here raises :class:`~jaz.exceptions.InvalidEffectError`). To change the
-    terminal result, transform it at :class:`InvokeComplete`.
+    returned here raises :class:`~jaz.exceptions.InvalidEffectError`). To change the terminal
+    result, transform it at :class:`InvokeComplete`. (Unlike the *per-turn* ``*Exit`` events —
+    :class:`LLMQueryExit` / :class:`REPLExecExit`, which accept an :class:`Abort` on **every** arm —
+    ``InvokeExit`` stays fully observation-only: an invoke aborting at its own
+    terminal Exit would make this event's ``Completed`` payload diverge from the exception the
+    caller then receives, with no enclosing span to record the abort, and :class:`InvokeComplete`
+    already gives full control over the final result.)
 
     Timing: like every event, this exit carries only :attr:`~jaz.hooks.events.Event.timestamp`
     (its emission time); the span's duration is ``Exit.timestamp - Enter.timestamp``.
@@ -219,12 +227,19 @@ class InvokeExit(Event):
 class InvokeSendContext(ExecutionContext):
     """Context for invoke *send* events.
 
-    Hooks can abort the invoke via :class:`Abort` (``abort_errors`` — ``span_invoke``'s
-    send emitter raises their combination; the span closes ``Aborted``). No invoke
-    supplier effect exists, so unlike the other spans' Send contexts there is no supply
-    slot to collect.
+    The invoke-boundary twin of ``REPLExecSendContext``: hooks can supply the invoke's terminal
+    result via :class:`SupplyInvokeResult` (``supply_effects`` — ``span_invoke``'s send emitter
+    resolves them to ``span.supplied`` and the agent skips the whole loop), or abort via
+    :class:`Abort` (``abort_errors`` — the send emitter raises their combination; the span closes
+    ``Aborted``).
     """
 
+    # ``supply_effects`` holds the ``SupplyInvokeResult``s (each carrying a terminal ExecResult);
+    # ``abort_errors`` the Abort exceptions. Left untyped-element (plain ``list``) for the same
+    # reason as ``InvokeCompleteContext.modify_effects``: importing the effect class here creates
+    # an events→effects cycle that mis-resolves the frozen generic ``Event`` dataclasses in this
+    # module. The dispatcher's ``_compose_invoke_send`` is the only writer and appends the right type.
+    supply_effects: list = field(default_factory=list)
     abort_errors: list[Exception] = field(default_factory=list)
 
 
@@ -232,18 +247,21 @@ class InvokeSendContext(ExecutionContext):
 class InvokeCompleteContext(ExecutionContext):
     """Context for invoke *complete* events (#568).
 
-    Symmetric with ``REPLExecCompleteContext``: the invoke's terminal result is a **transform**
-    boundary, so a hook may replace it via :class:`ModifyExecResult` (or abort via :class:`Abort`). The
-    effects are collected here and resolved against the actual terminal result by
-    ``resolve_modify_results`` in ``span_invoke``. Used by :class:`ReturnType` / :class:`ValidateReturn` to
+    The invoke-boundary twin of ``REPLExecCompleteContext``: the invoke's terminal result is a
+    **transform** boundary, so a hook may replace it via :class:`ModifyInvokeResult` (or abort via
+    :class:`Abort`). The effects are collected here and resolved against the actual terminal result by
+    ``resolve_invoke_modify_results`` in ``span_invoke``. Used by :class:`ReturnType` / :class:`ValidateReturn` to
     downgrade a wrong-typed / invalid final :class:`Return` to a :class:`Raise` — the backstop that survives
-    another hook's :class:`REPLExecComplete` override reinstating a :class:`Return`.
+    another hook's :class:`REPLExecComplete` override reinstating a :class:`Return`. Unlike the REPL
+    boundary its effect is :class:`ModifyInvokeResult`, not :class:`ModifyExecResult`: an invoke
+    completes only on a terminal result, so a :class:`Continue` cannot be composed here (the effect
+    rejects one at construction).
     """
 
     # Transform / abort effects, mirroring REPLExecCompleteContext: ``modify_effects`` holds the
-    # ``ModifyExecResult``s (each carrying a full ExecResult) and ``abort_errors`` the Abort
+    # ``ModifyInvokeResult``s (each carrying a terminal ExecResult) and ``abort_errors`` the Abort
     # exceptions (resolve to a Raise). Left untyped-element (plain ``list``) deliberately: importing
-    # ``ModifyExecResult`` (in the effects layer) here creates an events→effects cycle that makes pyright
+    # ``ModifyInvokeResult`` (in the effects layer) here creates an events→effects cycle that makes pyright
     # mis-resolve the frozen generic ``Event`` dataclasses in this module. The dispatcher's
     # ``_compose_invoke_complete`` is the only writer and appends the right types.
     modify_effects: list = field(default_factory=list)
@@ -274,8 +292,8 @@ class InvokeContext(ExecutionContext):
       structural affordance-removal (see :class:`RecursionLimit`).
     - Record metrics
 
-    The result-scoped effects (SupplyExecResult / ModifyExecResult) are not valid here (an invoke
-    has no execution result to supply or transform), and ``Finish`` (a graceful
+    The result-scoped effects (SupplyExecResult / ModifyExecResult / ModifyInvokeResult) are not
+    valid here (an invoke has no execution result to supply or transform yet), and ``Finish`` (a graceful
     Return-terminate) is deliberately excluded (#481, YAGNI) — so Abort is the only
     terminating effect at invoke enter.
     """
@@ -323,7 +341,15 @@ class InvokeSpan:
     def __init__(self, ctx: InvokeContext) -> None:
         self.ctx = ctx
         self._completed: bool = False
-        self._result: ExecResult | None = None
+        # An invoke completes only on a terminal result (see ``InvokeComplete.result``), so the
+        # span holds a ``TerminalExecResult`` throughout — set at ``complete`` and possibly
+        # replaced by a ``ModifyInvokeResult`` override at ``set_final_result``.
+        self._result: TerminalExecResult | None = None
+        # A Send-time ``SupplyInvokeResult`` short-circuit, resolved by ``span_invoke``'s send
+        # emitter and read by the agent after ``send()``: when non-None the agent skips the whole
+        # loop and completes with it (mirrors ``REPLExecSpan.supplied``). Terminal by the effect's
+        # own ``__post_init__``, so it is a valid ``complete(result=...)`` argument.
+        self.supplied: TerminalExecResult | None = None
         # Emitter for InvokeSend, installed by ``span_invoke`` (the span is pure data and
         # must not import the dispatcher; the CM closes over the enter event + composed
         # input effects so ``send()`` needs only the committed inputs). None on a
@@ -347,11 +373,12 @@ class InvokeSpan:
             )
         self._emit_send(inputs)
 
-    def complete(self, *, result: ExecResult) -> None:
+    def complete(self, *, result: TerminalExecResult) -> None:
         """Complete span with invocation result.
 
         Args:
-            result: The result of the invocation (a ``return`` or a ``raise``)
+            result: The invocation's terminal result — a ``Return`` or a ``Raise`` (an invoke
+                never completes on a ``Continue``).
 
         Raises:
             RuntimeError: If span was already completed
@@ -365,11 +392,12 @@ class InvokeSpan:
         """Check if span was completed."""
         return self._completed
 
-    def get_result(self) -> ExecResult:
+    def get_result(self) -> TerminalExecResult:
         """Get the invocation result.
 
         Returns:
-            The result provided to complete()
+            The terminal result provided to complete() (or the ``set_final_result`` override) —
+            a ``Return`` or a ``Raise``.
 
         Raises:
             RuntimeError: If span was not completed
@@ -379,11 +407,11 @@ class InvokeSpan:
         assert self._result is not None
         return self._result
 
-    def set_final_result(self, result: ExecResult) -> None:
+    def set_final_result(self, result: TerminalExecResult) -> None:
         """Replace the completed result with an ``InvokeComplete``-composed override.
 
         Called only by ``span_invoke`` after emitting ``InvokeComplete`` and resolving any
-        ``ModifyExecResult`` (mirrors ``REPLExecSpan.set_final_exec_result``). The caller then reads
+        ``ModifyInvokeResult`` (mirrors ``REPLExecSpan.set_final_exec_result``). The caller then reads
         the (possibly overridden) terminal result via :meth:`get_result` *after* the span closes.
         """
         if not self._completed:

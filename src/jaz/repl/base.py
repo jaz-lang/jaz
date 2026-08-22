@@ -1,6 +1,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from typing import Any, Self
 
 from jaz._invoke_tool import InvokeTool
@@ -8,12 +9,40 @@ from jaz._invoke_tool import InvokeTool
 from .types import ExecResult
 
 
+@dataclass(frozen=True)
+class REPLState:
+    """The per-invoke state of a REPL run — everything one ``initialize()`` produces.
+
+    A REPL is *configured* by construction (its sandbox policy, timeouts, finishing rules) and
+    *initialized* per invoke; this holds exactly the per-invoke half. Separating it from the REPL
+    object is the direction of #1058: with state in an explicit ``REPLState``, the REPL becomes
+    pure configuration and the "one template, many runs" mutable-sharing hazard becomes structural
+    rather than guarded by copy-on-initialize.
+
+    Note the two distinct lifetimes: this is *per-invoke* state. Per-*exec* scratch (a REPL's
+    per-turn bookkeeping) does not belong here — it lives for one ``exec`` call and is threaded
+    locally, not stored across turns.
+    """
+
+    # ``frozen`` makes the "never rebind a field" invariant structural rather than audited: the
+    # REPL surfaces these through read-only properties precisely because every writer mutates the
+    # *namespace dict* in place (which frozen still allows) and never reassigns a field. A fresh
+    # ``REPLState`` is built per invoke, so immutability of the container costs nothing.
+
+    # The REPL namespace (globals the agent's code runs against). ``__history__`` is not a separate
+    # field — it lives inside this dict (under ``__builtins__``), seeded at initialize time.
+    repl_state_locals: dict[str, object] = field(default_factory=dict)
+    # The sub-invoke primitive bound in the namespace as ``invoke``; ``None`` disables recursion.
+    invoke_tool: InvokeTool | None = None
+    session_id: str | None = None
+
+
 class BaseREPL(ABC):
     """Base contract for REPL implementations used by LM agents.
 
     The REPL knows nothing about the return type or its validation. Return-*type* checking,
-    return-*value* validation, and REPL-*input* validation all live in hooks (``ReturnType`` /
-    ``ValidateReturn`` / ``ValidateREPLInput``) that act on the effect path; the REPL only
+    return-*value* validation, and REPL-*code* validation all live in hooks (``ReturnType`` /
+    ``ValidateReturn`` / ``ValidateREPLCode``) that act on the effect path; the REPL only
     produces a ``Return`` carrying the value and the hooks decide whether it's acceptable.
     """
 
@@ -80,24 +109,22 @@ class BaseREPL(ABC):
         allowed_builtins: dict[str, object] | None = None,
         session_id: str = "",
         initial_repl_history: list[object] | None = None,
-    ) -> Self:
-        """Return a **new** REPL carrying this one's configuration plus one invoke's state.
+    ) -> REPLState:
+        """Build one invoke's :class:`REPLState` — the REPL itself stays pure configuration.
 
         Takes **only invoke-time arguments**. Everything that configures the REPL —
         ``exec_timeout``, the sandbox allow-lists, the finishing rules — is a constructor
-        parameter, so a REPL is *configured* by construction and *initialized* per run.
+        parameter, so a REPL is *configured* by construction and produces a fresh ``REPLState``
+        per run. The REPL holds no per-invoke state, so one configured REPL serves many invokes::
 
-        **The receiver is a reusable template and is left untouched**; the returned instance is
-        the one to ``exec`` against. Call it once per invoke on the same configured REPL::
+            repl = PythonREPL(exec_timeout=30.0)
+            first = repl.initialize(inputs=..., session_id="a")   # a REPLState
+            second = repl.initialize(inputs=..., session_id="b")  # an independent REPLState
+            repl.exec(first, "x = 1", "0")                        # pass the state back to exec
 
-            template = PythonREPL(exec_timeout=30.0)
-            first = template.initialize(inputs=..., session_id="a")
-            second = template.initialize(inputs=..., session_id="b")  # independent of `first`
-
-        Implementations must not bind per-invoke state onto ``self``. Returning ``self`` would
-        make the object single-use — a second call would silently replace the first run's
-        namespace, invoke-tool binding and session id — which rules out holding one configured REPL
-        and running many invokes from it.
+        The returned ``REPLState`` is threaded back into :meth:`exec` / :meth:`add_variables` /
+        :meth:`drop_variables`; the REPL never mutates ``self``, so two invokes cannot bleed into
+        each other by construction.
 
         Arguments:
             inputs: A dictionary of initial inputs to the REPL.
@@ -113,18 +140,19 @@ class BaseREPL(ABC):
                 without a Python namespace (a non-Python REPL) ignore it (leaving it empty),
                 which signals to the driver that the REPL keeps no history.
         Returns:
-            This REPL, initialized.
+            A fresh :class:`REPLState` holding this invoke's namespace, tool binding and session id.
         """
 
     @abstractmethod
     def exec(
         self,
+        state: REPLState,
         src: str,
-        input_id: str,
+        code_id: str,
         exec_timeout_override: float | None = None,
     ) -> ExecResult[Any]:
         # TODO: Fix static types
-        """Execute REPL input and mutate state in place.
+        """Execute REPL code against ``state``, mutating it in place.
 
         Errors in the executed code should be captured and returned as a recoverable
         :class:`~jaz.repl.Continue` (its ``exception`` set, its ``output`` shown to the
@@ -134,8 +162,8 @@ class BaseREPL(ABC):
         this call instead of becoming feedback, so it propagates past the agent.
 
         Arguments:
-            src: The REPL input to execute.
-            input_id: The unique identifier for the REPL input.
+            src: The REPL code to execute.
+            code_id: The unique identifier for the REPL code.
         Returns:
             An :class:`~jaz.repl.ExecResult` — exactly one of :class:`~jaz.repl.Continue`
             (ran, session continues; carries ``output`` and an optional recoverable
@@ -146,8 +174,9 @@ class BaseREPL(ABC):
 
     async def aexec(
         self,
+        state: REPLState,
         src: str,
-        input_id: str,
+        code_id: str,
         exec_timeout_override: float | None = None,
     ) -> ExecResult[Any]:
         """Async version of exec(). Runs exec() in a thread pool to avoid blocking
@@ -166,8 +195,9 @@ class BaseREPL(ABC):
         """
         return await asyncio.to_thread(
             self.exec,
+            state,
             src,
-            input_id,
+            code_id,
             exec_timeout_override,
         )
 
@@ -176,7 +206,7 @@ class BaseREPL(ABC):
         return "`return ...`"
 
     @abstractmethod
-    def add_inputs(self, inputs: dict[str, object]) -> None:
+    def add_inputs(self, state: REPLState, inputs: dict[str, object]) -> None:
         """Add inputs to the REPL environment after initialization.
 
         This method allows dynamically adding variables, functions, or other
@@ -200,7 +230,7 @@ class BaseREPL(ABC):
         """
 
     @abstractmethod
-    def add_variables(self, variables: dict[str, object]) -> None:
+    def add_variables(self, state: REPLState, variables: dict[str, object]) -> None:
         """Bind ``variables`` **raw** into the REPL namespace (the per-turn ``AddVariables``).
 
         The namespace-level counterpart of ``add_inputs``: where ``add_inputs`` is an
@@ -221,7 +251,10 @@ class BaseREPL(ABC):
 
     @abstractmethod
     def drop_variables(
-        self, names: Iterable[str], allow_missing: Iterable[str] = ()
+        self,
+        state: REPLState,
+        names: Iterable[str],
+        allow_missing: Iterable[str] = (),
     ) -> None:
         """Remove ``names`` from the REPL namespace (the inverse of ``add_inputs``).
 

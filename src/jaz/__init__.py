@@ -51,15 +51,12 @@ experimental and may change or be removed.
 #   ``jaz.display``, ``jaz.library``, ``jaz.llm_client``, ``jaz.parent_output``) are
 #   forwarding shims; the definitions live in ``_``-prefixed siblings. Holding a
 #   ``_DEMOTED`` target — not merely "holds no public name" — is the criterion: a shim
-#   exists to close the second route to a name ``jaz.<name>`` already warns about (see
-#   ``make_private_module_shim`` for why ``jaz.llm_client_rlm`` is excluded despite fitting
-#   the broader reading).
-# - Three silent paths remain, each signposted by something other than a warning: importing
+#   exists to close the second route to a name ``jaz.<name>`` already warns about.
+# - Two silent paths remain, each signposted by something other than a warning: importing
 #   straight from a ``_``-prefixed module (``jaz._agent`` / ``jaz._library`` — the
-#   underscore is the contract); a ``from`` import of a demoted name out of a module that
+#   underscore is the contract); and a ``from`` import of a demoted name out of a module that
 #   *also* holds public ones (``from jaz.config import configure_by_depth``; ``jaz.config``
-#   cannot become a shim while ``configure`` is defined there); and ``from jaz.llm_client_rlm
-#   import RLMClient``, whose module is private by convention only.
+#   cannot become a shim while ``configure`` is defined there).
 # - The supported move in every case is a name in ``__all__``.
 
 from typing import TYPE_CHECKING
@@ -109,12 +106,13 @@ if TYPE_CHECKING:
     from .descriptions import DescriptionOverride as DescriptionOverride
     from .descriptions import get_description as get_description
     from .hooks import ReturnType as ReturnType
-    from .hooks import ValidateREPLInput as ValidateREPLInput
+    from .hooks import ValidateREPLCode as ValidateREPLCode
+    from .hooks import ValidateREPLInput as ValidateREPLInput  # deprecated alias
     from .hooks import ValidateReturn as ValidateReturn
     from .scope import current_scope as current_scope
     from .scope import get_scope as get_scope
 
-__version__ = "0.2.0a2"
+__version__ = "0.2.0a3"
 
 # The v1 public API — the documented, supported surface (API-surface review,
 # 2026-07-26). `__all__` is the single source of truth for several things at once:
@@ -234,7 +232,9 @@ _DEMOTED = {
     # blessed path: jaz.hooks.<name>
     "ReturnType": ("jaz.hooks", "ReturnType"),
     "ValidateReturn": ("jaz.hooks", "ValidateReturn"),
-    "ValidateREPLInput": ("jaz.hooks", "ValidateREPLInput"),
+    "ValidateREPLCode": ("jaz.hooks", "ValidateREPLCode"),
+    # deprecated alias of ValidateREPLCode
+    "ValidateREPLInput": ("jaz.hooks", "ValidateREPLCode"),
     # Base classes are reached via their (now uniformly public) package — jaz.llm.BaseLLM,
     # jaz.protocol.BaseProtocol, jaz.repl.BaseREPL — so they are NOT demoted top-level aliases
     # of `jaz` (BaseREPL never was one; this makes LLM/Protocol match it).

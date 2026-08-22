@@ -2,7 +2,7 @@
 
 Registered as ``"code_only"`` and the only protocol JAZ ships. There is no XML framing, no
 ``<repl_code>`` tag, and no delimiter of any kind — the whole assistant message is executed
-verbatim as REPL input, and reasoning goes in leading comments.
+verbatim as REPL code, and reasoning goes in leading comments.
 
 Why there is no delimiter
 -------------------------
@@ -41,9 +41,9 @@ Known costs (accepted)
   for a block); this cannot. The failure is loud and recoverable rather than silent, which is the
   intended trade, but it falls hardest on smaller models.
 - **No per-exec timeout attribute.** ``<repl_code timeout="30">``'s successor is not a protocol
-  concern at all: the REPL reads a ``# timeout: <seconds>`` comment among the lines that open the
-  input (see :meth:`PythonREPL.exec`), so the request travels *inside* the
-  code rather than in framing this protocol no longer has. ``parse`` therefore still returns
+  concern at all: the REPL reads a ``# timeout: <seconds>`` comment among the lines that open
+  the code (see :meth:`PythonREPL.exec`), so the request travels *inside* the code rather than
+  in framing this protocol no longer has. ``parse`` therefore still returns
   ``exec_timeout_override=None`` — the seam stays open for a protocol that does carry one
   out-of-band, and the pragma outranks it when both are present.
 - **No plan/code split.** Consumers that extracted ``<plan>`` separately see only code — though

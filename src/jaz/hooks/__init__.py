@@ -93,7 +93,7 @@ from .builtin import (
     RecursionLimit,
     ReturnType,
     RolloutRecorder,
-    ValidateREPLInput,
+    ValidateREPLCode,
     ValidateReturn,
 )
 from .dispatcher import Hook
@@ -116,22 +116,29 @@ if TYPE_CHECKING:
     from .builtin import MetaData as MetaData
     from .builtin import Replay as Replay
     from .builtin import ReplayHook as ReplayHook
+    from .builtin import ValidateREPLInput as ValidateREPLInput
     from .builtin import WorkflowReplay as WorkflowReplay
     from .builtin import WorkflowReplayHook as WorkflowReplayHook
     from .dispatcher import HookDispatcher as HookDispatcher
     from .dispatcher import get_dispatcher as get_dispatcher
+    from .effects import UNSET as UNSET
     from .effects import Abort as Abort
     from .effects import AddInputs as AddInputs
     from .effects import AddMessages as AddMessages
     from .effects import AddVariables as AddVariables
     from .effects import BlackboardWrite as BlackboardWrite
+    from .effects import DeleteCode as DeleteCode
     from .effects import DisableRecursion as DisableRecursion
     from .effects import DropInputs as DropInputs
     from .effects import DropMessages as DropMessages
     from .effects import DropVariables as DropVariables
     from .effects import Effect as Effect
+    from .effects import InsertCode as InsertCode
     from .effects import ModifyExecResult as ModifyExecResult
+    from .effects import ModifyInvokeResult as ModifyInvokeResult
+    from .effects import ModifyLLMResponse as ModifyLLMResponse
     from .effects import SupplyExecResult as SupplyExecResult
+    from .effects import SupplyInvokeResult as SupplyInvokeResult
     from .effects import SupplyLLMResponse as SupplyLLMResponse
     from .events import Aborted as Aborted
     from .events import Completed as Completed
@@ -195,7 +202,7 @@ __all__ = [
     "ReturnType",
     "RolloutRecorder",
     "ValidateReturn",
-    "ValidateREPLInput",
+    "ValidateREPLCode",
 ]
 
 if _TRACING_AVAILABLE:
@@ -222,14 +229,20 @@ _DEMOTED = {
     "Abort": ("jaz.hooks.effects", "Abort"),
     "SupplyExecResult": ("jaz.hooks.effects", "SupplyExecResult"),
     "ModifyExecResult": ("jaz.hooks.effects", "ModifyExecResult"),
+    "ModifyInvokeResult": ("jaz.hooks.effects", "ModifyInvokeResult"),
+    "SupplyInvokeResult": ("jaz.hooks.effects", "SupplyInvokeResult"),
     "DisableRecursion": ("jaz.hooks.effects", "DisableRecursion"),
     "AddInputs": ("jaz.hooks.effects", "AddInputs"),
     "DropInputs": ("jaz.hooks.effects", "DropInputs"),
     "AddVariables": ("jaz.hooks.effects", "AddVariables"),
     "DropVariables": ("jaz.hooks.effects", "DropVariables"),
+    "InsertCode": ("jaz.hooks.effects", "InsertCode"),
+    "DeleteCode": ("jaz.hooks.effects", "DeleteCode"),
     "DropMessages": ("jaz.hooks.effects", "DropMessages"),
     "AddMessages": ("jaz.hooks.effects", "AddMessages"),
     "SupplyLLMResponse": ("jaz.hooks.effects", "SupplyLLMResponse"),
+    "ModifyLLMResponse": ("jaz.hooks.effects", "ModifyLLMResponse"),
+    "UNSET": ("jaz.hooks.effects", "UNSET"),
     "BlackboardWrite": ("jaz.hooks.effects", "BlackboardWrite"),
     # Event vocabulary — blessed path: jaz.hooks.events.<name>
     "Event": ("jaz.hooks.events", "Event"),
@@ -268,7 +281,8 @@ _DEMOTED = {
     "REPLExecSpan": ("jaz.hooks.events", "REPLExecSpan"),
 }
 
-# Pre-rename spellings (#806 question 1 dropped the ``Hook`` suffix across the whole set).
+# Pre-rename spellings (#806 question 1 dropped the ``Hook`` suffix across the whole set;
+# the REPL-input → REPL-code rename added one more that is not a suffix drop).
 # Every one was in ``__all__`` before the rename — documented surface, not merely reachable —
 # so dropping it outright would turn `from jaz.hooks import WorkflowReplayHook` in
 # out-of-tree code into an ImportError with no hint of the replacement.
@@ -280,7 +294,7 @@ _DEMOTED = {
 # alias, and an eagerly-bound attribute never reaches ``__getattr__`` — silently un-demoting
 # the very name this module means to demote.
 #
-# These are *import*-compatibility only: they keep the old ``XxxHook`` names importable. An
+# These are *import*-compatibility only: they keep the old names importable. An
 # entry here registers nothing and has no bearing on serialized ``qualified_name`` reconstruction.
 _DEMOTED.update(
     {
@@ -291,6 +305,11 @@ _DEMOTED.update(
         "IterationLimitHook": ("jaz.hooks.builtin", "IterationLimit"),
         "ReplayHook": ("jaz.hooks.builtin", "ATIFReplay"),
         "WorkflowReplayHook": ("jaz.hooks.builtin", "WorkflowReplay"),
+        # Not a ``Hook``-suffix drop: "REPL input" was renamed to "REPL code" because
+        # "input" already means an *invoke input* everywhere else in the vocabulary
+        # (``AddInputs``, ``DropInputs``, ``__inputs__``), so the old name read as
+        # "validate the invoke's inputs" — the opposite of what it does.
+        "ValidateREPLInput": ("jaz.hooks.builtin", "ValidateREPLCode"),
     }
 )
 

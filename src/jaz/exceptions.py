@@ -343,12 +343,12 @@ DuplicateREPLInputError = REPLInputConflictError
 
 
 class REPLTimeoutPragmaError(ValueError, JazException):
-    """Raised when an input's leading ``# timeout:`` comment names no positive number of seconds.
+    """Raised when the code's leading ``# timeout:`` comment names no positive number of seconds.
 
     An agent sets a per-execution wall-clock bound with a ``# timeout: <seconds>`` comment among
-    the lines opening its REPL input. The value must parse as a positive, finite number, so
+    the lines opening its REPL code. The value must parse as a positive, finite number, so
     ``# timeout: 120s`` and ``# timeout: 0`` are rejected; a trailing ``#`` comment after the
-    number is allowed. The offending input is not executed — the agent sees the error as ordinary
+    number is allowed. The offending code is not executed — the agent sees the error as ordinary
     REPL feedback and can correct it on the next iteration."""
 
     # ``ValueError`` (following :class:`REPLInputConflictError`): nothing failed to resolve — the
@@ -413,11 +413,13 @@ class InvalidEffectError(JazException):
 
 
 class LLMResponseConflictError(JazException):
-    """Raised when two distinct :class:`SupplyLLMResponse` effects supply a response for the
-    same LLM query.
+    """Raised when hooks compose conflicting LLM-response values for the same query.
 
-    Identical supplies coalesce to one; distinct ones raise, because resolving by arrival order
-    would make composition depend on hook registration or ``with``-nesting order.
+    Two cases, both order-independence violations: two distinct :class:`SupplyLLMResponse` effects
+    supplying a response at :class:`LLMQuerySend`, or two :class:`ModifyLLMResponse` effects setting
+    the *same* field to different values at :class:`LLMQueryComplete`. Identical values coalesce;
+    distinct ones raise, because resolving by arrival order would make composition depend on hook
+    registration or ``with``-nesting order.
     """
 
 
@@ -435,8 +437,9 @@ ConflictingOverrideError = LLMResponseConflictError
 class ReturnValueConflictError(JazException):
     """Raised when effects carrying *distinct* :class:`Return` values fold at one boundary.
 
-    Applies wherever results fold — :class:`SupplyExecResult` at :class:`REPLExecSend`, and
-    :class:`ModifyExecResult` at :class:`REPLExecComplete` or :class:`InvokeComplete`. Carried
+    Applies wherever results fold — :class:`SupplyExecResult` at :class:`REPLExecSend`,
+    :class:`ModifyExecResult` at :class:`REPLExecComplete`, and :class:`ModifyInvokeResult` at
+    :class:`InvokeComplete`. Carried
     :class:`Continue` results merge (outputs concatenate, exceptions group) and identical return
     values coalesce, but two *different* return values cannot be combined without picking a
     winner by hook order.
@@ -505,7 +508,7 @@ class BlackboardWriteConflictError(JazException):
 def is_fatal(e: BaseException) -> bool:
     """Whether ``e`` should end the whole agent run instead of becoming feedback.
 
-    Consulted at every REPL exec boundary (see ``_reraise_if_fatal``) to decide whether
+    Consulted at every REPL exec boundary to decide whether
     a caught exception re-raises out of ``exec`` and propagates out of the invoke (fatal)
     or is rendered as a recoverable ``Continue``.
 
@@ -686,6 +689,20 @@ class MessageEditIndexError(IndexError, JazException):
     # renders unquoted in a traceback and no ``__str__`` override is needed.
 
     # TODO: revise docstring
+
+
+class CodeEditOffsetError(IndexError, JazException):
+    """Raised when an :class:`InsertCode` / :class:`DeleteCode` character offset is out of range.
+
+    The character-offset twin of :class:`MessageEditIndexError`: offsets follow list semantics
+    against the code the hook saw on :class:`REPLExecEnter` (a negative offset counts from the
+    end; end-of-string is ``offset == len``). Anything outside ``[-len, len]`` — or a
+    :class:`DeleteCode` whose resolved ``start`` exceeds its ``end`` — raises rather than being
+    ignored or clamped, since every offset is computed against that exact snapshot and so an
+    out-of-range one is a hook bug.
+
+    Both an ``IndexError`` and a :class:`JazException`, mirroring :class:`MessageEditIndexError`.
+    """
 
 
 class MissingDropTargetError(KeyError, JazException):

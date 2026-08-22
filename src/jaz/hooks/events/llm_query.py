@@ -131,11 +131,16 @@ class MessageDropRecord:
     Attributes:
         message: The dropped message itself (with its provenance stamp, so its stable
             per-message id is readable via :func:`jaz.provenance.provenance_of`).
+        position: The resolved slot the message occupied in the enter-time snapshot when it
+            was dropped -- the drop's input coordinate, mirroring :attr:`MessageAddRecord.position`.
+            A live buffer index, so it drifts across turns; the message's id and iteration (via its
+            provenance) are the stable identity.
         persistent: Whether the drop also removed the message from the carried-forward
             buffer (``True``) or applied to this query's view only (``False``).
     """
 
     message: MessageDict
+    position: int
     persistent: bool
 
 
@@ -241,24 +246,35 @@ class LLMQueryComplete(Event):
 
     Allowed effects:
 
+    - :class:`ModifyLLMResponse` — transform the response (content and/or token/cost fields) the
+      agent then acts on. The transform is authoritative: the modified response is what the agent
+      parses into its next turn and what :class:`LLMQueryExit` observers + cost accounting see.
     - :class:`Abort` — abort the invoke on the basis of the response.
 
     Attributes:
-        response: The raw ``LLMResponse`` the producer returned — content, token counts,
-            and cost.
+        response: The *raw* ``LLMResponse`` the producer returned (pre-transform) — content, token
+            counts, and cost. A :class:`ModifyLLMResponse` composed here transforms it; the
+            post-transform response is what :class:`LLMQueryExit` carries.
         model: Which model was called; mirrors :class:`LLMQueryEnter`'s ``model``.
         iteration: The agent-loop iteration this query belongs to.
     """
 
-    # The modify slot is documented-but-empty by design: this event is the stage that would
-    # host a response-transforming effect (the ``ModifyExecResult`` analogue for responses),
-    # but no such effect exists yet — substituting a response after the call happened is a
-    # semantic minefield (the observed exit and the acted-on response would need to agree),
-    # so the slot stays unfilled until a concrete consumer motivates it. Abort-only for now.
+    # Transform here, carry the transformed value on the Exit event: the #906 pattern.
+    # This is the response-transform boundary — the ``ModifyExecResult`` analogue for responses,
+    # via ``ModifyLLMResponse`` (the "modify slot" this event long reserved but left empty until a
+    # consumer motivated it). The minefield the old comment warned of — "the observed exit and the
+    # acted-on response must agree" — is resolved by making the transform authoritative and
+    # single-sourced: ``span_llm_query`` writes the merged response back onto the span, so
+    # ``LLMQueryExit`` and the content the agent parses read the *same* post-transform object (see
+    # ``resolve_llm_modify_results`` and ``Agent._query_with_messages``). ``LLMQueryComplete.response``
+    # itself stays the *raw* response, mirroring ``InvokeComplete.result`` (hooks transform what they
+    # observe here; Exit carries the result).
     #
-    # ``BudgetPool``'s uncosted-model backstop lives here (#1071): its predicate reads the
-    # response ("this turn reported no cost"), which is exactly this event's firing
-    # condition — at Exit the outcomes where no response exists are already terminating.
+    # ``BudgetPool``'s uncosted-model backstop also lives here (#1071): its predicate reads the
+    # response ("this turn reported no cost"), which is exactly this event's firing condition — at
+    # Exit the outcomes where no response exists are already terminating. It reads the *raw*
+    # response deliberately (it guards against a provider reporting no cost, not against a hook's
+    # re-price); the cost *booked* at Exit reflects any ``ModifyLLMResponse`` override.
 
     response: LLMResponse
     model: str
@@ -279,9 +295,18 @@ class LLMQueryExit(Event):
     fires). The event fires on **every** path once the query span opened — an aborted
     query closes ``Aborted``, it no longer skips the exit.
 
-    Observation-only: no effect is valid here — the outcome is already final (an effect
-    returned here raises :class:`~jaz.exceptions.InvalidEffectError`). A hook that
-    must stop the run on the basis of the response aborts at :class:`LLMQueryComplete`.
+    Allowed effects — narrow: a hook may return :class:`Abort` (and only ``Abort``), on **every**
+    arm. On the :class:`Completed` arm this stops the run on the basis of the **final,
+    post-transform** response — the thing :class:`LLMQueryComplete` can't see, since a
+    ``ModifyLLMResponse`` there composes after every Complete hook has run — firing before the agent
+    acts on the response. On the :class:`Aborted` / :class:`Failed` arms a terminating exception is
+    already unwinding, so an abort here cannot *replace* it: it is folded *into* it via an
+    ``ExceptionGroup`` (the in-flight exception stays present, so ``is_fatal`` still governs how far
+    the combined error travels). Any effect other than ``Abort`` raises
+    :class:`~jaz.exceptions.InvalidEffectError` on the ``Completed`` arm and is dropped with an
+    error log on the abnormal arms (a loud raise there would replace the exception that must win).
+    To transform the response (rather than abort on it), use :class:`ModifyLLMResponse` at
+    :class:`LLMQueryComplete`.
 
     Timing: like every event, this exit carries only :attr:`~jaz.hooks.events.Event.timestamp`
     (its emission time); a span's duration is ``Exit.timestamp - Enter.timestamp``.
@@ -293,6 +318,9 @@ class LLMQueryExit(Event):
         iteration: The agent-loop iteration this query belongs to.
     """
 
+    # #892 settled the abnormal-arm rule: an abort raised while an exception is already
+    # unwinding folds into that exception rather than replacing it.
+    #
     # ``model`` stays an **event** field rather than folding into the outcome (a divergence
     # from the #481 doc): it is *query* metadata, not *response* content.
     #
@@ -356,13 +384,20 @@ class LLMQuerySendContext(ExecutionContext):
 
 @dataclass
 class LLMQueryCompleteContext(ExecutionContext):
-    """Context for LLM query *complete* events.
+    """Context for LLM query *complete* events — the response-transform boundary.
 
-    Hooks can abort the invoke via :class:`Abort`; the composed exceptions are
-    collected in ``abort_errors`` and ``span_llm_query`` raises their combination (the
-    span closes ``Aborted``). No other effect is valid here (no response-modify effect
-    exists yet — see the comment on :class:`LLMQueryComplete`).
+    The LLM-query twin of ``REPLExecCompleteContext``: hooks can transform the response via
+    :class:`ModifyLLMResponse` (``modify_effects`` — ``span_llm_query`` resolves them onto the raw
+    response and writes the result back on the span, so ``LLMQueryExit`` and the agent read the
+    post-transform object), or abort via :class:`Abort` (``abort_errors`` — ``span_llm_query`` raises
+    their combination; the span closes ``Aborted``, superseding any transform).
     """
+
+    # ``modify_effects`` holds the ``ModifyLLMResponse``s; ``abort_errors`` the Abort exceptions.
+    # Left untyped-element (plain ``list``) for the same reason as the other *Complete contexts:
+    # importing the effect class here creates an events→effects cycle. The dispatcher's
+    # ``_compose_llm_query_complete`` is the only writer and appends the right type.
+    modify_effects: list = field(default_factory=list)
 
     # Why this boundary exists at all: the response's first-existence point used to be
     # `LLMQueryExit`, which grew an Abort channel because denying it forced hooks to stash
@@ -467,6 +502,18 @@ class LLMQuerySpan:
             raise RuntimeError("Span not completed")
         assert self._response is not None
         return self._response
+
+    def set_response(self, response: LLMResponse) -> None:
+        """Replace the completed response with a ``LLMQueryComplete``-composed override.
+
+        Called only by ``span_llm_query`` after emitting ``LLMQueryComplete`` and resolving any
+        ``ModifyLLMResponse`` (mirrors ``InvokeSpan.set_final_result``). The caller then reads the
+        (possibly overridden) response via :meth:`get_response` *after* the span closes — the
+        object ``LLMQueryExit`` carries and the agent parses, so the transform is authoritative.
+        """
+        if not self._completed:
+            raise RuntimeError("Span not completed")
+        self._response = response
 
 
 # Retry lives here with the rest of the LLMQuery* family (rather than a standalone

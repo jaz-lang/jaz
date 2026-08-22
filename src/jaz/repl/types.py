@@ -85,3 +85,33 @@ An :class:`ExecResult` is what a hook receives as ``event.exec_result``, and wha
 ``jaz.hooks.effects.SupplyExecResult`` / :class:`ModifyExecResult` to supply or replace the outcome of a
 turn.
 """
+
+
+type TerminalExecResult[ReturnT] = Return[ReturnT] | Raise
+"""The subset of :class:`ExecResult` a run can *terminate* on: a :class:`Return` or a
+:class:`Raise`, never a :class:`Continue`.
+
+A single REPL turn may end on any of the three :class:`ExecResult` kinds, but an *invoke* only
+ever finishes on a terminal one — a :class:`Continue` appends an observation and loops again, so
+by the time the invoke's result exists the loop has already broken on a :class:`Return` /
+:class:`Raise`. This alias names that narrower domain so the invoke transform boundary can require
+it — see ``jaz.hooks.effects.ModifyInvokeResult`` and ``jaz.hooks.events.InvokeComplete`` — rather
+than accept the full :class:`ExecResult` union and lean on a runtime check.
+"""
+
+# Why a distinct alias rather than reusing ``ExecResult`` at the invoke boundary: the field type is
+# the only place the "no Continue past an invoke's completion" invariant can be *stated*. Reusing
+# ``ExecResult`` there let a hook construct ``ModifyExecResult(Continue(...))`` at ``InvokeComplete``
+# with nothing rejecting it until a strippable ``assert isinstance(final, Return | Raise)`` deep in
+# the dispatcher (and, under ``python -O``, a leaked ``Continue`` corrupting the invoke's outcome).
+# The same downgrade-to-``Continue`` is *valid* at ``REPLExecComplete`` (it forces another turn) and
+# meaningless at ``InvokeComplete`` (the loop has already broken), so the two Complete boundaries
+# genuinely have different valid domains and cannot share one result type — even though they share
+# the merge fold. (Executive call, this conversation: split the effect *wrapper* per boundary, keep
+# the ``_fold_carried_results`` algorithm shared.)
+#
+# Named ``TerminalExecResult``, not ``InvokeResult``: this is the terminal *subset of an
+# ``ExecResult``* (a REPL-turn property, defined here in REPL vocabulary), not an invoke-layer type —
+# the invoke boundary merely consumes it, and the name ``InvokeResult`` would both invert the
+# layering and collide with the existing ``InvokeOutcome`` (``Completed[Return | Raise] | Aborted |
+# Failed``), two "invoke result" types meaning different things.

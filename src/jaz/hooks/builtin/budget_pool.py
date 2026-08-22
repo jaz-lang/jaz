@@ -49,7 +49,6 @@ from jaz.hooks.effects import Abort, AddMessages, Effect
 from jaz.hooks.events import (
     InvokeEnter,
     InvokeExit,
-    LLMQueryComplete,
     LLMQueryEnter,
     LLMQueryExit,
 )
@@ -86,7 +85,7 @@ class BudgetPool(Hook):
     with no usage block; this hook does not track tokens, so a missing usage block is a
     non-event for it. A missing *cost* (``cost_usd is None``) under a ``cost_budget`` is a
     different matter — the budget is then unenforceable and the hook aborts (see
-    ``on_llm_query_complete``); with no ``cost_budget`` the call is booked as ``$0`` and the
+    ``on_llm_query_exit``); with no ``cost_budget`` the call is booked as ``$0`` and the
     ``calls_budget`` keeps counting it.
 
     Args:
@@ -144,8 +143,9 @@ class BudgetPool(Hook):
     # `InvokeEnter`): accounting and enforcement skip an invoke_id that never entered.
     #
     # Mechanics kept out of the docstring: the hook handles `InvokeEnter`/`InvokeExit` (scope
-    # membership), `LLMQueryEnter` (enforcement + warning), `LLMQueryComplete` (the
-    # uncosted-model backstop) and `LLMQueryExit` (accounting: += cost, += 1 call). The hard
+    # membership), `LLMQueryEnter` (enforcement + warning), and `LLMQueryExit` (accounting:
+    # += cost, += 1 call — AND the uncosted-model backstop, an `Abort` on the Completed arm that
+    # reads the final post-transform cost). The hard
     # stop is an `Abort` at `LLMQueryEnter` — the top of the turn, before the query — chosen
     # because that event is the always-present per-turn boundary; REPL *execution* is skipped
     # for unparseable output, so enforcing there would let a turn slip past the budget. The
@@ -311,12 +311,21 @@ class BudgetPool(Hook):
         if not isinstance(event.outcome, Completed):
             return []
         response = event.outcome.result
-        # Book the call. An unknown cost (cost_usd None) is recorded as 0.0 — conflating "free"
-        # with "unknown", acceptable precisely because the pairing that would be misled by it
-        # (an uncosted turn under a cost_budget) is aborted by on_llm_query_complete rather than
-        # left to run on an undercounting total. `total_llm_calls` is incremented ONLY here, so
-        # skipping an uncosted turn would let a calls_budget count zero forever and never fire —
-        # which is exactly what a calls_budget is for when a model can't be priced.
+        # Observed-uncosted-turn BACKSTOP (#1071). It lives HERE (the Completed *Exit), not at
+        # on_llm_query_complete, so it reads the FINAL, post-transform cost — the SAME value booked
+        # just below — rather than the raw pre-transform one. That makes the two coherent: a
+        # ModifyLLMResponse(cost_usd=…) re-pricing an otherwise-uncostable model now rescues the
+        # turn (final cost non-None → no abort → booked on the re-priced value), and a genuinely
+        # uncostable turn still aborts. Abort at the Completed *Exit still fires *before* the agent
+        # acts on the response, so the uncosted turn's code never executes (the #1071 property is
+        # preserved); the aborted turn books nothing (we return before the booking below). See
+        # HookDispatcher._resolve_completed_exit_effects for why the abort is valid at Exit now.
+        if response.cost_usd is None and self.cost_budget is not None:
+            return [Abort(error=self._pricing_error(event.model))]
+        # Book the call. An unknown cost (cost_usd None) is recorded as 0.0 — reachable only when
+        # there is NO cost_budget (the branch above aborts the cost_budget case), i.e. a calls_budget
+        # over an unpriceable model. `total_llm_calls` is incremented ONLY here, so booking every
+        # completed call (including a free/unknown one) is what lets a calls_budget actually count.
         with self._lock:
             self._total_cost += (
                 response.cost_usd if response.cost_usd is not None else 0.0
@@ -337,7 +346,7 @@ class BudgetPool(Hook):
         # table lookup in this hook would false-abort every client that prices by another
         # route: `MockLLMClient` hands back its own cost and never consults the table, and
         # its default model name ("mock") is not in it. (The observed-uncosted-turn BACKSTOP
-        # lives at on_llm_query_complete, the turn it is observed — see there.)
+        # lives at on_llm_query_exit, on the post-transform cost — see there.)
         #
         # Pre-flight is first-turn-only in practice, but by consequence rather than by
         # construction: there is no iteration test here, it simply aborts, so no second turn
@@ -374,23 +383,12 @@ class BudgetPool(Hook):
         content = "\n".join(t for t in self._warning_texts() if t)
         return [AddMessages([{"role": "user", "content": content}])] if content else []
 
-    def on_llm_query_complete(self, event: LLMQueryComplete) -> list[Effect]:
-        # Observed-uncosted-turn BACKSTOP (#1071, resolved here): a turn actually reported
-        # no cost while a cost_budget is set, so the budget is unenforceable — abort NOW,
-        # the turn the condition is observed. Kept alongside the pre-flight
-        # `can_report_cost` check at enter because that is a promise a client can get wrong
-        # (a stale table entry, a provider returning no usage); the observed condition is
-        # the ground truth. LLMQueryComplete is the natural home: the predicate reads the
-        # response, which is exactly this event's firing condition — and aborting here
-        # (rather than arming a field and deferring to the next LLMQueryEnter, the old
-        # `_uncosted_model` shape) means the agent never *executes* the code from the
-        # uncosted turn. The turn itself was already paid for either way. Accounting
-        # caveat: the aborted turn's LLMQueryExit closes Aborted, so on_llm_query_exit
-        # books nothing for it — acceptable, since the abort terminates the invoke and the
-        # unknown cost would have been booked as 0.0 anyway.
-        if event.response.cost_usd is None and self.cost_budget is not None:
-            return [Abort(error=self._pricing_error(event.model))]
-        return []
+    # The observed-uncosted-turn BACKSTOP (#1071) used to live on ``on_llm_query_complete`` here,
+    # reading the *raw* pre-transform ``response.cost_usd``. It moved to ``on_llm_query_exit`` so it
+    # reads the FINAL, post-transform cost — coherent with what that same method books, and so a
+    # ``ModifyLLMResponse(cost_usd=…)`` re-price can rescue an otherwise-uncostable turn. It stays a
+    # pre-*execution* abort: the Completed ``LLMQueryExit`` still fires before the agent acts on the
+    # response (see ``on_llm_query_exit`` and ``HookDispatcher._resolve_completed_exit_effects``).
 
     def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:
         # Drop this invoke from the in-scope set. The aggregate is deliberately NOT decremented:
@@ -423,7 +421,7 @@ class BudgetPool(Hook):
     def _pricing_error(self, model: str) -> Exception:
         """The config error when a turn reported no cost while a ``cost_budget`` is set.
 
-        Emitted by ``on_llm_query_complete`` the turn the uncosted response is observed.
+        Emitted by ``on_llm_query_exit`` the turn the uncosted response is observed.
         """
         return ModelPricingUnavailableError(
             f"cost_budget=${self.cost_budget:.6f} was set, but no cost was reported for model "
