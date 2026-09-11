@@ -34,7 +34,7 @@ Executive design decisions (settled with the user; see also ``Display`` in
   the sentence becomes a `` `name` `` backtick reference so the prose reads naturally and
   points the agent at the bound variable. This mirrors the explicit input form.
 - **Default prompt rendering of the bound object is its ``__jaz_description__``** — i.e.
-  the existing default input rendering in ``jaz.prompts``. We deliberately do *not*
+  the existing default input rendering in ``jaz.descriptions``. We deliberately do *not*
   inline ``str(value)`` at the ``{expr}`` site.
 - **A ``!conversion`` / ``:format_spec`` overrides that rendering**, not the binding. The
   object is still bound; only its prompt-header rendering becomes the f-string-style
@@ -159,11 +159,12 @@ def _binding_name(expression: str, used: set[str]) -> str:
     ``_jaz_arg{n}`` that doesn't collide with ``used`` (existing inputs + names already
     minted for this template).
 
-    TODO(#659): let callers name a complex interpolation explicitly via the format-spec
-    slot (``t"{list(range(100)):numbers}"`` binds under ``numbers``), instead of only
-    auto-synthesizing ``_jaz_arg{n}``. Deferred to a separate PR — it repurposes the
-    ``:format_spec`` rendering-override channel, so it needs its own design.
+    A complex interpolation cannot be named explicitly; it always binds under a synthesized
+    ``_jaz_arg{n}``.
     """
+    # TODO(#659): let callers name one via the format-spec slot
+    # (``t"{list(range(100)):numbers}"`` binds under ``numbers``). Deferred to its own PR — it
+    # repurposes the ``:format_spec`` rendering-override channel, so it needs its own design.
     candidate = expression.strip()
     if candidate.isidentifier() and not keyword.iskeyword(candidate):
         return candidate
@@ -267,10 +268,9 @@ def normalize_task(
 
 
 def normalize_inputs(inputs: dict[str, object]) -> dict[str, object]:
-    """Lower any t-string **input values** into text + sibling bindings (#538).
+    """Lower any t-string **input values** into text + sibling bindings.
 
-    After ``task`` was demoted to an ordinary input, a t-string is no longer a positional
-    prompt — it is passed as an *input value* (e.g. ``invoke(task=t"Summarize {data}")``).
+    A t-string is passed as an *input value* (e.g. ``invoke(task=t"Summarize {data}")``).
     For each input whose value is a :class:`~string.templatelib.Template`, this lowers it
     exactly as the former positional ``task`` was lowered by :func:`normalize_task`: literal
     chunks are kept verbatim, each interpolation becomes a `` `name` `` reference, and the
@@ -278,8 +278,8 @@ def normalize_inputs(inputs: dict[str, object]) -> dict[str, object]:
     The t-string input itself then binds to the lowered *text*. A plain (non-Template) value
     passes through untouched, so the common case (all plain kwargs) is a cheap identity walk.
 
-    Semantics deliberately match the old positional behavior: interpolations *mint* sibling
-    inputs, and a template-derived name that collides with another explicit input raises (via
+    Interpolations *mint* sibling inputs, and a template-derived name that collides with
+    another explicit input raises (via
     :func:`normalize_task`). So the ergonomic form is to let the t-string supply its own
     interpolated inputs — ``invoke(task=t"Summarize {data}")`` binds ``data`` from the
     interpolation — rather than also passing ``data=`` separately. Referencing a *separately*
@@ -306,8 +306,8 @@ def normalize_inputs(inputs: dict[str, object]) -> dict[str, object]:
     downstream exactly like a top-level input — ``normalize_inputs`` never resolves
     ``__jaz_get__`` itself.
 
-    Two known v1 limitations at that boundary (tracked in #857), both from ``__jaz_get__``
-    resolution being single-level:
+    Two known v1 limitations at that boundary, both from ``__jaz_get__`` resolution being
+    single-level:
 
     - **Override + a ``__jaz_get__`` value drops the payload.** ``t"{lib!r}"`` (where ``lib``
       carries ``__jaz_get__``, e.g. a :class:`~jaz.library.Library`) minus the override binds the
@@ -320,6 +320,9 @@ def normalize_inputs(inputs: dict[str, object]) -> dict[str, object]:
       binds a raw, un-lowered ``Template``. (A ``Template`` subclass that *directly* defines
       ``__jaz_get__`` is impossible — the C type is not subclassable.)
     """
+    # Exists because #538 demoted ``task`` to an ordinary input: a t-string stopped being a
+    # positional prompt and became an input value, so the lowering the positional ``task`` used to
+    # get had to apply to any input. The two limitations above are tracked in #857.
     result: dict[str, object] = {}
     for name, value in inputs.items():
         if isinstance(value, Template):

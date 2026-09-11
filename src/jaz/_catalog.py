@@ -173,8 +173,9 @@ def render_catalog(
     ``Display``, ``default_description``) call this with no flag, so a large library
     passed as an input always renders full — compact is not reachable there today
     (those APIs don't thread ``full_docstrings``, and the entry cap bounds object
-    count, not per-docstring size). A reachable escape hatch is tracked in #726.
+    count, not per-docstring size). There is no reachable escape hatch.
     """
+    # TODO(#726): a reachable escape hatch for the per-catalog cap.
     root = bound_name or getattr(value, "__name__", None) or "value"
     seen: set[int] = set()
     remaining = [_MAX_PROMPT_OBJECT_ENTRIES]

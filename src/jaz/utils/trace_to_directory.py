@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Convert an ATIF JSON trace into a browsable directory.
 
-Reads an ATIF trace as written by ``ATIFTrace`` (schema v1.7) and expands it into
+Reads an ATIF trace as written by ``TrajectoryRecorder`` (schema v1.7) and expands it into
 a directory tree. Each invoke trajectory becomes a directory with:
 
     overview.md          — metadata, prompt, iteration index
@@ -19,6 +19,12 @@ Usage::
 
     python -m jaz.utils.trace_to_directory trace.atif.json output_dir/
     python -m jaz.utils.trace_to_directory trace.atif.json output_dir/ --all
+
+For the same tree written *during* the run instead of after it, see
+:class:`~jaz.hooks.TrajectoryDirectoryRecorder`. It shares this directory layout for the
+single-root case (so both are navigable the same way), names multi-root siblings differently
+because it must place the first root before knowing a second is coming, and renders each message
+as a fenced block under a provenance header rather than as the ``## Role`` sections below.
 """
 
 from __future__ import annotations
@@ -160,7 +166,7 @@ def _task_name(node: dict[str, Any]) -> str:
     inputs = (node.get("extra") or {}).get("inputs") or {}
     task = inputs.get("task")
     if isinstance(task, dict):
-        # ATIFTrace serializes inputs as {"type": ..., "repr_prefix_10000": ...}
+        # TrajectoryRecorder serializes inputs as {"type": ..., "repr_prefix_10000": ...}
         rep = task.get("repr_prefix_10000")
         if isinstance(rep, str) and rep:
             return rep[:70].replace("\n", " ").strip()
@@ -257,7 +263,7 @@ def trace_to_directory(
     """Convert an ATIF trace JSON file to a browsable directory.
 
     Args:
-        trace_path: Path to the ATIF JSON file (as written by ``ATIFTrace``).
+        trace_path: Path to the ATIF JSON file (as written by ``TrajectoryRecorder``).
         output_dir: Directory to write the output to.
         all_nodes: If True, write all top-level invoke trajectories.
                    If False (default), write only the first one.
@@ -270,7 +276,7 @@ def trace_to_directory(
 
     data = json.loads(trace_path.read_text())
 
-    # ATIFTrace writes a single root trajectory as an object, or an array when the traced
+    # TrajectoryRecorder writes a single root trajectory as an object, or an array when the traced
     # scope had multiple top-level invokes. Normalize both to a list of trajectory dicts.
     if isinstance(data, dict):
         nodes: list[dict[str, Any]] = [data]

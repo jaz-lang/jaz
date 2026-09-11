@@ -31,18 +31,18 @@ def _new_message_lines(
     """The wire messages to emit as `[Agent] message:` lines for this query's buffer —
     each buffer message exactly once.
 
-    Messages are identified by their stable provenance id (#599), mirroring ATIFTrace's
+    Messages are identified by their stable provenance id, mirroring TrajectoryRecorder's
     emission rule: a stamped message is logged the first time it appears in the buffer
     (whatever its position), and ASSISTANT messages are skipped here because the reply is
     logged at LLMQueryExit. This replaced a positional ``messages[-1]``-only increment,
-    which silently dropped all but the last message appended between two queries (e.g.
-    the truncation-advice observation CodeOnlyProtocol emits alongside a truncated
-    output) and never logged a persistent hook add (a compaction summary) at all.
+    which silently dropped all but the last message appended between two queries (a
+    protocol whose ``render_observation`` returns several, or any hook that appends)
+    and never logged a persistent hook add (a compaction summary) at all.
 
     This stream is the carried *buffer* content as of LLMQueryEnter; per-query edits are
     logged separately as ``[Agent] message added/dropped:`` lines from LLMQuerySend's
     pre-resolved records (see :func:`_edit_lines`) — together the two streams record
-    everything the model was shown, mirroring ATIFTrace's step-stream/``extra.edits``
+    everything the model was shown, mirroring TrajectoryRecorder's step-stream/``extra.edits``
     split. ADDED-kind messages (persistent hook adds already in the buffer, e.g. a
     compaction summary) are skipped here for the same reason ATIF skips them: their
     content was logged by the add line on the turn they were sent, so re-logging them on
@@ -58,6 +58,7 @@ def _new_message_lines(
     positional fallback: dump the whole buffer on the invoke's first query, then only
     ``messages[-1]`` on later ones.
     """
+    # Provenance ids (#599) rather than positions: an edit renumbers positions, ids survive it.
     first_query = invoke_id not in logged_prompt_invokes
     logged_prompt_invokes.add(invoke_id)
     to_log = []
@@ -82,7 +83,7 @@ def _outcome_failure(outcome: Aborted | Failed) -> tuple[str, str]:
     failure log line.
 
     The variant IS the status (no parallel enum), so its lowercased class name is the
-    serialized form — the same spelling ATIFTrace and OTelTracing write, so "how did this
+    serialized form — the same spelling TrajectoryRecorder and OTelTracing write, so "how did this
     span end" greps identically across all three records. ``summarize_exception`` rather
     than ``str``: multiple aborts at one boundary group into an ``ExceptionGroup`` by law,
     and ``str()`` on a group renders only a sub-exception count, dropping every child's

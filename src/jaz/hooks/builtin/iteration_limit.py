@@ -14,6 +14,11 @@ an invoke and its nested invokes. It carries the limit *values* as constructor p
   is an ABSOLUTE turn count, not a fraction of the cap. There is no buffer / overshoot region, no
   result-overriding ``ModifyExecResult``, and no separate last-turn notice; with no
   ``warn_remaining`` (⟺ no ``warning_text``, by the coupling) the hard stop is the only behaviour.
+- ``min_depth`` / ``max_depth`` — optional, both ``None`` by default. They restrict WHICH invokes
+  in the propagating scope the cap applies to, by absolute recursion depth (1-based: the top-level
+  invoke is depth 1). ``IterationLimit(50, min_depth=2)`` caps every delegated invoke at 50 turns
+  and leaves the driver uncapped. They select invokes; they do not change what the cap means for a
+  selected one, which still counts its own iterations against ``max_iterations``.
 
 Surfaced through the effect system: an ``Abort`` at ``LLMQueryEnter`` (the hard stop —
 ``span_llm_query`` raises its carried exception *before* the turn's LLM query, closing the
@@ -30,6 +35,8 @@ per turn — it is the always-present per-turn boundary that ``Abort`` targets.
 Because the hard stop is hook-emitted (not a loop bound), a stricter
 ``IterationLimit`` stacked in the contextvar user tier tightens *both* the warning
 and the hard cap (aborts union — the stricter fires earlier, can't be loosened).
+A depth window narrows *which invokes* a stacked hook governs, never how strictly: outside its
+window a hook contributes nothing, so stacking can only add aborts and the union above still holds.
 Termination depends on this hook running, so the dispatcher fails *loud* on a hook
 exception (no silent swallow). There is deliberately no way to disable an active hook —
 there is no generic ``disable_hook`` or ``clear_all_hooks`` escape hatch — so a hook that
@@ -41,9 +48,9 @@ concern now lives in :class:`~ContextWindowWarning`.
 
 from __future__ import annotations
 
-from dataclasses import KW_ONLY, dataclass
+from dataclasses import KW_ONLY, dataclass, field
 
-from jaz.exceptions import IterationLimitExhaustedError
+from jaz.exceptions import HookActivationError, IterationLimitExhaustedError
 from jaz.hooks.dispatcher import Hook
 from jaz.hooks.effects import Abort, AddMessages, Effect
 from jaz.hooks.events import LLMQueryEnter
@@ -62,9 +69,10 @@ class IterationLimit(Hook):
     last-turn notice: with ``warn_remaining`` unset (⟺ ``warning_text`` unset), the hard stop is
     the only behaviour.
 
-    Under ``with`` the cap applies to every invoke in scope, nested ones included, each
-    counting its own iterations against ``max_iterations``. Passed positionally to one
-    ``jaz.invoke``, it caps only that invoke and not the invokes it nests.
+    Under ``with`` the cap applies to every invoke in scope, nested ones included (or to those
+    inside ``min_depth``/``max_depth``, when set), each counting its own iterations against
+    ``max_iterations``. Passed positionally to one ``jaz.invoke``, it caps only that invoke and not
+    the invokes it nests.
 
     Args:
         max_iterations: Max number of iterations. Must be positive (>= 1).
@@ -75,10 +83,20 @@ class IterationLimit(Hook):
             remain (counting the current one). An absolute turn count, not a fraction of the cap.
             ``None`` (default) emits no warning at all. Must be paired with ``warning_text``
             (both set, or both ``None``).
+        min_depth: If set, apply nothing — neither the cap nor the warning — to invokes
+            shallower than this. Absolute recursion depth, 1-based (a top-level invoke is depth 1),
+            so ``min_depth=2`` means "delegated invokes only". ``None`` (default) sets no
+            floor. Subject to the depth attribution gap :class:`~RecursionLimit` documents — see
+            the note below the field definitions.
+        max_depth: If set, apply nothing to invokes DEEPER than this, so ``max_depth=1`` means
+            "the top-level invoke only". ``None`` (default) sets no ceiling.
 
     Raises:
         ValueError: If ``max_iterations`` is not positive; if exactly one of ``warning_text`` /
-            ``warn_remaining`` is set (they are coupled); or if ``warn_remaining`` is not positive.
+            ``warn_remaining`` is set (they are coupled); if ``warn_remaining`` is not positive; if
+            ``min_depth`` or ``max_depth`` is less than 1; or if ``min_depth > max_depth``.
+        HookActivationError: On ``setup()``, if a depth window is set and the hook is installed
+            through ``local_hooks`` rather than ``with``.
     """
 
     # Mechanics: handles ``LLMQueryEnter``; emits ``Abort`` once ``iteration >=
@@ -123,6 +141,30 @@ class IterationLimit(Hook):
     _: KW_ONLY
     warning_text: str | None = None
     warn_remaining: int | None = None
+    # A depth WINDOW rather than a single ``depth`` value, and ``None`` on each side rather than a
+    # dedicated sentinel object: ``None`` is already this hook's spelling for "not configured"
+    # (``warning_text``/``warn_remaining`` use it), and a half-open window is what the real cases
+    # want — "subagents only" is ``min_depth=2`` with no ceiling, and "the driver only" is
+    # ``max_depth=1`` with no floor. A single ``depth=`` would express neither.
+    #
+    # ``min_depth``/``max_depth`` and not the longer ``applies_from_depth``/``applies_to_depth``,
+    # which these briefly were (executive call, reversing that rename). The objection to the short
+    # names is real and was tried: a ``RecursionLimit`` sits immediately above this hook in the
+    # configs the feature exists for, so two ``max_depth: 2`` with different meanings end up adjacent
+    # in one hook list, and side by side in a trace's ``hooks`` field now that the window is in the
+    # ``__repr__``. It was rejected anyway, because the collision is resolved by context — a reader
+    # meeting ``max_depth`` ON AN ITERATION LIMIT reads it against that hook, and nobody guesses what
+    # ``applies_to_depth`` means without being told. Clarity at the point of use beat global
+    # uniqueness of the identifier.
+    min_depth: int | None = None
+    max_depth: int | None = None
+
+    # True only for the dynamic extent of ``__enter__``, so the ``setup()`` it triggers can tell a
+    # propagating install from a ``local_hooks`` one. Same mechanism, and the same TODO(#808), as
+    # ``RecursionLimit``. ``init=False`` so it is lifecycle bookkeeping rather than a construction
+    # param, and ``repr=False`` so it stays out of the recorded string — ``init=False`` alone would
+    # not have, since the generated ``__repr__`` includes non-init fields.
+    _entering_via_context: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
         # max_iterations is a COUNT of allowed turns (indices 0 .. max_iterations - 1), so it must
@@ -150,8 +192,87 @@ class IterationLimit(Hook):
         # max_iterations simply warns from iteration 0.
         if self.warn_remaining is not None and self.warn_remaining <= 0:
             raise ValueError(f"warn_remaining must be > 0, got {self.warn_remaining!r}")
+        # Depth is 1-based and there is always a root, so a bound below 1 is incoherent in the same
+        # way ``RecursionLimit(max_depth=0)`` is. Unlike ``warning_text``/``warn_remaining`` the two
+        # are NOT coupled — each side is independently optional, which is the point of a window.
+        for name, value in (
+            ("min_depth", self.min_depth),
+            ("max_depth", self.max_depth),
+        ):
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be >= 1, got {value!r}")
+        # An inverted window selects nothing, so the hook would silently do nothing at all — the
+        # worst outcome for a hook that owns termination. Reject it at construction.
+        if (
+            self.min_depth is not None
+            and self.max_depth is not None
+            and self.min_depth > self.max_depth
+        ):
+            raise ValueError(
+                f"min_depth must be <= max_depth, got min_depth={self.min_depth!r} "
+                f"max_depth={self.max_depth!r} (an empty window would cap nothing)"
+            )
+        # NOT checked, and cannot be: a window the tree never reaches -- `min_depth=5` under a
+        # `RecursionLimit(max_depth=2)`, or under an agent that simply never delegates -- has the same
+        # silent no-op outcome as the inverted window above, and is refused only in the case this
+        # object can see by itself. The reachable depth is a property of the whole hook stack and of
+        # the agent's behaviour, neither of which is available at construction, and inferring it at
+        # the first event would move the failure from "the config is wrong" to "the run is over".
+
+    def __enter__(self):
+        # Mark the `with` path so the setup() the base __enter__ calls next is recognized as a
+        # propagating install. Cleared in `finally` so a failed __enter__ (the base's
+        # double-activation guard raising before setup()) never leaves the flag set, which would let
+        # a later local_hooks activation slip through unrejected.
+        self._entering_via_context = True
+        try:
+            return super().__enter__()
+        finally:
+            self._entering_via_context = False
+
+    def setup(self) -> None:
+        # Reject a depth window on the local_hooks channel. setup() runs on exactly two paths --
+        # `with` (via __enter__, which set the flag above) and local_hooks (called directly, flag
+        # unset). A local hook is dispatched to exactly ONE invoke and does not propagate, so a
+        # depth window there is either a no-op (the invoke is inside it) or silently disables the
+        # hook entirely (it is not) -- and the caller already knows that invoke's depth, so the
+        # window can express nothing they could not express by not installing the hook. Fail loud
+        # rather than let a cap quietly not apply. The plain form stays legal on both channels:
+        # `jaz.invoke(IterationLimit(50), ...)` is how a caller caps one invoke, and nothing here
+        # changes that. TODO(#808): this infers the install channel from the __enter__/setup
+        # routing; an explicit signal to setup() would be better than two hooks inferring it.
+        if not self._entering_via_context and (
+            self.min_depth is not None or self.max_depth is not None
+        ):
+            raise HookActivationError(
+                "IterationLimit with min_depth/max_depth cannot be installed via local_hooks: "
+                "local hooks reach exactly one invoke and do not propagate, so a depth window "
+                "there cannot select anything the caller did not already choose. Install it with "
+                "`with IterationLimit(...):`, or drop the depth window."
+            )
+        super().setup()
+
+    def _applies_at(self, depth: int) -> bool:
+        """Whether this hook governs an invoke at `depth` (1-based)."""
+        # Inherits RecursionLimit's "Known gap" (#1033): an invoke reached through a passed-down
+        # wrapper whose `jaz.invoke` runs on a thread that did not inherit the caller's context is
+        # counted at the BINDING invoke's depth, not the caller's. There it lets a tree go one level
+        # too deep; here it can present a delegated invoke as depth 1, so an `min_depth=2`
+        # cap silently does not apply to it — the termination backstop quietly absent, which is the
+        # outcome `__post_init__` and `setup()` both refuse configurations to avoid. Narrow (it needs
+        # `allowed_imports` to permit threads), but "absolute recursion depth" reads as exact above
+        # and is not, so do not build a safety argument on this window alone.
+        if self.min_depth is not None and depth < self.min_depth:
+            return False
+        return not (self.max_depth is not None and depth > self.max_depth)
 
     def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        # Depth window first, so an out-of-band invoke gets NEITHER the hard stop nor the warning.
+        # Gating only the abort would leave the driver being told to wrap up against a cap that
+        # will never fire on it -- agent-facing text about a limit that does not apply.
+        if not self._applies_at(event.depth):
+            return []
+
         # Hard stop: once iterations exceed max_iterations, abort the invoke at the top of
         # the turn — before the LLM query, so no query is wasted on a turn that would be
         # discarded. LLMQueryEnter is the always-present per-turn boundary, so the hard stop
@@ -170,10 +291,17 @@ class IterationLimit(Hook):
         # ``max_iterations`` is the first refused one. Exactly ``max_iterations`` turns run,
         # unchanged from when this read ``> max_iterations`` against a 1-based counter.
         if event.iteration >= self.max_iterations:
+            # The depth is in the message because it is the only place a consumer can read it. Both a
+            # tree-wide cap and a windowed one raise the same exception type, and a *capped subagent*
+            # and a *capped driver* mean opposite things to anyone reading a run: the first is a
+            # routine per-task outcome, the second ends the run with every unreached task unearned.
+            # Without the depth those are one bucket, and a downstream analysis splitting them has to
+            # split on hook identity, which stops existing the moment one hook does both jobs.
             return [
                 Abort(
                     error=IterationLimitExhaustedError(
-                        f"No return value after {self.max_iterations} REPL iterations"
+                        f"No return value after {self.max_iterations} REPL iterations "
+                        f"(depth {event.depth})"
                     )
                 )
             ]
@@ -199,10 +327,3 @@ class IterationLimit(Hook):
         ):
             return [AddMessages([{"role": "user", "content": self.warning_text}])]
         return []
-
-
-#: Deprecated alias for the pre-rename spelling — see the rationale block in
-#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
-#: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_legacy_hook_names_still_importable``).
-IterationLimitHook = IterationLimit

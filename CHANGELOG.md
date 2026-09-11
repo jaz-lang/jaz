@@ -3,6 +3,62 @@
 All notable user-facing changes to JAZ. Versions follow the distribution on PyPI
 (`jaz-lang`); the import name is `jaz`.
 
+## 0.2.0a4 — 2026-09-11
+
+### Breaking changes
+
+- **Component registries are removed.** Pass constructed LLM, REPL, and protocol
+  objects to configuration instead of registered names. Custom backends no longer
+  implement `validate_model`; model IDs are passed through to the backend.
+- **`ATIFTrace` / `ATIFReplay` are now `TrajectoryRecorder` / `TrajectoryReplay`.**
+  Deprecated hook-name aliases are removed; import hooks by their current names.
+- **`__inputs__` is removed.** Inputs are available directly under their names in
+  the agent's REPL.
+- **Prompt customization uses Jinja loaders.** Replace `register_template_dir` and
+  `register_template_string` with `jaz.add_template_loader`. Core inheritance
+  parents use the reserved `jaz/` prefix; inheritance cycles raise Jinja's
+  `TemplateAssertionError`.
+- **Custom REPLs must implement `repl_history`.** The `maintains_repl_history`,
+  `describe_repl_history`, and REPL language-identity surfaces are removed.
+  Protocol parsing no longer takes a language, and `CodeOnlyProtocol` no longer
+  rescues Markdown-fenced responses.
+- **Compaction and SlidingWindow are removed from core.** Compaction is maintained
+  with the evaluation tooling instead.
+- The input/output truncation-advice surfaces are removed.
+
+### Added
+
+- **GitHub Copilot backend** through `jaz-lang[copilot]`, billed to GitHub AI
+  credits, with optional session reuse. `CopilotLLM` is experimental.
+- **Console setup and conversation memory.** First-run provider/model setup,
+  persistent settings, validated model switching, Copilot authentication, and
+  conversation history for prompt turns and the `%` helper. The console requires
+  Python 3.14+; the framework continues to support Python 3.12+.
+- **`TrajectoryDirectoryRecorder`** writes a trajectory directory live.
+- **`OTelTracing`** is now a public hook.
+- **`jaz.add_template_loader`** supports custom prompt templates, named template
+  blocks, and template-controlled input placement.
+- **`jaz.get_default_description`** exposes the default input rendering.
+- **`IterationLimit(min_depth=..., max_depth=...)`** can target selected recursion
+  depths.
+
+### Fixed
+
+- Hook reactivation policies and lifecycle cleanup, including recorder run-state
+  resets and budget activation.
+- Per-depth configuration containers are isolated from mutation.
+- Replay detects divergence in message edits and committed assistant turns;
+  workflow replay no longer generates broken packages or deleted sentinels.
+- Importing `jaz` no longer configures logging or creates a log file.
+- Non-hook positional arguments to `invoke()` raise a clear `TypeError`.
+- Copilot responses trim hallucinated transcript continuations.
+- Async Anthropic requests preserve `max_tokens`.
+- `__history__[i].repl_output` is always a string, including on terminal turns.
+
+### Documentation
+
+- Expanded console, Copilot authentication, and prompt-template authoring guidance.
+
 ## 0.2.0a3 — 2026-08-22
 
 ### Breaking changes

@@ -18,7 +18,7 @@ counted nor enforced. Measured on the same root+child workload: 3 calls / $0.04 
 The hook owns the one budget and a **running scalar aggregate** — a total cost and a total
 call count over every LLM call in scope. It is a *pure enforcer*: it keeps no per-invoke
 records and writes no report. Per-invoke / per-tree cost accounting (with the full nesting
-tree) lives in the ATIF trace (``ATIFTrace``), which records the same cost off the same
+tree) lives in the ATIF trace (``TrajectoryRecorder``), which records the same cost off the same
 ``LLMQueryExit`` event; anything that needs a cost breakdown reads that trace rather than this
 hook. All invokes in scope draw down the ONE shared aggregate.
 
@@ -47,8 +47,6 @@ from jaz.exceptions import BudgetPoolExhaustedError, ModelPricingUnavailableErro
 from jaz.hooks.dispatcher import Hook
 from jaz.hooks.effects import Abort, AddMessages, Effect
 from jaz.hooks.events import (
-    InvokeEnter,
-    InvokeExit,
     LLMQueryEnter,
     LLMQueryExit,
 )
@@ -69,11 +67,21 @@ class BudgetPool(Hook):
       nested inside those* shares the one budget. Use this to cap a whole workflow.
     * ``jaz.invoke(BudgetPool(...), ...)`` — the pool covers **only that invoke's own LLM
       calls, excluding its sub-invokes.**
+    * ``with BudgetPool(...):`` opened **mid-REPL** — written in the agent's own turn of code,
+      or by anything that turn calls — behaves exactly like the first shape. It covers the
+      ``with`` statement's body: every invoke started while that body runs, and everything
+      nested inside those. It covers nothing before or after the body, including the rest of
+      the same turn's code.
+
+      The enclosing invoke is never covered, whatever the body contains. A hook applies to
+      whole invokes, and that invoke was already running when the body was entered; it also
+      outlives the body, which cannot span turns because the turn's code has to unwind it
+      before returning.
 
     The budget starts empty when the scope opens.
 
     This hook enforces only; it produces no cost report. For a per-invoke cost/token breakdown
-    (including the full sub-invoke tree), read the ATIF trace written by ``ATIFTrace`` — it
+    (including the full sub-invoke tree), read the ATIF trace written by ``TrajectoryRecorder`` — it
     records the same cost off the same event.
 
     Note that if a single turn jumps from above the warning headroom straight past the budget,
@@ -119,7 +127,7 @@ class BudgetPool(Hook):
     # kept a *forest* of per-invoke `CostTracker` nodes (one tree per top-level invoke, nested
     # invokes chained onto their parent) and flushed a JSON cost envelope at teardown via a
     # `json_path` param. That forest was removed (executive call): it duplicated the tree the
-    # ATIF trace (`ATIFTrace`) already builds off the same `LLMQueryExit` event — same cost,
+    # ATIF trace (`TrajectoryRecorder`) already builds off the same `LLMQueryExit` event — same cost,
     # same nesting — so two structures tracked one fact. Enforcement only ever reads the
     # *aggregate* (one budget vs the sum), which a scalar carries exactly; the per-invoke
     # breakdown a report needs now has one home, the ATIF trace. Eval tooling that used to read
@@ -134,19 +142,31 @@ class BudgetPool(Hook):
     # sub-invoke's cost is never counted, so the aggregate under-reports rather than erroring —
     # a delegating task can run up cost the pool never sees.
     #
-    # `on_invoke_enter` records the invoke_id in `_entered` (the set of in-scope invokes) and
-    # raises `RuntimeError` if an invoke reaches the hook without `setup()` having run. Not in
-    # the docstring: `with` and the positional argument are the only supported activations and
-    # both run `setup()`, so the raise is unreachable from documented usage — it exists to catch
-    # a hook wired up through some other path. `_entered` is what distinguishes an in-scope
-    # invoke from the non-loop `query()` path (which emits `LLMQueryEnter` with no preceding
-    # `InvokeEnter`): accounting and enforcement skip an invoke_id that never entered.
+    # The hook holds NO per-invoke state and reads no `invoke_id`: every `LLMQueryEnter` /
+    # `LLMQueryExit` it can see comes from inside an invoke, because both `span_llm_query` call
+    # sites are in `_agent.py`'s `do_one_repl_iteration` / `ado_one_repl_iteration`, inside
+    # `span_invoke`. So there is nothing to gate on — booking and enforcing on every query the
+    # dispatcher hands it is exactly right. What decides which invokes are in scope is the
+    # dispatcher reading the contextvar, not this hook inspecting an id.
     #
-    # Mechanics kept out of the docstring: the hook handles `InvokeEnter`/`InvokeExit` (scope
-    # membership), `LLMQueryEnter` (enforcement + warning), and `LLMQueryExit` (accounting:
-    # += cost, += 1 call — AND the uncosted-model backstop, an `Abort` on the Completed arm that
-    # reads the final post-transform cost). The hard
-    # stop is an `Abort` at `LLMQueryEnter` — the top of the turn, before the query — chosen
+    # The removed `_entered` filter (populated at `InvokeEnter`, checked on both query arms)
+    # gated exactly that, and its stated reason — excluding the non-loop `Agent.query()` path,
+    # which emitted `LLMQueryEnter` with no preceding `InvokeEnter` — died with that path in
+    # #716/#767. For every supported activation shape it was already a no-op: an invoke covered
+    # by the pool necessarily fires `InvokeEnter` under it, so it was always in the set.
+    # Measured on the mid-REPL case, with the filter restored at source level: identical
+    # aggregate either way.
+    #
+    # It was NOT a no-op for one unsupported shape — a bare `pool.__enter__()` with no matching
+    # `__exit__`, which leaves the pool open across the enclosing invoke's later turns. The
+    # filter made that book nothing; without it, that invoke is covered from the activation
+    # onward. Neither is a behaviour to rely on: a hook covers whole invokes, so an invoke
+    # partly inside a pool is a malformed activation, not a supported third shape.
+    #
+    # Mechanics kept out of the docstring: the hook handles `LLMQueryEnter` (enforcement +
+    # warning) and `LLMQueryExit` (accounting: += cost, += 1 call — AND the uncosted-model
+    # backstop, an `Abort` on the Completed arm that reads the final post-transform cost). The
+    # hard stop is an `Abort` at `LLMQueryEnter` — the top of the turn, before the query — chosen
     # because that event is the always-present per-turn boundary; REPL *execution* is skipped
     # for unparseable output, so enforcing there would let a turn slip past the budget. The
     # warning is an `AddMessages`. There is deliberately no buffer and no `ModifyExecResult`
@@ -246,11 +266,7 @@ class BudgetPool(Hook):
         # budget is one shared allowance, so a scalar sum is exactly the enforced quantity.
         self._total_cost = 0.0
         self._total_calls = 0
-        # In-scope invoke_ids (populated at InvokeEnter). Distinguishes a real in-scope invoke
-        # from the non-loop query() path so accounting/enforcement skip the latter.
-        self._entered: set[str] = set()
-        self._setup_done = False
-        # Guards the aggregate and the _entered set against concurrent sub-agent turns.
+        # Guards the aggregate against concurrent sub-agent turns.
         self._lock = threading.RLock()
 
     # --- lifecycle ---
@@ -260,8 +276,6 @@ class BudgetPool(Hook):
         with self._lock:
             self._total_cost = 0.0
             self._total_calls = 0
-            self._entered = set()
-        self._setup_done = True
 
     def teardown(self, exc: BaseException | None = None) -> None:
         """No-op: this hook writes no report. Present so the scope-close contract is explicit."""
@@ -284,30 +298,9 @@ class BudgetPool(Hook):
 
     # --- events ---
 
-    def on_invoke_enter(self, event: InvokeEnter) -> list[Effect]:
-        with self._lock:
-            if not self._setup_done:
-                # Real raise (assert is stripped under `python -O`). Triggered if an invoke
-                # reaches this hook without setup() having run.
-                raise RuntimeError(
-                    "BudgetPool received an invoke before setup() ran. "
-                    "It is a scoped hook: activate it via "
-                    "`with BudgetPool(...)` or "
-                    "`jaz.invoke(BudgetPool(...), ...)`."
-                )
-            self._entered.add(event.invoke_id)
-        # No entry hard-stop: an invoke born into an already-exhausted pool is caught
-        # by the first on_llm_query_enter, which also fires before the first LLM
-        # query (verified by the budget tests).
-        return []
-
     def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
-        # An unregistered invoke ⇒ the non-loop query() path (no InvokeEnter) — book nothing.
-        if event.invoke_id not in self._entered:
-            return []
         # Non-completed arms (#892 outcome union) record no call: the query failed before
-        # a response — there is no cost or call to book. (on_invoke_exit deliberately has NO
-        # such guard: its _entered cleanup must run on every outcome.)
+        # a response — there is no cost or call to book.
         if not isinstance(event.outcome, Completed):
             return []
         response = event.outcome.result
@@ -334,11 +327,6 @@ class BudgetPool(Hook):
         return []
 
     def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
-        # An unregistered invoke ⇒ the non-loop query() path (which emits no InvokeEnter, so is
-        # never in _entered) — skip both the hard stop and the warning.
-        if event.invoke_id not in self._entered:
-            return []
-
         # Unenforceable-budget PRE-FLIGHT: the client says up front it cannot report a cost
         # for the model this query is about to use, so the budget is unenforceable before a
         # token is spent on it. This asks the BACKEND (`LLM.can_report_cost`) rather than
@@ -389,13 +377,6 @@ class BudgetPool(Hook):
     # ``ModifyLLMResponse(cost_usd=…)`` re-price can rescue an otherwise-uncostable turn. It stays a
     # pre-*execution* abort: the Completed ``LLMQueryExit`` still fires before the agent acts on the
     # response (see ``on_llm_query_exit`` and ``HookDispatcher._resolve_completed_exit_effects``).
-
-    def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:
-        # Drop this invoke from the in-scope set. The aggregate is deliberately NOT decremented:
-        # a finished invoke's cost still counts against the shared budget for the scope's life.
-        with self._lock:
-            self._entered.discard(event.invoke_id)
-        return []
 
     # --- aggregate + enforcement (the hook is the pool) ---
 

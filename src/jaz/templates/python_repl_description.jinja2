@@ -1,3 +1,4 @@
+{% block repl_mechanics %}
 ## Python REPL specification
 
 {# Deduped against system_prompt.jinja2, which owns the output-format rules (code only, executed
@@ -7,6 +8,8 @@
   to you in the next iteration. It is NOT shown to the caller.
 - Printed output will be truncated if it is too large.
 - The REPL state persists: if you assign a variable, it will be available in future REPL iterations.
+{% endblock %}
+{% block timeout_rule %}
 {# `exec_timeout` and `allow_timeout_pragma` are injected at render time (like `allow_raise`),
    never baked: the REPL enforces both, so a stale value would promise the agent time it does not
    get — or an override the REPL ignores. With the pragma off and no bound there is nothing to
@@ -20,6 +23,8 @@
 {% elif exec_timeout is not none %}
 - Your code is executed under a timeout of {{ exec_timeout }} seconds.
 {% endif %}
+{% endblock %}
+{% block return_rule %}
 {# Frame `return` around what it delivers AND scope it to "no next step remains" — not around when it
    is forbidden. Two findings drive this wording:
    - Prohibition-only phrasing ("do NOT return unless ...") cost ~2 turns/run on a one-turn task
@@ -39,11 +44,15 @@
 - `return` the final result only once no next step remains and there is nothing left for you to do; this delivers the result to your caller and ends the REPL session.
   Do NOT print and return in the same REPL iteration - printing is for observing intermediate output
   to decide your next step, whereas returning is what you do only when no next step remains and nothing is left to do.
+{% endblock %}
+{% block raise_rule %}
 {% if allow_raise %}
 - If what you were asked is impossible, use a `raise` statement to raise an exception explaining why:
   `raise Exception("<reason why it is impossible>")`.
   Executing `raise` immediately ends the REPL session.
 {% endif %}
+{% endblock %}
+{% block import_policy %}
 {% if allows_everything(allowed_imports) %}
 - You may import any Python module.
 {% elif allowed_imports %}
@@ -52,6 +61,13 @@
 {% else %}
 - You are NOT allowed to import any Python modules.
 {% endif %}
+{% endblock %}
+{% block file_policy %}
+{# Defined INSIDE the block: the macro body IS this section's prose, so a child overriding
+   `file_policy` is by definition rewording what the macro emits rather than calling it. Keeping it
+   here means the block contains everything it renders — an override replaces the rules and their
+   helper together, and no template-level name is left over describing a section the child rewrote.
+   The cost is that the override cannot call `file_rule`; that is the point, not a limitation. #}
 {% macro file_rule(verb, patterns) %}
 {%- if patterns -%}
 - You may only {{ verb }} files whose path matches: `{{ patterns | join("`, `") }}`
@@ -61,7 +77,9 @@
 {% endmacro %}
 {{ file_rule("read", allowed_read_paths) }}
 {{ file_rule("write", allowed_write_paths) }}
+{% endblock %}
 
+{% block workflow_guidance %}
 ## Determine the workflow type
 
 The very first user message contains the prompt from your caller. Before writing the code for
@@ -81,16 +99,20 @@ your first REPL iteration, determine the most appropriate workflow for respondin
   you can inspect intermediate output in between iterations.
 
   - Take *small, incremental* steps.
-  - Write the code for only the immediate next step, then print the intermediate result and STOP -
-    defer later steps to future iterations.
+  - Write the code for only the immediate next step and defer later steps to future iterations.
+  - Do NOT wrap your code in `try`/`except` to suppress errors. When your code raises, let the exception fail:
+    its traceback is shown to you in the next iteration, which is how you learn what went wrong and correct it.
+  - In particular, do NOT wrap tool calls in `try`/`except`. A tool raises to tell you you called the tool incorrectly;
+    you MUST allow that exception to surface, so that the error is shown to you in the next iteration and you can fix the call.
   - Do NOT return while any next step remains — instead print intermediate output to inform future steps:
 
-    # <plan for immediate next step only>
-    <code for the *immediate next step* (non-final)>
-    print(<intermediate output>)  # print, NOT return, because there is remaining work to do
+    <code for the *immediate next step* (non-final)>  # do NOT wrap in `try`/`except`
+    print(<intermediate output>)
+    # STOP HERE: do NOT return — there is remaining work to do
 
-  Return only when the step you just completed was the last step of your entire workflow and nothing further is left to do:
+  Return only when the step you just completed was the very last step for completing everything requested by the first user message,
+  and *nothing further is left to do*:
 
-    # <plan for last step>
-    <code for the *last step* of the workflow>
-    return <final result>  # return only when there is nothing left to do: this ends the REPL session
+    <code for the *last step* of the workflow>  # do NOT wrap in `try`/`except`
+    return <final result>  # return only when there is *nothing left to do*: this ends the REPL session
+{% endblock %}

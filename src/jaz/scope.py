@@ -37,9 +37,16 @@ Concurrency / mutation semantics:
   ``list``/``CostTracker`` is a data race the caller must guard — bind immutable
   values, or rebind a fresh instance inside each worker via a nested
   ``jaz.scope(...)`` block (which is properly isolated per Task/context).
-- Process boundaries are forbidden for now; ``invoke._invoke`` raises if it runs
-  outside the main process (the bound ``jaz`` and most scoped values don't
-  survive pickling).
+- **A scope does not propagate across a process boundary, and what a child sees
+  depends on the start method.** Under ``spawn`` the child is a fresh
+  interpreter, so an invoke there runs with no scope at all; bind one inside the
+  worker, which works and is the supported way to give a worker ambient values.
+  Under ``fork`` the child inherits the binding as copied memory and invokes
+  there do run under it — but that is not a guarantee to rely on, because an
+  object inherited across a fork may be unusable in the child: a lock held at
+  fork time can never be acquired there, and a buffered file handle replays the
+  parent's unflushed bytes. Nothing serializes a scope and nothing checks for
+  this, so rebind inside the worker rather than inheriting.
 
 Composition with descriptions: a scoped value carrying a ``jaz.describe``
 description renders using that description in every invoke's prompt header, with
@@ -51,6 +58,29 @@ from __future__ import annotations
 import contextvars
 from collections.abc import Iterator
 from contextlib import contextmanager
+
+# Process boundaries: there is deliberately NO runtime check that an invoke's scope was bound in
+# this process. `invoke._build_invoke_setup` used to raise whenever a scoped invoke ran outside
+# `MainProcess`, on the theory that scoped values "don't survive the pickle into a child process".
+# Nothing pickles a scope. Under spawn the child's `_scope_var` is unset, and the guard was
+# structurally incapable of catching that case anyway — it sat inside `if scoped:`, which with an
+# empty scope never runs. Under fork the binding is inherited as copied memory and works. What
+# the guard reliably did was reject the fix its own message prescribed: a worker that sets its
+# own scope and invokes.
+#
+# Removing it regresses one case, documented in the module docstring: a forked child now invokes
+# under an inherited scope instead of raising. Measured, the inherited *objects* are the hazard,
+# not the propagation — a `threading.Lock` held at fork time fails a 2s-timeout `acquire()` in
+# the child (an untimed one deadlocks), and an inherited buffered file handle rewrote the
+# parent's unflushed bytes into the file.
+#
+# Considered and rejected: stamp `os.getpid()` at bind time and refuse (or warn) at invoke when
+# it differs. It separates the two cases exactly — a worker's own binding passes, an inherited
+# one does not — but it repeats the shape of the mistake above. Fork-unsafe inherited state is a
+# property of fork, not of scope: the same lock in a module global is just as broken and nothing
+# guards it, so the check would fire on the common benign case (a forked child under a scope of
+# plain data) while implying an assurance it cannot give for any other channel. Documented
+# instead; revisit if a scope-specific failure is ever observed in the wild.
 
 # The single dict-valued scope ContextVar. See the module docstring for why this
 # is only a same-context bridge and not the cross-boundary propagation channel.

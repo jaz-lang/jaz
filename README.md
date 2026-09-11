@@ -8,9 +8,10 @@ JAZ provides a unified framework for creating agents that combine deterministic 
 
 ### Prerequisites
 
-- **Python ≥ 3.12** — 3.14+ is recommended for the full feature set. Everything works on
-  3.12/3.13 except the t-string prompt syntax (`invoke(task=t"Analyze the {data}")`), which
-  is PEP 750 and requires Python ≥ 3.14; the equivalent
+- **Python ≥ 3.12** — 3.14+ is recommended for the full feature set. The t-string prompt
+  syntax (`invoke(task=t"Analyze the {data}")`) and the interactive
+  [`jaz` console](#the-jaz-console) need PEP 750 t-strings, hence Python ≥ 3.14.
+  Everything else works on 3.12/3.13; the equivalent
   ``invoke(task="Analyze the `data`", data=data)`` works on every supported version.
 
 ## Installation
@@ -28,14 +29,15 @@ import jaz
 Optional extras:
 
 ```bash
-pip install "jaz-lang[tracing]"
+pip install "jaz-lang[tracing]"   # OpenTelemetry tracing
+pip install "jaz-lang[copilot]"   # GitHub Copilot backend — no API key, billed to AI credits
 ```
 
 To pin a specific release, or to install one that has not reached PyPI, use the
 distribution repo and a release tag:
 
 ```bash
-pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a3"
+pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a4"
 ```
 
 ### API Keys
@@ -44,16 +46,25 @@ JAZ reads provider API keys from the environment, under each provider's standard
 
 - **Shell profile** — add `export OPENAI_API_KEY=sk-...` to `~/.zshrc` or `~/.bashrc` (simplest, available globally)
 - **`.env` file** — create a `.env` at the project root with `OPENAI_API_KEY=sk-...` per line, then load it with:
-  - **VS Code** — set `"python.terminal.useEnvFile": true` in settings
   - **direnv** — add `dotenv` to an `.envrc` file to auto-load on `cd` (`brew install direnv`)
 
-### VS Code Setup
+No API key at hand? The `copilot` backend (the `copilot` extra) bills a Copilot
+subscription's GitHub AI credits instead. Authentication checks an explicit `github_token`
+first, then `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` in the environment
+(in that order), then your signed-in `gh`/`copilot` CLI. An exported token therefore
+takes precedence over your CLI login:
 
-After installation, select the Python interpreter so VS Code uses the correct environment:
+```python
+import jaz
+from jaz.llm import CopilotLLM
 
-1. Open the command palette (`Cmd+Shift+P` / `Ctrl+Shift+P`)
-2. Search **"Python: Select Interpreter"**
-3. Choose the one marked **(Recommended)** — this is the virtual environment created by uv or conda
+jaz.configure(llm=CopilotLLM(model="gpt-5-mini"))   # ids are Copilot's own, unprefixed
+```
+
+For CLI authentication, run `gh auth login`, or start `copilot` and enter `/login`.
+
+Like every backend other than LiteLLM it sits outside the stable API surface — see
+[Custom & Local LLM Backends](#custom--local-llm-backends).
 
 ## Quick Start
 
@@ -77,6 +88,40 @@ result = invoke(
 
 Later snippets assume the Quick Start imports (`from jaz import invoke`,
 `from jaz.hooks import ReturnType`, `import jaz`) and show only what each adds.
+
+Every input is a **keyword** argument — the prompt included. `invoke()`'s positional
+arguments are hooks (`ReturnType(int)`, a budget, …) and an optional `ConfigOverride`, so
+`invoke("Calculate the factorial of 10")` is an error, not a shorthand.
+
+## The `jaz` console
+
+Installing puts a `jaz` command on `PATH` (it needs Python ≥ 3.14 to run): a real Python
+REPL — variables persist, `_` holds the last result — with conversational sugar layered
+on top. Run `jaz`, then enter these lines at its prompt:
+
+```
+> what is 2 + 2?
+n: int <- how many days in a leap year?
+?n
+% switch to gpt-5-mini
+import math
+```
+
+`>` asks the agent; `n: int <-` captures a typed result; `?n` shows what the agent sees
+for `n`; `%` asks the jaz helper to change settings, with confirmation. Plain Python
+still runs. Enter the sigil lines without trailing `#` annotations: they become prompt
+text, or can leave a `?` expression waiting for more input.
+
+A session with no model configured opens a setup wizard first: pick a provider and paste
+its API key, or pick **github copilot** — no provider key, just the `copilot` extra and
+[GitHub authentication](#api-keys). The choice is validated with one live request before
+anything is kept. Backend and model defaults are saved to `~/.jaz/settings.json`;
+provider API keys entered in the wizard go in `~/.jaz/credentials.json`.
+
+Flags configure one session without touching that default — `jaz --backend copilot --model
+gpt-5-mini`, `jaz --max-cost 0.50`, `jaz --log run.log` — and `jaz -c "…"` runs a single
+prompt and exits. In-session, `setup_llm()` re-runs the wizard and
+`switch_model("openai/gpt-5")` changes model (keeping the backend) after validating it.
 
 ## Key Features
 
@@ -205,9 +250,9 @@ jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"), repl=PythonREPL(exec_timeo
 
 ### Custom & Local LLM Backends
 
-JAZ talks to LLMs through a small `BaseLLM` layer. Currently, **LiteLLM is the only backend covered by the stable API, and the default** — one backend that routes to every provider LiteLLM supports (OpenAI, Anthropic, Gemini, Bedrock, Vertex, …). Other backends ship in the package but can change or be removed. You can add your own backend without forking, mirroring the REPL extension pattern.
+JAZ talks to LLMs through a small `BaseLLM` layer. Currently, **LiteLLM is the only backend covered by the stable API, and the default** — one backend that routes to every provider LiteLLM supports (OpenAI, Anthropic, Gemini, Bedrock, Vertex, …). Other backends ship in the package but can change or be removed. You can add your own backend without forking.
 
-A config selects **one** backend: the `BaseLLM` you pass to `llm=`, defaulting to `LiteLLM`. Its constructor takes everything it needs — the `model` id (a LiteLLM route like `openai/gpt-5-mini`), the backend's own settings, and any per-request defaults. `@register_llm` also gives a backend a `tag`, which is how JAZ's own config-file loaders (the eval harness, the console's `--model`) name it as data; because litellm is the default, a config need only name the `model`.
+A config selects **one** backend: the `BaseLLM` you pass to `llm=`, defaulting to `LiteLLM`. Its constructor takes everything it needs — the `model` id (a LiteLLM route like `openai/gpt-5-mini`), the backend's own settings, and any per-request defaults. A config *file* can name a backend instead of constructing one, but the name lives in whatever reads the file: JAZ's own loaders (the eval harness, the console) each keep their own tag → class mapping, and core carries neither the mapping nor a name on the class. Because litellm is the default, a config need only name the `model`.
 
 **Local OpenAI-compatible server** (Ollama, vLLM, LM Studio, llama.cpp, …) — no code, just config:
 
@@ -220,13 +265,12 @@ jaz.configure(
 )
 ```
 
-**A custom backend** — subclass `BaseLLM` and pass an instance (registering it is only needed if a config *file* must name it):
+**A custom backend** — subclass `BaseLLM` and pass an instance (a name is only needed if a config *file* must select it, and it is that file's reader that holds the name):
 
 ```python
 import os
-from jaz.llm import BaseLLM, register_llm, CompletionResponse, Usage, Choice, Message
+from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
 
-@register_llm("mybackend")                    # the tag a config file can name
 class MyLLM(BaseLLM):
     def __init__(self, base_url: str | None = None, **retry):
         super().__init__(**retry)             # forwards the retry_* settings
@@ -247,9 +291,11 @@ jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
 
 One class owns the whole job: the API call, retry, cost accounting and model metadata. `finalize()` turns your wire response into the normalized `jaz.llm.LLMResponse` and prices it from the bundled table (models absent from it simply report `cost=None`); the retry wrappers and the non-retryable-error classification come from the base.
 
-When a config *file* names your backend by tag, the split between "settings for the backend object" and "params for the request" is taken from your `__init__` signature, so `base_url` reaches `MyLLM(...)` while `model` rides each call — a backend declares its construction keys just by declaring `__init__`. Constructing it yourself needs no such rule: `ConfigOverride(llm=my_llm)`.
+When a config *file* names your backend, the split between "settings for the backend object" and "params for the request" is taken from your `__init__` signature, so `base_url` reaches `MyLLM(...)` while `model` rides each call — a backend declares its construction keys just by declaring `__init__`. Whoever loads that file supplies the name → class mapping (`jaz.instantiate.build_config(..., resolvers={"llm": my_lookup})`); JAZ core holds no registry, and a backend class carries no name of its own. Constructing it yourself needs no name at all: `ConfigOverride(llm=my_llm)`.
 
-`register_llm` deliberately refuses to clobber an existing tag — registering `"litellm"` again raises. `OpenAILLM` and `AnthropicLLM` ship in the package but are not registered, so `backend: openai` does not resolve — reach those providers through litellm's `openai/…` / `anthropic/…` routes. Registration and stability are separate axes: a tag can resolve without being covered by the stable API. To add or replace a backend, subclass `BaseLLM` and register your own tag.
+`OpenAILLM` and `AnthropicLLM` ship in the package but are in no loader's tag map, so `backend: openai` names nothing — reach those providers through litellm's `openai/…` / `anthropic/…` routes. Being nameable and being stable are separate axes: a name can resolve without being covered by the stable API. To add or replace a backend, subclass `BaseLLM`; add it to your loader's map only if a config file needs to name it.
+
+The configured model id is sent verbatim: JAZ neither strips nor rewrites a `provider/` prefix, so write the id the backend's own documentation uses. A backend is chosen by configuring it, not by prefixing the model — `OpenAILLM(model="litellm/gpt-4o")` sends that string to OpenAI, which rejects it.
 
 ## Architecture
 
@@ -280,11 +326,11 @@ jaz/
 | `BudgetPool` | Shared LLM cost / call-count budget with hard-stop enforcement |
 | `IterationLimit` / `RecursionLimit` | Per-level turn cap / invoke-nesting cap |
 | `BudgetForcing` | Refuse early finishes so the agent keeps working |
-| `Compaction` | Summarize old turns to stay inside the context window |
 | `ContextWindowWarning` | Warn the agent as its prompt nears the model's window |
 | `PrintLogger` / `FileLogger` | Log events to console / file |
-| `ATIFTrace` | Write the run as an ATIF trajectory (replay/cost source) |
-| `ATIFReplay` | Resume a run from an ATIF trace: saved responses replay, then live calls take over |
+| `TrajectoryRecorder` | Write the run as an ATIF trajectory (replay/cost source) |
+| `TrajectoryDirectoryRecorder` | Write the run as a browsable Markdown directory, live (`tail -f` a running agent) |
+| `TrajectoryReplay` | Resume a run from an ATIF trace: saved responses replay, then live calls take over |
 | `RolloutRecorder` | Record token-native rollouts for training |
 | `JaegerTracing` / `LangfuseTracing` | OpenTelemetry tracing presets |
 

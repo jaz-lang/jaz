@@ -64,9 +64,11 @@ if TYPE_CHECKING:
 
 def _format_type_name(t: object) -> str:
     """Human-readable name for a type or type form: ``__name__`` for a concrete type (``int``),
-    else ``str()`` (``list[int]``). Local to this module — after #568 moved return-type rendering
-    off ``prompts.py`` into ``ReturnType``, this hook is its only consumer.
+    else ``str()`` (``list[int]``). Local to this module — return-type rendering lives on
+    ``ReturnType`` rather than in the prompt builder, and this hook is its only consumer.
     """
+    # Kept local because #568 moved return-type rendering onto this hook; there is no shared
+    # formatter left to call.
     return t.__name__ if isinstance(t, type) else str(t)
 
 
@@ -77,7 +79,7 @@ _HINT_PROBE = object()
 
 
 def _validate_return_type_hint(return_type: TypeForm | None) -> None:
-    """Fail fast at invoke *entry* if ``return_type`` is not a hint beartype can check (#891).
+    """Fail fast at invoke *entry* if ``return_type`` is not a hint beartype can check.
 
     The return-type contract is enforced at ``return`` time by ``is_bearable`` (see
     ``_return_type_error``). If ``return_type`` is not a usable hint — most commonly the builtin
@@ -97,6 +99,7 @@ def _validate_return_type_hint(return_type: TypeForm | None) -> None:
     builtin-only restriction (that is the evals ``RestrictReturnValue``'s job) — ``Callable``, custom classes,
     ``list[int]``, etc. all pass.
     """
+    # Fail-fast at entry is #891: a bad hint used to surface only at return time, after the run.
     try:
         is_bearable(_HINT_PROBE, return_type)  # type: ignore[arg-type]
     except BeartypeException as e:
@@ -268,7 +271,7 @@ class ReturnType[ReturnT](Hook):
     def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
         # First turn only: inject the <return_type> block once, as a persistent user message so it
         # carries forward (mirrors the old opener placement; #568 moved it off the opener so
-        # prompts.py no longer names return types).
+        # the prompt builder no longer names return types).
         # Iterations are 0-based (#719), so the first turn is 0.
         if event.iteration != 0:
             return []

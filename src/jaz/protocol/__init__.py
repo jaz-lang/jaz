@@ -19,10 +19,6 @@ it (``render_observation`` / ``render_initial_message_list``).
 from .base import BaseProtocol
 from .base import ParsedCode as ParsedCode
 from .code_only import CodeOnlyProtocol
-from .registry import INTERACTION_PROTOCOL_MAP as INTERACTION_PROTOCOL_MAP
-from .registry import create_protocol as create_protocol
-from .registry import register_protocol as register_protocol
-from .registry import validate_protocol_name as validate_protocol_name
 
 __all__ = [
     "BaseProtocol",

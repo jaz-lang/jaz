@@ -1,16 +1,34 @@
 """JAZ exception taxonomy — the errors raised during agent execution.
 
-Every error JAZ raises derives from :class:`JazException`, which derives from ``Exception``.
+Every error defined here derives from :class:`JazException`, which derives from ``Exception``, so
+``except JazException`` around :func:`jaz.invoke` catches any of them.
+
+Configuring JAZ is not agent execution and does not go through this taxonomy: calling a setup
+function wrongly raises the builtin that fits (``ValueError``, ``TypeError``), and a component
+validating input with someone else's library raises that library's error — registering a template
+loader surfaces ``jinja2.TemplateSyntaxError``. Each such function documents what it raises.
 
 Exceptions raised by hooks are unstable API: the hook system is experimental, so the errors it
 raises may be renamed, re-rooted, or removed in a future release.
 """
 
-# There are no exceptions to the rule above, so ``try: jaz.invoke(...) except Exception:``
-# catches everything JAZ can surface — including :class:`FatalError`, which used to escape it
-# (see that class's docstring for why the ``BaseException`` rooting was reversed). Catch
-# ``jaz.exceptions.JazException`` for a framework-wide catch-all, or a specific subclass for a
-# specific failure mode (e.g. a hook enforcing a budget raises ``BudgetExhaustedError``).
+# Whether a new error belongs in this taxonomy is two questions, and it needs both: can a caller of
+# `jaz.invoke` write a meaningful `except` for it, and is JAZ the thing that decides it happened?
+#
+# The second is what keeps registration-time validation out. `add_template_loader` rejecting an
+# inheritance loop is JAZ's *detection*, but Jinja's *verdict* — the template is invalid by Jinja's
+# rules — so it raises `jinja2.TemplateAssertionError` and a caller catches one family, not two.
+# The `LLMError` subtree is the same test answered the other way: JAZ normalises across backends
+# and owns that contract, so those re-root here while keeping LiteLLM's vocabulary.
+#
+# The first keeps out plumbing no caller can observe — `REPLTimeoutError`, `CookieCollisionError`
+# and friends live in the private modules that raise them, are translated before they surface, and
+# would otherwise advertise handlers for conditions that never reach a caller.
+#
+# Catch `jaz.exceptions.JazException` for a framework-wide catch-all, or a specific subclass for a
+# specific failure mode (e.g. a hook enforcing a budget raises `BudgetExhaustedError`). Either
+# catches :class:`FatalError`, which used to escape both (see that class's docstring for why the
+# `BaseException` rooting was reversed).
 #
 # Naming rules, so the next audit does not re-litigate them (#806):
 #
@@ -537,7 +555,7 @@ def is_fatal(e: BaseException) -> bool:
     at the raise site rather than extending this function.
 
     Why classify here at all, rather than ``except Exception`` and let fatals propagate
-    (the "why not the fully Python-native shape" the reviewer asked to capture, #561):
+    (the "why not the fully Python-native shape" question):
     the exec boundary is *forced* to catch ``BaseException`` because the agent's
     ``return``/``raise`` compile to ``BaseException``-rooted control-flow signals (see
     ``python_repl``) — once everything is caught it must be sorted — and every exec

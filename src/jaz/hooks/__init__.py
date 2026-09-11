@@ -44,8 +44,8 @@ A complete first hook — count the turns, nudge the agent, then stop it::
     # do NOT see it. See the Hook class for the difference.
     result = invoke(TurnLimiter(), task="...")
 
-Before writing your own, check the battery hooks — limits, budgets, logging, tracing,
-compaction, and replay are already covered.
+Before writing your own, check the battery hooks — limits, budgets, logging, tracing and
+replay are already covered.
 
 **Experimental.** The hook system is an experimental feature; its interfaces may change
 in a future release.
@@ -69,23 +69,26 @@ from . import effects, events
 # hook *vocabulary* lives in the events/effects sub-namespaces (jaz.hooks.events /
 # jaz.hooks.effects). The dispatch engine (`HookDispatcher`/`get_dispatcher`), the
 # internal contract base (`ExecutionContext`), the `Blackboard` store type, and
-# `MetaData`/`WorkflowReplayHook` are demoted (see `_DEMOTED`:
+# `MetaData`/`WorkflowReplay` are demoted (see `_DEMOTED`:
 # reachable via `__getattr__`, with a NonPublicAPIWarning).
 #
-# `ATIFTrace`/`ATIFReplay` are public here as of 2026-08-15 (user call), superseding the
-# review-of-#962 demotion of the replay hook and `ATIFTrace`'s deep-path-only status:
-# ATIF is the canonical trace/replay/cost format (#813, #1159), so its write/read pair
-# belongs on the offered surface rather than behind deep imports every consumer had to
-# know. The replay hook was renamed `Replay` → `ATIFReplay` at promotion (user call,
-# same review): `RolloutRecorder` already makes token-native rollouts a second recorded
-# format, so the bare name would collide with a future token-native replay, and the
-# shared prefix keeps the write/read pair adjacent in `__all__` and on the docs page.
+# `TrajectoryRecorder`/`TrajectoryReplay` are public here as of 2026-08-15 (user call),
+# superseding the review-of-#962 demotion of the replay hook and the recorder's
+# deep-path-only status: ATIF is the canonical trace/replay/cost format (#813, #1159), so its
+# write/read pair belongs on the offered surface rather than behind deep imports every consumer
+# had to know.
+#
+# The pair has been renamed twice. At promotion the replay hook went `Replay` -> `ATIFReplay`
+# (user call, same review): `RolloutRecorder` already makes token-native rollouts a second
+# recorded format, so the bare `Replay` would collide with a future token-native one, and a
+# shared prefix keeps the write/read pair adjacent in `__all__` and on the docs page. Later
+# `ATIFTrace`/`ATIFReplay` became `TrajectoryRecorder`/`TrajectoryReplay`: the prefix argument
+# survives (they still share one), but ATIF is the *format* these read and write, not what they
+# are, and `Trace` named the artifact where an actor was meant. `Trajectory` rather than `Trace`
+# because `OTelTracing` already owns "trace" in this namespace, in the industry sense.
 from .builtin import (
-    ATIFReplay,
-    ATIFTrace,
     BudgetForcing,
     BudgetPool,
-    Compaction,
     ContextWindowWarning,
     FileLogger,
     IterationLimit,
@@ -93,6 +96,9 @@ from .builtin import (
     RecursionLimit,
     ReturnType,
     RolloutRecorder,
+    TrajectoryDirectoryRecorder,
+    TrajectoryRecorder,
+    TrajectoryReplay,
     ValidateREPLCode,
     ValidateReturn,
 )
@@ -103,22 +109,8 @@ if TYPE_CHECKING:
     # __getattr__, which warns). Not bound at runtime; type checkers read this block.
     from .base import ExecutionContext as ExecutionContext
     from .blackboard import Blackboard as Blackboard
-
-    # Pre-rename spellings, kept importable via _DEMOTED (see below). Taken from
-    # ``.builtin``, which binds them as plain aliases of the renamed classes.
-    from .builtin import BudgetForcingHook as BudgetForcingHook
-    from .builtin import CompactionHook as CompactionHook
-    from .builtin import ContextWindow as ContextWindow
-    from .builtin import ContextWindowHook as ContextWindowHook
-    from .builtin import IterationLimitHook as IterationLimitHook
-    from .builtin import JaegerTracingHook as JaegerTracingHook
-    from .builtin import LangfuseTracingHook as LangfuseTracingHook
     from .builtin import MetaData as MetaData
-    from .builtin import Replay as Replay
-    from .builtin import ReplayHook as ReplayHook
-    from .builtin import ValidateREPLInput as ValidateREPLInput
     from .builtin import WorkflowReplay as WorkflowReplay
-    from .builtin import WorkflowReplayHook as WorkflowReplayHook
     from .dispatcher import HookDispatcher as HookDispatcher
     from .dispatcher import get_dispatcher as get_dispatcher
     from .effects import UNSET as UNSET
@@ -176,7 +168,7 @@ if TYPE_CHECKING:
 
 # Conditionally import tracing hooks
 try:
-    from .builtin import JaegerTracing, LangfuseTracing  # noqa: F401
+    from .builtin import JaegerTracing, LangfuseTracing, OTelTracing  # noqa: F401
 
     _TRACING_AVAILABLE = True
 except ImportError:
@@ -189,11 +181,16 @@ __all__ = [
     # Authoring primitive
     "Hook",
     # Concrete built-in hooks ("batteries")
-    "ATIFReplay",
-    "ATIFTrace",
+    # Writers before the reader: the two hooks that WRITE a trajectory, then the one that
+    # reads one back, which is the order the docs page renders. (This block was alphabetical
+    # when the pair was `TrajectoryRecorder`/`TrajectoryReplay` and the two rules agreed;
+    # `TrajectoryDirectoryRecorder` sorts before both, so only the write-before-read rule
+    # survives.)
+    "TrajectoryRecorder",
+    "TrajectoryDirectoryRecorder",
+    "TrajectoryReplay",
     "BudgetForcing",
     "BudgetPool",
-    "Compaction",
     "ContextWindowWarning",
     "IterationLimit",
     "RecursionLimit",
@@ -206,6 +203,13 @@ __all__ = [
 ]
 
 if _TRACING_AVAILABLE:
+    # `OTelTracing` alongside its two presets: it is the base a caller subclasses to export to
+    # any other OTLP collector, so the extension seam has to be reachable by the same route as
+    # the batteries. It was previously deep-path-only, which meant the one tracing name a user
+    # is expected to subclass was the only one they could not import from here — and silently,
+    # since a module read warns nowhere (see `jaz._warnings.warn_on_nonpublic_submodules`,
+    # installed on the top-level package only).
+    __all__.append("OTelTracing")
     __all__.append("JaegerTracing")
     __all__.append("LangfuseTracing")
 
@@ -214,10 +218,6 @@ if _TRACING_AVAILABLE:
 # `jaz.hooks.<name>` spelling of it is demoted; the dispatch engine / internal machinery
 # has no public home.
 _DEMOTED = {
-    # Pre-promotion spelling of ATIFReplay: this name was reachable-with-warning here
-    # before the rename, so it keeps exactly that status rather than becoming an
-    # AttributeError.
-    "Replay": ("jaz.hooks.builtin", "ATIFReplay"),
     "ExecutionContext": ("jaz.hooks.base", "ExecutionContext"),
     "Blackboard": ("jaz.hooks.blackboard", "Blackboard"),
     "MetaData": ("jaz.hooks.builtin", "MetaData"),
@@ -281,42 +281,21 @@ _DEMOTED = {
     "REPLExecSpan": ("jaz.hooks.events", "REPLExecSpan"),
 }
 
-# Pre-rename spellings (#806 question 1 dropped the ``Hook`` suffix across the whole set;
-# the REPL-input → REPL-code rename added one more that is not a suffix drop).
-# Every one was in ``__all__`` before the rename — documented surface, not merely reachable —
-# so dropping it outright would turn `from jaz.hooks import WorkflowReplayHook` in
-# out-of-tree code into an ImportError with no hint of the replacement.
+# No pre-rename hook spellings are kept. #806 question 1 dropped the ``Hook`` suffix across the
+# set, later renames added more (``ContextWindow`` -> ``ContextWindowWarning``,
+# ``ValidateREPLInput`` -> ``ValidateREPLCode``, ``Replay``/``ATIFReplay`` ->
+# ``TrajectoryReplay``, ``ATIFTrace`` -> ``TrajectoryRecorder``), and each left an alias here so
+# an out-of-tree import kept working with a warning. They are all gone: the set had grown to
+# sixteen dead spellings across four renames, which made the public surface read as larger and
+# more settled than it is — ``dir(jaz.hooks)`` advertised three names for one replay hook. An old
+# name is now an ``AttributeError`` naming the module, the same failure a typo gives. Pre-1.0 is
+# when that trade is cheapest; ``ATIFTrace``/``ATIFReplay`` were announced in 0.2.0a2 and so do
+# have released users, which is what the changelog entry is for rather than a reason to keep them.
 #
-# Routed through ``_DEMOTED`` rather than bound as plain aliases (`XHook = X`), which is what
-# the naming-audit PR used while this module still lacked a ``__getattr__`` shim — its comment
-# said so explicitly and expected the unwind once ``make_lazy_getattr`` landed here. Plain
-# aliases would also force ``WorkflowReplay`` to be imported eagerly just to have something to
-# alias, and an eagerly-bound attribute never reaches ``__getattr__`` — silently un-demoting
-# the very name this module means to demote.
-#
-# These are *import*-compatibility only: they keep the old names importable. An
-# entry here registers nothing and has no bearing on serialized ``qualified_name`` reconstruction.
-_DEMOTED.update(
-    {
-        "BudgetForcingHook": ("jaz.hooks.builtin", "BudgetForcing"),
-        "CompactionHook": ("jaz.hooks.builtin", "Compaction"),
-        "ContextWindow": ("jaz.hooks.builtin", "ContextWindowWarning"),
-        "ContextWindowHook": ("jaz.hooks.builtin", "ContextWindowWarning"),
-        "IterationLimitHook": ("jaz.hooks.builtin", "IterationLimit"),
-        "ReplayHook": ("jaz.hooks.builtin", "ATIFReplay"),
-        "WorkflowReplayHook": ("jaz.hooks.builtin", "WorkflowReplay"),
-        # Not a ``Hook``-suffix drop: "REPL input" was renamed to "REPL code" because
-        # "input" already means an *invoke input* everywhere else in the vocabulary
-        # (``AddInputs``, ``DropInputs``, ``__inputs__``), so the old name read as
-        # "validate the invoke's inputs" — the opposite of what it does.
-        "ValidateREPLInput": ("jaz.hooks.builtin", "ValidateREPLCode"),
-    }
-)
-
-if _TRACING_AVAILABLE:
-    # Conditional: the tracing hooks only exist when their optional deps are installed, so
-    # listing them unconditionally would advertise them in ``__dir__`` and then fail on access.
-    _DEMOTED["JaegerTracingHook"] = ("jaz.hooks.builtin", "JaegerTracing")
-    _DEMOTED["LangfuseTracingHook"] = ("jaz.hooks.builtin", "LangfuseTracing")
+# Why the surviving ``_DEMOTED`` entries above are routed through ``__getattr__`` rather than
+# bound as plain aliases (``X = Y``), which still matters for the ~30 that remain: a plain alias
+# forces its target to be imported eagerly just to have something to alias, and an eagerly-bound
+# attribute never reaches ``__getattr__`` — silently un-demoting the very name this module means
+# to demote. That is why the block below stays ``TYPE_CHECKING``-only.
 
 __getattr__, __dir__ = make_lazy_getattr(__name__, __all__, _DEMOTED)

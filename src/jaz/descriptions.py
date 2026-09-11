@@ -376,13 +376,15 @@ def _resolve_stored(
       callable, or nothing for a *bound* ``__jaz_description__`` method (``self`` is
       implicit, mirroring ``str()``/``__str__``). ``bound_name`` is appended as a
       trailing positional argument **only if the callable accepts it** — so both
-      PR #372's name-agnostic forms (``lambda v: ...``, ``def __jaz_description__(self)``)
+      the name-agnostic forms (``lambda v: ...``, ``def __jaz_description__(self)``)
       and the bound-name-aware forms (``lambda v, name: ...``,
       ``def __jaz_description__(self, bound_name)``) work. (This is the superset that
-      keeps #372's zero-arg form working while enabling the catalog use case that
+      keeps the zero-arg form working while enabling the catalog use case that
       needs the kwarg name — see design Open Question 3.)
     - A plain ``str`` passes through unchanged.
     """
+    # The name-agnostic zero-arg forms come from #372; the one-arg catalog form is layered on top
+    # without breaking them.
     if isinstance(stored, _CatalogMode):  # the `jaz.Catalog` render mode
         return render_catalog(value, bound_name)
     if callable(stored):
@@ -405,13 +407,15 @@ def resolve_jaz_get(value: object) -> object:
 
     A *class* is skipped: ``getattr(SomeClass, "__jaz_get__")`` returns the plain
     (unbound) function, so calling it raises ``TypeError: missing 'self'``. This is the
-    same guard `inputs.resolve_inputs` applies (#946) — duplicated here rather than
+    same guard `inputs.resolve_inputs` applies — duplicated here rather than
     centralized because the prompt builder calls *this* function directly, bypassing
     `resolve_inputs`, so the guard has to live at both entry points. It matters because
     framework helper classes are delivered as ordinary inputs
     (``jaz.invoke(Display=jaz.Display, ...)``) and ``Display``/``Library`` are exactly
     the symbols defining ``__jaz_get__``.
     """
+    # Duplicated from `inputs.resolve_inputs` (#946) rather than shared: the two run at different
+    # boundaries and the guard is two lines.
     getter = None if isinstance(value, type) else getattr(value, "__jaz_get__", None)
     return getter() if getter is not None else value
 
@@ -558,3 +562,180 @@ class DescriptionOverride:
         )
         _override_stack.reset(self._token)
         self._token = None
+
+
+# --- default value rendering -------------------------------------------------------------
+# The fallback for a value with no description attached: `get_description` above answers "what did
+# the author say about this value", and this answers "what do we show when they said nothing". Both
+# are the same question — what text represents this value to the agent — so they live together
+# rather than in the prompt module, which is one consumer of the answer and not its owner.
+#
+# `get_default_description` is public; its six formatting helpers stay private. The default
+# rendering is the rule the agent-facing `invoke` docstring publishes to every sub-agent author
+# ("an input renders as its `str()`, except: a class as its docstring and public members; any
+# other callable as its signature and docstring; an object with no `str()` of its own as its
+# class docstring and public attributes"), so it was already public *behaviour* reachable only
+# through a private name. Making it callable is what lets an author COMPOSE with the default
+# instead of replacing it — `describe(x, lambda v, n: f"Note.\n\n{get_default_description(v, n)}")`
+# — which previously required either duplicating the chain or, for a `Library`, the bespoke
+# `Library.default_description` escape hatch.
+
+
+def get_default_description(value: object, bound_name: str | None = None) -> str:
+    r"""Render ``value``'s default description — what the agent sees when nothing is attached.
+
+    A ``str`` for most values, with three exceptions: a class renders as its docstring and
+    public members; any other callable (a function, a method, or an object with ``__call__``)
+    as its signature and docstring; and an object with no ``str()`` of its own as its class
+    docstring and public attributes. Never truncated — the caller applies its own cap.
+
+    ``bound_name`` is the name the value renders under, normally the kwarg it is passed to
+    :func:`jaz.invoke` as. Without one, a class or function renders under its own
+    ``__name__`` and anything else renders unnamed — no placeholder is invented.
+
+    A value carrying ``__jaz_get__`` is resolved one level first, so the description is of
+    the object an agent actually binds rather than the wrapper it arrived in.
+
+    Pass it to :func:`jaz.describe` to compose with the default rather than replace it::
+
+        jaz.describe(tools, lambda v, name: f"Prefer `search` first.\n\n{jaz.get_default_description(v, name)}")
+
+    Members of a nested namespace are **not** listed: a namespace renders its own top-level
+    names, and a namespace among them renders as a single entry rather than being walked into.
+
+    **Experimental.** The description system is an experimental feature; its interfaces may change
+    in a future release.
+    """
+    # Not recursive, by executive call (user, 2026-09-09): walking nested namespaces is
+    # unbounded in the one direction that costs the most — an input two levels deep can
+    # dominate the prompt, and the agent pays for it on every turn. Top-level names only,
+    # so the size of this rendering is a function of the value the author actually passed.
+    # `_catalog.render_catalog` still walks recursively for a `Library`, where the author
+    # opted into a tool namespace explicitly and the shape is theirs to bound.
+    #
+    # `__jaz_get__` is resolved here rather than at the call site so the default describes
+    # the object the agent actually binds (a `Library`'s root module, a `Display`'s payload)
+    # no matter who asks — the prompt builder, or a user composing in a `describe` callable.
+    # Exactly one level, matching `inputs.resolve_inputs`: the caller must therefore pass the
+    # ORIGINAL value, not a payload it already resolved, or the two disagree.
+    value = resolve_jaz_get(value)
+    if isinstance(value, type):
+        return _format_class(bound_name, value)
+    if callable(value):
+        return _format_callable(bound_name, value)
+    if type(value).__str__ is object.__str__ and hasattr(value, "__dict__"):
+        return _format_object(bound_name, value)
+    return str(value)
+
+
+def _own_name(value: object) -> str | None:
+    """The value's own ``__name__``, when it has a usable one.
+
+    Only functions, classes and modules carry one. `getattr` rather than an `isinstance`
+    chain because anything defining it means it as its name — and a non-`str` one (a `Mock`
+    fabricates attributes) is not usable as a label.
+    """
+    own = getattr(value, "__name__", None)
+    return own if isinstance(own, str) and own else None
+
+
+def _format_callable(name: str | None, value: Callable[..., object]) -> str:
+    """Render a callable, falling back to its own ``__name__`` when unnamed.
+
+    A callable with neither — a `functools.partial`, an instance with `__call__` — renders
+    signature-first, with nothing standing in for the name it does not have.
+    """
+    label = name or _own_name(value)
+    sig = _get_signature(value)
+    doc = _indent_continuation(_get_doc(value), "  ")
+    return f"`{label}{sig}`: {doc}" if label else f"`{sig}`: {doc}"
+
+
+def _format_class(name: str | None, cls: type) -> str:
+    # A class always has `__name__`, so the fallback is total here — unlike `_format_object`,
+    # where an unnamed value has nothing of its own to fall back to.
+    label = name or _own_name(cls)
+    head = f"`{label}` [class]" if label else "[class]"
+    lines: list[str] = [f"{head}: {_indent_continuation(_get_doc(cls), '  ')}"]
+    attr_names: set[str] = set()
+    for base in cls.__mro__:
+        if base is object:
+            continue
+        attr_names.update(vars(base))
+    for attr_name in sorted(attr_names):
+        if attr_name.startswith("_"):
+            continue
+        attr = getattr(cls, attr_name)
+        if callable(attr):
+            sig = _get_signature(attr)
+            doc = _indent_continuation(_get_doc(attr), "    ")
+            lines.append(f"  - `{attr_name}{sig}`: {doc}")
+        else:
+            type_name = type(attr).__name__
+            lines.append(f"  - `{attr_name}` [{type_name}]")
+    return "\n".join(lines)
+
+
+def _format_object(name: str | None, obj: object) -> str:
+    # An instance has no name of its own — `__name__` belongs to its CLASS, and borrowing it
+    # would label the value with its type twice. A placeholder like `value` is worse still: it
+    # reads as a real binding the agent could reference and is not.
+    #
+    # Unnamed, it says so in prose rather than dropping to a bare `[Widget]:`. The bracket is
+    # a type tag ATTACHED TO A NAME — every other bracket in this rendering sits after a
+    # backticked name — so on its own it reads as a fragment, and it needs a convention the
+    # reader may not have. (Square brackets are not a type notation in the wider world either;
+    # they conventionally mean *optional*. Python writes `x: T`, Google docstrings `x (T):`.)
+    # "Instance of Widget" also distinguishes the value from its CLASS, which renders as
+    # `` `Widget` [class] `` — a confusion this module already guards against elsewhere.
+    #
+    # The NAMED form is left alone: it is agent-facing prompt text, and changing it would
+    # break reproducibility against recorded eval runs. This branch is not — it is reachable
+    # only from the console's `?expr`, an agent's own `desc(x)` call, and a direct `__desc__`.
+    cls = type(obj)
+    head = f"`{name}` [{cls.__name__}]" if name else f"Instance of {cls.__name__}"
+    lines: list[str] = [f"{head}: {_indent_continuation(_get_doc(cls), '  ')}"]
+    attr_names: set[str] = set(vars(obj))
+    for base in cls.__mro__:
+        if base is object:
+            continue
+        attr_names.update(vars(base))
+    for attr_name in sorted(attr_names):
+        if attr_name.startswith("_"):
+            continue
+        attr = getattr(obj, attr_name)
+        if callable(attr):
+            sig = _get_signature(attr)
+            doc = _indent_continuation(_get_doc(attr), "    ")
+            lines.append(f"  - `{attr_name}{sig}`: {doc}")
+        else:
+            type_name = type(attr).__name__
+            lines.append(f"  - `{attr_name}` [{type_name}]")
+    return "\n".join(lines)
+
+
+# TODO(#1345): these two duplicate `_catalog._format_signature` / `_summarize_doc`. Moving them
+# here from the prompt builder put the copies one direct import apart — `descriptions` already
+# imports `_catalog` — so the merge that was awkward across two concerns is now mechanical:
+# `_get_doc(x)` is `_summarize_doc(x, full=True) or "(no description available)"`. Left for that
+# issue rather than folded in here, where it would hide behind a move.
+def _get_signature(obj: Callable[..., object]) -> str:
+    try:
+        return str(inspect.signature(obj))
+    except (TypeError, ValueError):
+        return "()"
+
+
+def _get_doc(obj: type | Callable[..., object]) -> str:
+    doc = inspect.getdoc(obj)
+    if not doc:
+        return "(no description available)"
+    return doc.strip()
+
+
+def _indent_continuation(text: str, indent: str) -> str:
+    """Indent all lines of `text` after the first by `indent`."""
+    lines = text.splitlines()
+    if len(lines) <= 1:
+        return text
+    return lines[0] + "\n" + "\n".join(indent + line for line in lines[1:])

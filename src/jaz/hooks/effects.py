@@ -909,7 +909,7 @@ def _add_sort_key(add: AddMessages) -> tuple[float, str]:
 def _resolve_edit_index(index: int, n: int, *, upper: int, kind: str) -> int:
     """Resolve a possibly-negative message-edit index against snapshot length ``n``.
 
-    NumPy / ``list`` semantics (#595): a negative index counts from the end (``index + n``,
+    NumPy / ``list`` semantics: a negative index counts from the end (``index + n``,
     so ``-1`` is the last position). The resolved index must lie in ``[0, upper]`` —
     ``upper == n`` for an add slot (``n`` = append), ``upper == n - 1`` for a drop position
     — otherwise :class:`MessageEditIndexError` is raised. Out-of-range is a hook bug (every
@@ -917,6 +917,8 @@ def _resolve_edit_index(index: int, n: int, *, upper: int, kind: str) -> int:
     make an add's content vanish; clamping would misplace it. Normalizing here — before the
     fold — keeps composition commutative (a pure function of the resolved index set).
     """
+    # NumPy/list index semantics were chosen over positive-only in #595, so a hook can address the
+    # most recent message as -1 without knowing the buffer length.
     resolved = index + n if index < 0 else index
     if not (0 <= resolved <= upper):
         raise MessageEditIndexError(
@@ -940,7 +942,7 @@ def apply_message_edits(
     (both reference original indices — an add "at" a dropped slot still inserts, since it
     is new content). Same-slot adds are ordered by :func:`_add_sort_key`.
 
-    Indices follow NumPy / ``list`` semantics (#595): negatives count from the end (``-1``
+    Indices follow NumPy / ``list`` semantics: negatives count from the end (``-1``
     = the last message; append is an add ``index`` of ``None`` — the default — or the
     explicit ``len``), and an out-of-range index — after that normalization, ``[-len, len]``
     for an add, ``[-len, len-1]`` for a drop — raises :class:`MessageEditIndexError` rather
@@ -951,12 +953,14 @@ def apply_message_edits(
     ``Agent._compose_shown_messages``), so once a real compaction hook emits edits, an
     out-of-range index aborts the *entire invoke* mid-run — not just that one edit, not just
     that turn. That is deliberate: an OOR index is a hook bug (every index is computed
-    against the snapshot the hook saw), and the fail-loud surface is the point (§#595). The
+    against the snapshot the hook saw), and the fail-loud surface is the point. The
     considered-and-rejected softer alternative was surfacing it as recoverable
-    ``ErrorEffect``-style feedback to the offending hook; it's moot while the mechanism is
-    dormant (``SlidingWindow`` only drops in-range), and can be revisited if a
-    third-party compaction hook taking down the run ever proves too sharp.
+    ``ErrorEffect``-style feedback to the offending hook; it's moot while core ships no hook that
+    emits a drop at all, and can be revisited if a third-party compaction hook taking down the
+    run ever proves too sharp.
     """
+    # Fail-loud on an out-of-range index is #595's call: a silently-clamped edit writes to the
+    # wrong message, and the hook composed it against a snapshot it can no longer check.
     n = len(snapshot)
     normalized_drops = {
         _resolve_edit_index(d, n, upper=n - 1, kind="DropMessages") for d in drops
@@ -1153,10 +1157,10 @@ def _fold_carried_results(
       contributes only its exception (the ``BudgetForcing`` shape);
     - else ``None`` (nothing carried — run/keep).
 
-    ``Raise`` / ``Return`` carry no ``output`` (#903), so the fold's ``Raise`` / ``Return`` branches
-    simply replace the kind — there is no output to keep or drop, which is exactly why #903 removed
-    the field (it erases the old supply-vs-transform asymmetry where a carried terminal's own output
-    was silently discarded). Only the ``Continue`` branch has outputs to concatenate, and it prepends
+    ``Raise`` / ``Return`` carry no ``output``, so the fold's ``Raise`` / ``Return`` branches
+    simply replace the kind — there is no output to keep or drop, which is why the field was
+    removed at all (it erases the supply-vs-transform asymmetry where a carried terminal's own
+    output was silently discarded). Only the ``Continue`` branch has outputs to concatenate, and it prepends
     ``original``'s output only when ``original`` is itself a ``Continue`` (a transform of an executed,
     still-continuing turn).
 
@@ -1166,6 +1170,8 @@ def _fold_carried_results(
     agent only the carried hooks' text, not whatever the turn printed before finishing. See the
     ``Raise`` docstring in ``jaz.repl.types`` for why that loss is accepted.
     """
+    # Terminal results carry no output since #903, which is what makes the Raise/Return branches a
+    # plain kind replacement rather than an output merge.
     raise_results = [r for r in carried if isinstance(r, Raise)]
     return_results = [r for r in carried if isinstance(r, Return)]
     continue_results = [r for r in carried if isinstance(r, Continue)]
@@ -1263,7 +1269,7 @@ def resolve_modify_results(
       return values raise ``ReturnValueConflictError`` (identical values coalesce);
     - else any carried ``Continue`` → ``Continue`` — the carried ``Continue``s' ``output``s
       are concatenated onto ``original``'s output *when ``original`` is itself a ``Continue``*
-      (a terminal one has none to contribute, #903) and their non-``None`` exceptions grouped
+      (a terminal one has none to contribute) and their non-``None`` exceptions grouped
       (plus ``original``'s if it too is a ``Continue``); a carried ``Continue`` with empty
       output contributes only its exception (the ``BudgetForcing`` shape);
     - else ``None`` (keep ``original``).
@@ -1280,6 +1286,7 @@ def resolve_modify_results(
 
     Returns the folded override, or ``None`` when nothing was emitted (keep ``original``).
     """
+    # A terminal result has no output to contribute (#903).
     # Fold the carried replacements onto the executed result — the same precedence/merge the
     # supply boundary uses among its suppliers, but with a real ``original`` to fold onto.
     return _fold_carried_results([m.result for m in modify_effects], original=original)

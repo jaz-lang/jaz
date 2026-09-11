@@ -1,8 +1,7 @@
-"""Selecting and building the configured LLM backend.
+"""The mock LLM backend, plus the pre-merge import path for ``BaseLLM``/``LLMResponse``.
 
-The backend classes themselves live in :mod:`jaz.llm.llm` — this module is the thin layer
-between ``Config.llm`` and them: it validates the tag, routes ``llm.params`` to the right
-destination, and builds the instance.
+The backend classes themselves live in :mod:`jaz.llm.llm`; this module holds the callback-driven
+:class:`MockLLMClient` and nothing else.
 
 ``BaseLLM`` and ``LLMResponse`` are re-exported here because this is where they lived before the
 ``LLMClient``/``Provider`` merge, and internal call sites import them from this path.
@@ -11,74 +10,19 @@ destination, and builds the instance.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any
 
 from .llm.llm import (
     BaseLLM,
     LLMResponse,
 )
-from .llm.registry import (
-    register_llm,
-    registered_llm_tags,
-    resolve_llm,
-)
 
 __all__ = [
     "BaseLLM",
     "LLMResponse",
     "MockLLMClient",
-    "create_llm",
-    "known_llm_tags",
-    "register_llm",
-    "validate_llm_tag",
 ]
-
-
-def known_llm_tags() -> frozenset[str]:
-    """Every tag :func:`create_llm` accepts.
-
-    Computed rather than a constant because the registry is **open** — ``@register_llm`` lets a
-    user add a backend without forking, which the README documents as the extension point. A
-    frozen set here would silently exclude them.
-    """
-    return registered_llm_tags()
-
-
-def validate_llm_tag(name: str, *, field: str = "llm.backend") -> None:
-    """Raise ``ValueError`` if ``name`` is not a registered backend tag.
-
-    Single source of truth for the message so the ``configure`` / ``ConfigOverride`` /
-    depth-override / factory call sites can't drift. ``field`` names the offending setting
-    (a depth override passes its indexed field path).
-    """
-    if name not in known_llm_tags():
-        raise ValueError(
-            f"Unknown {field} {name!r}. "
-            f"Known backends: {', '.join(sorted(known_llm_tags()))}. "
-            "Register one with @register_llm, or pass an LLM instance."
-        )
-
-
-def create_llm(tag: str, params: Mapping[str, Any] | None = None) -> BaseLLM:
-    """Build the backend named by ``tag``, configured from ``params``.
-
-    The whole ``params`` mapping is handed to the backend's constructor, whose
-    ``**request_defaults`` tail absorbs whatever it does not name.
-    """
-    # `REGISTRY[tag].from_dict(params)` with NO per-field special-casing at all — the whole bag
-    # goes to the constructor, whose `**request_defaults` tail absorbs whatever is not a named
-    # parameter.
-    #
-    # The pre-merge version carried four exceptions; merging the two class layers removed three,
-    # and the last (`model` excluded by name, because it "rides per call") lived in
-    # `split_llm_params` until the backend started holding its own `model`. That split existed
-    # only to decide which keys of a tag-plus-bag config reached the constructor; with the
-    # configured backend itself in the config there is no bag to partition.
-    validate_llm_tag(tag)
-    cls = resolve_llm(tag)
-    assert cls is not None  # validate_llm_tag above guarantees it
-    return cls.from_dict(params)
 
 
 class MockLLMClient(BaseLLM):
@@ -101,8 +45,8 @@ class MockLLMClient(BaseLLM):
         mock = MockLLMClient(fn=my_llm)
         jaz.configure(llm=mock)
 
-    Not registered under a tag, and deliberately so: it is constructed with a *callable*, so no
-    authored config could name it. Passing the instance is the only way to select it — which is
+    No authored config can name it: it is constructed with a *callable*, so no config file
+    could express one. Passing the instance is the only way to select it — which is
     the ordinary way to select any backend.
     """
 

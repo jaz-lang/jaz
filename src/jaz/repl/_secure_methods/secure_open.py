@@ -183,7 +183,7 @@ def _path_allowed(
 
 
 def make_secure_open(policy: _OpenPolicy) -> Callable[..., Any]:
-    """Create an ``open`` wrapper bound to a fail-closed read/write path policy (#804 follow-up).
+    """Create an ``open`` wrapper bound to a fail-closed read/write path policy.
 
     ``allowed_read_paths`` / ``allowed_write_paths`` are gitignore-style glob lists: an ``open`` is
     permitted only if its resolved path matches the list for its direction (reads vs. write-capable
@@ -197,6 +197,9 @@ def make_secure_open(policy: _OpenPolicy) -> Callable[..., Any]:
     This is an in-process, model-level policy — defense-in-depth, not an OS boundary. It raises the
     cost of the obvious escapes; genuinely untrusted code needs OS/process isolation.
     """
+    # The fail-closed read/write path policy is the #804 follow-up: #804 replaced the
+    # forbidden-names list with a builtins allow-list, and file access was split out into its own
+    # gitignore-glob policy here.
     # Resolve the anchor bases once so a resolved target and a (possibly symlinked) base share a
     # canonical space — else target.relative_to(base) would spuriously reject an in-tree file.
     # ``home`` is resolved eagerly (not lazily on first ``~`` pattern), so this assumes HOME is set:

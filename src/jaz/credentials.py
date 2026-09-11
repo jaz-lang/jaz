@@ -164,7 +164,7 @@ def resolve_credential(provider: str, field: str = API_KEY_FIELD) -> str | None:
     This is the opt-in hook: the store only takes effect for a backend that calls it. The default
     :class:`~jaz.llm.LiteLLM` backend calls it per request, with the provider it routes the model
     to; the in-tree :class:`~jaz.llm.OpenAILLM` / :class:`~jaz.llm.AnthropicLLM` classes call it
-    once in ``__init__``, having one vendor each. A custom ``@register_llm``
+    once in ``__init__``, having one vendor each. A custom
     backend that never calls it will not read a key stored under its tag.
     """
     # Non-string values (a number, a nested object) are treated as absent rather than

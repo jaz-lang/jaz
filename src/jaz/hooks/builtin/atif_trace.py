@@ -6,9 +6,9 @@ without an intermediate conversion step.
 Usage::
 
     from jaz import invoke
-    from jaz.hooks import ATIFTrace
+    from jaz.hooks import TrajectoryRecorder
 
-    with ATIFTrace(output_path="./trace.atif.json"):
+    with TrajectoryRecorder(output_path="./trace.atif.json"):
         result = invoke(task="Do something")
 
     # Creates: ./trace.atif.json validated by harbor.utils.trajectory_validator
@@ -184,14 +184,20 @@ class _InvokeState:
         return self.step_counter
 
 
-class ATIFTrace(Hook):
+class TrajectoryRecorder(Hook):
     """Write the run as an ATIF trajectory JSON file.
 
     A pure observer: it emits no effects, so it never influences the run. The file is
     written once, when the hook's scope ends — a single trajectory object when the scope
     held one top-level ``invoke``, an array when it held several (nested invokes appear
     under their parent's ``subagent_trajectories``, not as extra roots). The resulting
-    trace is also the input :class:`ATIFReplay` resumes from.
+    trace is also the input :class:`TrajectoryReplay` resumes from.
+
+    Because the write happens at scope end, nothing is on disk while the run is in progress:
+    ``tail -f`` on ``output_path`` shows nothing until it finishes, and a process killed outright
+    leaves no file at all. An ordinary exception does still write, and :meth:`get_trajectories`
+    returns the same documents mid-run. For a trace that reaches disk *as it happens*, see
+    :class:`TrajectoryDirectoryRecorder`, which writes a browsable directory rather than this JSON.
 
     Under ``with`` the trace covers invokes nested inside. Passed positionally, only that
     invoke is traced and its sub-invokes are absent from the output.
@@ -199,9 +205,9 @@ class ATIFTrace(Hook):
     Example::
 
         from jaz import invoke
-        from jaz.hooks import ATIFTrace
+        from jaz.hooks import TrajectoryRecorder
 
-        with ATIFTrace(output_path="./trace.atif.json"):
+        with TrajectoryRecorder(output_path="./trace.atif.json"):
             result = invoke(task="Do something")
 
     Args:
@@ -362,10 +368,11 @@ class ATIFTrace(Hook):
         # The turn's edits hang on the LAST message emitted this enter -- the simplest rule and the
         # least surprising mental model: the edits are applied to the buffer as it stands right after
         # that last message, so they belong immediately after it. It is also chronologically correct
-        # when a turn emits more than one observation (CodeOnlyProtocol appends a truncation-advice
-        # observation after the output one): the edits act on the buffer after BOTH, so anchoring on
-        # the last renders them after both, whereas the first-observation rule would wrongly slot them
-        # between the two. On iteration 1 the last emitted step is a seed, which works the same way.
+        # when a turn emits more than one observation (no in-tree protocol does today, but
+        # ``render_observation`` returns a list and an out-of-tree one may): the edits act on the
+        # buffer after ALL of them, so anchoring on the last renders them after all, whereas the
+        # first-observation rule would wrongly slot them in between. On iteration 1 the last emitted
+        # step is a seed, which works the same way.
         last_emitted_step: dict[str, Any] | None = None
         for position, msg in enumerate(event.messages):
             if not isinstance(msg, dict):
@@ -665,25 +672,43 @@ class ATIFTrace(Hook):
         data = trajectories[0] if len(trajectories) == 1 else trajectories
         self.output_path.write_text(json.dumps(data, indent=self.indent))
 
+    def setup(self) -> None:
+        """Prepare for a run: with an ``output_path``, refuse reuse; without one, start clean.
+
+        Raises :class:`~jaz.exceptions.HookActivationError` when this instance has already been
+        activated and ``output_path`` is set, because the second run's file would replace the
+        first's.
+        """
+        # The policy splits on `output_path` because the two configurations fail differently, and
+        # only this class knows which one it is in.
+        #
+        # With a path, `teardown` writes the whole document to it. A second activation writes the
+        # same path again, so run 1's trace is gone from disk — measured, not assumed. Clearing
+        # in-memory state does not help: the loss is on the filesystem, and by the time the second
+        # run starts there is nothing left to protect. Refusing is the only thing that keeps it.
+        #
+        # Without a path, the in-memory read IS the output, and refusing reuse would buy nothing
+        # while breaking a documented affordance — see the clearing rationale below.
+        if self.output_path is not None:
+            self.forbid_reactivation()
+        # Clearing at SETUP, not teardown. Sequential re-activation of one instance is legal —
+        # the dispatcher rejects only CONCURRENT activation — and without a clear somewhere the
+        # first run's root stayed in `_root_invokes` and was written into the second run's
+        # document. Doing it at teardown would close that leak and break a documented read:
+        # `get_trajectories` promises the documents can be read "after the scope ends", and with
+        # `output_path=None` (the default) that in-memory read is the only way to get them at
+        # all, so a post-scope call would return []. setup runs once per activation on BOTH
+        # paths (`with` and positional/local_hooks), so the second run still starts clean while
+        # the first run's documents survive its own scope. The clearing used to live in a public
+        # `reset()` with no caller anywhere.
+        self._invokes.clear()
+        self._root_invokes.clear()
+
     def teardown(self, exc: BaseException | None = None) -> None:
         """Write the output file when the hook's scope ends."""
         # teardown, NOT __exit__: it runs on BOTH activation paths — `with` (via the base
         # __exit__) and positional/local_hooks (called directly by _activate_local_hooks,
         # which never touches __exit__). The write used to live in a __exit__ override,
-        # so a positionally-passed ATIFTrace(output_path=...) silently never wrote its
+        # so a positionally-passed TrajectoryRecorder(output_path=...) silently never wrote its
         # file even though the docstring documents positional use.
         self._write_output()
-
-    def reset(self) -> None:
-        """Clear state for reuse."""
-        self._invokes.clear()
-        self._root_invokes.clear()
-
-
-#: Deprecated alias for the pre-rename spelling — see the rationale block in
-#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
-#: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_legacy_hook_names_still_importable``). Deep-path only: the old spelling predates
-#: this hook's promotion to ``jaz.hooks.__all__``, so it was never importable from a
-#: package namespace and gets no ``_DEMOTED`` entry there.
-ATIFTraceHook = ATIFTrace

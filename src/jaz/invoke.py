@@ -1,11 +1,10 @@
 import logging
-import multiprocessing
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from typing import overload
+from typing import get_origin, overload
 
 from ._agent import Agent
 from ._invoke_tool import InvokeTool, get_invoke_tool
@@ -28,15 +27,15 @@ from .hooks.context import (
     _set_hook_context,
     get_current_hooks,
 )
-from .instantiate import language_of
 from .repl.stdout_proxy import capturing as _stdout_capturing
 from .scope import _scope_var
 
 # `normalize_inputs` lowers any t-string INPUT VALUES (a Template passed as an input,
 # now that `task` is an ordinary input rather than a positional prompt — #538) into text
-# plus sibling bindings. Nothing in this module annotates against `Template` anymore, so
-# only the lowering helper is imported.
-from .templates import normalize_inputs
+# plus sibling bindings. `Template` itself is imported only for the positional-argument
+# guard below, which names a t-string prompt as such; on <3.14 it is that module's dummy
+# stand-in, against which `isinstance` is simply always False (no t-string can exist there).
+from .templates import Template, normalize_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +89,7 @@ def _activate_local_hooks(hooks: tuple[Hook, ...]) -> Iterator[None]:
     that propagates out of the invoke to teardown() so stateful hooks (e.g. tracing) see
     the same exception they would via __exit__.
 
-    Enforces the "one instance, one live scope" invariant (#533 / #540) before running
+    Enforces the "one instance, one live scope" invariant before running
     any setup(). A second activation that would run setup()/teardown() twice on one live
     instance raises ``HookActivationError`` (by identity, so distinct instances of the
     same class are fine):
@@ -107,6 +106,8 @@ def _activate_local_hooks(hooks: tuple[Hook, ...]) -> Iterator[None]:
     *propagating* set and passes the sub-invoke's own (disjoint) local hooks, so no
     instance lands in both.
     """
+    # The invariant and every route into it (with+with, with+local, a repeated instance in one
+    # call) are #533 / #540.
     current = get_current_hooks()
     propagating = current.hooks
     local_active = current.local_active
@@ -145,17 +146,29 @@ def _activate_local_hooks(hooks: tuple[Hook, ...]) -> Iterator[None]:
         # routing to reject the local-hooks channel (its ``setup()`` raises unless reached
         # through ``__enter__``); if this ever went through ``__enter__``, that rejection would
         # silently stop firing and the under-cap footgun would return. Keep it direct.
-        for hook in hooks:
-            hook.setup()
+        # Teardown covers the hooks whose `setup()` RETURNED, not the whole list, and the
+        # bookkeeping is what makes the difference: the setup loop is not inside the `try` whose
+        # `finally` tears down, so a `setup()` that raises used to skip teardown for every hook
+        # already started beside it. Reachable since a hook can refuse activation outright
+        # (`Hook.forbid_reactivation`) — `jaz.invoke(fresh, already_used, ...)` set up the first
+        # and then stranded it, leaving its file handle or span open for the process's life.
+        #
+        # The raiser itself is deliberately absent from `started`: a `setup()` that did not
+        # complete has nothing to undo, matching `with`, where a throwing `__enter__` means no
+        # `__exit__`.
+        started: list[Hook] = []
         exc: BaseException | None = None
         try:
+            for hook in hooks:
+                hook.setup()
+                started.append(hook)
             yield
         except BaseException as e:  # noqa: BLE001 - captured to forward to teardown, then re-raised
             exc = e
             raise
         finally:
             # Reverse order mirrors nested-context-manager teardown semantics.
-            for hook in reversed(hooks):
+            for hook in reversed(started):
                 try:
                     hook.teardown(exc)
                 except Exception:
@@ -163,6 +176,12 @@ def _activate_local_hooks(hooks: tuple[Hook, ...]) -> Iterator[None]:
                         "Local hook %s teardown failed", type(hook).__name__
                     )
     finally:
+        # A SECOND `finally`, wrapping the one above, rather than both jobs in one block. The
+        # teardown loop guards each hook with `except Exception`, which does not catch
+        # `BaseException` — a `KeyboardInterrupt` out of a `teardown` escapes the loop, and in a
+        # single `finally` the reset written after it would simply be skipped, leaking this
+        # invoke's `local_active` entry for the life of the process. Splitting them makes the
+        # token reset unconditional on anything teardown does.
         _reset_hook_context(token)
 
 
@@ -221,8 +240,11 @@ class _InvokeSetup:
     Does not carry ``return_type`` — it stays in the generic ``_invoke[ReturnT]`` /
     ``_ainvoke[ReturnT]`` callers so pyright can track ``ReturnT`` through to
     ``agent.invoke`` / ``agent.ainvoke``. (Return-value validation is no longer a
-    parameter at all: it flows through the ``ValidateReturn`` hook — #528.)
+    parameter at all: it flows through the ``ValidateReturn`` hook.)
     """
+
+    # Return validation moved onto the ValidateReturn hook in #528, which is why no validator
+    # parameter appears here.
 
     agent: Agent
     repl_depth: int
@@ -295,21 +317,16 @@ def _build_invoke_setup(
     scoped = {**(parent_scope or {}), **(_scope_var.get() or {})}
 
     if scoped:
-        # Process boundaries are forbidden for now: the bound `jaz` (and many
-        # scoped values — a live APIClient, a connection pool) don't survive the
-        # pickle into a child process, so scope would be either silently empty or
-        # a cryptic PicklingError. Refuse loudly instead of shipping that footgun.
-        # TODO(scope): support process boundaries via explicit serialization once
-        # there is a real use case and a serialization story.
-        # TODO(#475): config/hooks ride the same snapshot-and-bind path and may
-        # warrant analogous process-boundary guards for consistency.
-        if multiprocessing.current_process().name != "MainProcess":
-            raise RuntimeError(
-                "jaz.scope does not cross process boundaries: jaz.invoke() with an "
-                "active scope was called outside the main process (e.g. in a "
-                "multiprocessing / ProcessPoolExecutor worker). Set the scope "
-                "inside the worker, or thread the value explicitly as a kwarg."
-            )
+        # No process-boundary guard here. One used to raise whenever `current_process().name !=
+        # "MainProcess"`, and it could not see the case it named — under spawn the child's scope
+        # is empty, so this branch never runs — while firing on the remedy its own message
+        # prescribed: a worker that sets its own scope and invokes. What a child actually
+        # inherits, and why nothing is checked, is in `jaz.scope`'s module comment.
+        #
+        # TODO(scope): support process boundaries via explicit serialization once there is a real
+        # use case and a serialization story.
+        # TODO(#475): config/hooks ride the same snapshot-and-bind path and may warrant analogous
+        # process-boundary handling for consistency.
 
         # Conflict detection is loud, not silent: a value can't be both ambient
         # (via jaz.scope) and passed explicitly to this same invoke. Silent
@@ -362,10 +379,6 @@ def _build_invoke_setup(
     # Cost / LLM-calls budget tracking + enforcement lives in the opt-in BudgetPool
     # (jaz.hooks). jaz.invoke no longer creates a CostTracker.
 
-    # The single REPL language for this invocation, named by the registry rather than stored on
-    # the config: the config holds the configured REPL itself now.
-    agent_repl = language_of(config.repl)
-
     # The prehook a child of THIS invoke would run under: depth+1. The Prehook's
     # parent_repl_iteration is updated by Agent at each iteration. There is no framework
     # recursion cap to carry — the RecursionLimit hook (if installed) enforces one via
@@ -411,7 +424,6 @@ def _build_invoke_setup(
     local = tuple(local_hooks or ())
 
     agent = Agent(
-        repl=agent_repl,
         prehook=new_prehook,
         config=config,
         local_hooks=local,
@@ -433,7 +445,7 @@ def _build_invoke_setup(
 
 @contextmanager
 def _established_config_stack() -> Iterator[None]:
-    """Mark the propagating config stack "established" for this invoke's dynamic extent (#727).
+    """Mark the propagating config stack "established" for this invoke's dynamic extent.
 
     The agent-facing synthesized ``invoke`` (``get_invoke_tool``) re-bases the ancestor stack
     onto a raw worker thread by detecting an *unestablished* stack — the module-default stack a
@@ -444,6 +456,8 @@ def _established_config_stack() -> Iterator[None]:
     ConfigOverride`` stays established. No-op when already established (a nested same-thread invoke
     inherits the parent's established stack). Layers are unchanged; only the marker flips.
     """
+    # "Established" is the #727 stack model's marker for "this stack is the ancestor for a subtree",
+    # which is how a fresh worker thread tells a missing ContextVar from an empty one.
     stack = get_config_stack()
     if stack.established:
         yield
@@ -457,7 +471,7 @@ def _established_config_stack() -> Iterator[None]:
 
 @contextmanager
 def _established_hook_context() -> Iterator[None]:
-    """Mark the propagating hook context "established" for this invoke's dynamic extent (#727).
+    """Mark the propagating hook context "established" for this invoke's dynamic extent.
 
     Twin of ``_established_config_stack`` — the hook half of the same worker-detection mechanism.
     The agent-facing synthesized ``jaz.invoke`` re-bases the ancestor hook chain onto a raw worker
@@ -488,7 +502,7 @@ def _invoke(
 ) -> object:
     """Same as public ``invoke`` but with the prehook specified explicitly.
 
-    The return type is no longer a parameter (#568): it is declared by a positional
+    The return type is not a parameter: it is declared by a positional
     ``ReturnType(...)`` hook that dispatches on its own (prompt + type check), so ``agent`` /
     the REPL know nothing about it and this returns whatever the agent RETURNed as an untyped
     ``object``. The public ``invoke``'s typed overloads provide the static ``-> ReturnT``.
@@ -554,7 +568,7 @@ async def _ainvoke(
     parent_scope: dict[str, object] | None = None,
     inputs: dict[str, object],
 ) -> object:
-    """Async version of ``_invoke`` (see it: the return type is a ``ReturnType`` hook now, #568)."""
+    """Async version of ``_invoke`` (see it: the return type is a ``ReturnType`` hook)."""
     # See `_invoke`: lower any t-string input values into text + sibling bindings (#538).
     inputs = normalize_inputs(inputs)
     s = _build_invoke_setup(
@@ -653,33 +667,103 @@ def _extract_config_override(
     return (overrides[0] if overrides else None), tuple(hooks)
 
 
+def _non_hook_positional_message(arg: object) -> str:
+    """The ``TypeError`` text for a positional argument that is not a hook.
+
+    A hook/config class needs instantiation, a prompt (``str``/t-string) belongs in a
+    keyword input, a return type belongs in ``ReturnType(...)``, and data or tools are
+    also keyword inputs.
+    """
+    # Each message states the rule AND the corrected call, because the mistake is a mental
+    # model ("invoke takes a prompt") rather than a typo — a message that only said what is
+    # wrong would leave the user to guess `task=`, which is an ordinary input name, not a
+    # parameter they can find in the signature.
+    kind = type(arg).__name__
+    if isinstance(arg, (str, Template)):
+        # `task` is an example input name, not a required keyword. A t-string cannot be
+        # quoted back (its interpolations are already evaluated), so it gets a schematic form.
+        if isinstance(arg, str):
+            excerpt = arg if len(arg) <= 40 else arg[:37] + "..."
+            corrected = f"invoke(task={excerpt!r})"
+            if len(arg) > 40:
+                corrected += " (prompt truncated)"
+        else:
+            corrected = 'invoke(task=t"...")'
+        return (
+            f"invoke() got the prompt as a positional argument ({kind}). The prompt is an "
+            f"input, passed by keyword, e.g., {corrected}. invoke()'s positional arguments are "
+            "hooks and an optional ConfigOverride; every input — the prompt, data, tools — "
+            "is a keyword argument."
+        )
+    if isinstance(arg, type) and issubclass(arg, (Hook, ConfigOverride)):
+        shown = arg.__name__
+        # A per-depth override is invalid locally even after instantiation.
+        if issubclass(arg, ConfigOverrideByDepth):
+            return (
+                f"invoke() got the {shown} class rather than an instance. A per-depth "
+                f"override must propagate: use a `with {shown}(...):` block instead."
+            )
+        return (
+            f"invoke() got the {shown} class rather than an instance. Hooks and "
+            f"ConfigOverride are passed as instances, e.g., invoke({shown}(...), task=...)."
+        )
+    if isinstance(arg, type) or get_origin(arg) is not None:
+        shown = arg.__name__ if isinstance(arg, type) else repr(arg)
+        return (
+            f"invoke() got a type ({shown}) as a positional argument. A return type is "
+            f"declared with the ReturnType hook, e.g., invoke(ReturnType({shown}), task=...). "
+            "invoke()'s positional arguments are hooks and an optional ConfigOverride."
+        )
+    return (
+        f"invoke() got a positional argument of type {kind}, which is not a hook. Pass data "
+        f"and tools as keyword inputs, e.g., invoke(task=..., my_data=...). invoke()'s positional "
+        "arguments are hooks and an optional ConfigOverride."
+    )
+
+
 def _resolve_invoke_hooks(
     local_hooks: tuple[Hook, ...],
 ) -> list[Hook]:
     """Resolve the effective hook list for an invoke.
 
     Shared by ``invoke``, ``ainvoke``, and the agent-facing ``jaz.invoke`` closure.
-    ``ReturnType`` is **no longer special-cased**: as of #568 it is a genuine, self-contained
+    ``ReturnType`` is **not special-cased**: it is a genuine, self-contained
     hook (it renders the ``<return_type>`` prompt and enforces the return type via effects), so it
     stays in the hook list and dispatches like any other. ``invoke`` / ``agent`` / the REPL no
     longer know anything about return types.
 
     Return-value validation (``ValidateReturn``) and REPL-code validation (``ValidateREPLCode``)
     are ordinary positional hooks too. The ``return_validator=`` / ``repl_input_validator=``
-    keywords were removed (#528), and so was the config-level input validator
+    keywords do not exist, and neither does the config-level input validator
     (``jaz.configure(repl_input_validator=fn)`` + ``max_repl_input_validation_failures``): a
     propagating ``ValidateREPLCode`` context manager is the direct replacement, so this resolver
     no longer synthesizes any hook from config — it just guards and returns the hook list.
 
-    Guards against more than one ``ReturnType`` (an invoke has a single return type).
+    Guards against a positional argument that is not a hook (the prompt passed positionally
+    is the common one) and against more than one ``ReturnType`` (an invoke has a single
+    return type).
 
-    Semantic note (#568): omitting ``ReturnType`` entirely means **no return-type contract** — the
+    Semantic note: omitting ``ReturnType`` entirely means **no return-type contract** — the
     agent may ``return`` any value and it is returned as ``object``, unchecked. This is deliberately
-    *not* the same as ``ReturnType(None)``, which still enforces a ``None`` return. (Pre-#568 the
-    default ``return_type=None`` was threaded to the REPL, which rejected any non-``None`` return,
-    so the two were equivalent; now "no hook" means "no contract", consistent with every other
-    migrated #568 flag — a deliberate decision, not an oversight.)
+    *not* the same as ``ReturnType(None)``, which still enforces a ``None`` return.
     """
+    # The non-hook guard exists because #538's split — positional = hooks/ConfigOverride,
+    # keyword = inputs — makes `invoke("do the thing")` a *type* error that nothing caught:
+    # a stray positional stayed in the hook list all the way to `_activate_local_hooks`, which
+    # failed with `AttributeError: 'str' object has no attribute 'setup'` from inside a
+    # contextmanager, several frames from the call. That traceback names neither `invoke` nor
+    # the argument, and it is the first thing a new user meets, since `invoke("prompt")` is the
+    # shape every other agent library takes (and the shape an LLM writes from memory in its own
+    # REPL — this resolver guards the agent-facing `jaz.invoke` too, where the message is fed
+    # back as the observation it self-corrects from).
+    for hook in local_hooks:
+        if not isinstance(hook, Hook):
+            raise TypeError(_non_hook_positional_message(hook))
+    # #568 turned ReturnType into an ordinary hook; #528 removed the return_validator= /
+    # repl_input_validator= keywords and the config-level input validator. The "no hook means no
+    # contract" reading is deliberate, and consistent with every other migrated #568 flag:
+    # before #568 the default return_type=None was threaded to the REPL, which rejected any
+    # non-None return, making the two equivalent.
     if sum(isinstance(h, ReturnType) for h in local_hooks) > 1:
         raise TypeError(
             "invoke() got more than one ReturnType(...) hook; an invoke has a single "

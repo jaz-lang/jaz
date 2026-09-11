@@ -5,8 +5,8 @@ the ``_``-prefixed sibling so that this path *warns* instead of resolving silent
 :func:`jaz._warnings.make_private_module_shim`.
 
 ``LLMClient`` no longer exists under any name: it was merged with ``Provider`` into the single
-``BaseLLM`` class (:mod:`jaz.llm.llm`), whose public home is ``jaz.llm``. #984 tracks
-the seam's final public shape. Configure the backend by constructing it and passing it in —
+``BaseLLM`` class (:mod:`jaz.llm.llm`), whose public home is ``jaz.llm``. Configure the
+backend by constructing it and passing it in —
 ``jaz.configure(llm=LiteLLM(model=...))``.
 
 Internal code imports from ``jaz._llm_client`` directly; going through this shim warns.

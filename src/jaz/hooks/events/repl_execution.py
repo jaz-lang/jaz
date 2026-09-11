@@ -211,13 +211,16 @@ class REPLExecContext(ExecutionContext):
       edits above; the LLM-message twins are ``AddMessages`` / ``DropMessages``).
     - Record metrics
 
-    Inputs (:class:`AddInputs`/:class:`DropInputs`) are NOT here: they are :class:`InvokeEnter`-only (#481) — fixed
+    Inputs (:class:`AddInputs`/:class:`DropInputs`) are NOT here: they are :class:`InvokeEnter`-only — fixed
     at invoke start, before the prompt. The per-turn namespace analogues are :class:`AddVariables` /
     :class:`DropVariables` (per-turn: a hook may want a name re-added/re-dropped each turn; see their
     docstrings). ``dropped_variables`` is applied before ``added_variables``, so a name in both
     ends *added* — which is what makes the documented drop-then-add re-bind recipe work (see
     the ``AddVariables`` docstring for the ordering rationale).
     """
+
+    # The inputs/variables split is #481: inputs are per-invoke setup applied once before the
+    # prompt renders, so they belong at InvokeEnter rather than here.
 
     # Abort effects: the exceptions from Aborts (``abort_errors`` — ``span_repl_exec``
     # raises their combination; the span closes ``Aborted``). ``SupplyExecResult`` no longer
@@ -313,7 +316,7 @@ class REPLExecSpan:
         # InsertCode / DeleteCode edits are folded in (``apply_code_edits``). Set by
         # ``span_repl_exec`` before ``yield`` (== the enter code when no hook edits), and read by
         # the agent for ``repl.exec`` in place of the local code, so what runs is what
-        # ``REPLExecSend`` observers (e.g. ``ValidateREPLInput``) saw. Mirrors ``supplied`` — a
+        # ``REPLExecSend`` observers (e.g. ``ValidateREPLCode``) saw. Mirrors ``supplied`` — a
         # resolved value the CM computes and the agent consumes. ``""`` on a hand-built span until
         # the CM sets it.
         self.committed_code: str = ""

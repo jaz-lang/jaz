@@ -315,7 +315,6 @@ class WorkflowReplay(Hook):
                     # TODO: Parse reasoning more carefully
                     f.write(f"    # Iteration {iteration.iteration}\n")
 
-                # Get the code, possibly with RETURN replaced
                 code = iteration.code
 
                 # Handle different execution result types
@@ -337,8 +336,7 @@ class WorkflowReplay(Hook):
                         # Everything else — clean `Continue`, `Return`, and terminal
                         # `Raise` — is written as-is. Crucially, a terminal `Raise` is NOT
                         # swallowed (#710): writing it as-is lets the replay re-raise and
-                        # terminate where the original did. The `RETURN`/`RAISE` sentinels
-                        # in the code are lowered to `return`/`raise` at finalization.
+                        # terminate where the original did.
                         _write_indented(f, code, "    ")
 
     def _write_function_header(
@@ -421,15 +419,6 @@ class WorkflowReplay(Hook):
             import_lines.append("    _invoke_idx += 1")
             import_lines.append("    return fn")
             import_lines.append("")
-
-        # Lower the RETURN/RAISE REPL sentinels to real Python FIRST — both are invalid
-        # Python as-is and must go before the AST parse in _replace_invoke_calls (mirrors
-        # python_repl.py lowering both). Without the RAISE pass, a terminal `RAISE ...`
-        # iteration leaves a literal `RAISE ...` that fails ast.parse and silently aborts
-        # finalization for the invoke (#710). Crude str.replace (not `\bRAISE\b`) matches
-        # the existing RETURN handling.
-        current_content = current_content.replace("RETURN", "return")
-        current_content = current_content.replace("RAISE", "raise")
 
         # Replace jaz.invoke() calls in the function body if we have children
         if ctx.child_invocations:
@@ -539,7 +528,13 @@ class WorkflowReplay(Hook):
         try:
             tree = ast.parse(source_code)
         except SyntaxError:
-            # If parsing fails, return original code
+            # Returning the source unchanged aborts the invoke rewrite SILENTLY, and that is a
+            # nastier outcome than a crash: the "replay" keeps its literal `invoke(...)` calls
+            # and runs REAL sub-invokes instead of returning the recorded values. Same hazard
+            # the matcher below guards against, reached through a second door. It is reachable
+            # whenever this hook's own codegen emits an unparseable file — e.g. an invoke with a
+            # callable input, which `_write_function_header` annotates `: function` and
+            # `_generate_main_block` `repr()`s as `<function f at 0x...>`.
             return source_code
 
         # Transformer to replace sub-invoke calls
@@ -579,16 +574,44 @@ class WorkflowReplay(Hook):
                     # under-stripped a lone leading hook and forwarded any positional past index
                     # 2 — e.g. `invoke(H1(), H2(), H3(), task=...)` leaked `H3` into the replay.)
                     new_args: list[ast.expr] = []
-                    _CONTROL_KWARGS = {
-                        "return_type",
-                        "prompt",
-                        "task",
-                        "task_name",
-                        "config_override",
-                    }
-                    new_keywords = [
-                        kw for kw in node.keywords if kw.arg not in _CONTROL_KWARGS
-                    ]
+                    # Every keyword is forwarded. There used to be a `_CONTROL_KWARGS` set
+                    # stripping `return_type` / `prompt` / `task` / `task_name` /
+                    # `config_override`, encoding an `invoke()` signature that no longer exists:
+                    # `return_type=` went with #528, `config_override=` and `task_name` became
+                    # ordinary inputs (#546), and `task` was demoted to one in #538 — a commit
+                    # this file annotates three times elsewhere. It also disagreed with
+                    # `_write_function_header`, which builds the child's parameters FROM
+                    # `ctx.inputs` and therefore declares `task`, so a stripped call could not
+                    # satisfy the signature generated for it:
+                    #
+                    #     invoke(task="do the thing", n=5)
+                    #       -> _get_next_invoke_fn()(n=5)  against  def main_2(task, n)
+                    #       -> TypeError: missing 1 required positional argument: 'task'
+                    #
+                    # Keyword policy tracks TODAY's `invoke` signature only. That is why this
+                    # half has no legacy branch while the matcher above deliberately still
+                    # accepts legacy `jaz.invoke(...)`: the matcher reads a *file*, which a host
+                    # may have produced under any past namespace, whereas the call rewritten here
+                    # is code the CURRENT agent just wrote against the current signature. Do not
+                    # "restore" a control-keyword set for symmetry with the matcher.
+                    #
+                    # Known limitation — header/call agreement holds only for names the agent
+                    # PASSED. `ctx.inputs` is `{**event.scope, **inputs}` (see the InvokeEnter
+                    # comment), so a name the child INHERITED lands in the header with nothing in
+                    # the source call to forward, and the same TypeError returns from the other
+                    # side:
+                    #
+                    #     with jaz.scope(shared="S"):      # agent code: invoke(task='t', n=5)
+                    #       -> def main_2(shared, task, n)   called as   (task='t', n=5)
+                    #       -> TypeError: missing 1 required positional argument: 'shared'
+                    #
+                    # A t-string input is the second instance: `invoke(task=t"... {data}")` mints
+                    # `data` as a sibling input the source call never names. Neither is fixable
+                    # here — the call cannot forward a name its source never had — so any fix
+                    # belongs in `_write_function_header`, e.g. giving scope-derived parameters
+                    # defaults from their recorded values, which `_generate_main_block` already
+                    # `repr()`s.
+                    new_keywords = list(node.keywords)
 
                     # Create: _get_next_invoke_fn()
                     get_fn_call = ast.Call(
@@ -626,10 +649,3 @@ class WorkflowReplay(Hook):
 
         # Clear the contexts dict
         self.contexts.clear()
-
-
-#: Deprecated alias for the pre-rename spelling — see the rationale block in
-#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
-#: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_legacy_hook_names_still_importable``).
-WorkflowReplayHook = WorkflowReplay

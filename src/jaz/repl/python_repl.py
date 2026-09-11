@@ -5,7 +5,7 @@ import re
 import sys
 import threading
 import traceback
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 from io import StringIO
@@ -27,7 +27,7 @@ from jaz.inputs import resolve_inputs
 from jaz.string_utils import summarize_exception
 from jaz.template_loader import _jinja_env
 
-from ._ast_utils import parse_allowing_toplevel_return
+from ._ast_utils import parse_or_none
 from ._cookies import CookieJar
 from ._exec_guards import (
     REPLMemoryError,
@@ -42,11 +42,10 @@ from ._glob_allowlist import allows_everything
 from .base import BaseREPL, REPLState
 from .compiler import secure_compile
 from .permissions import REPLPermissionPolicy, build_allowed_builtins
-from .registry import register_repl
 from .types import Continue, ExecResult, Raise, Return
 
 # Default Jinja template for REPL help in system prompt (jaz/templates/).
-_DEFAULT_REPL_DESCRIPTION_TEMPLATE = "python_repl_description.jinja2"
+_DEFAULT_REPL_DESCRIPTION_TEMPLATE = "jaz/python_repl_description.jinja2"
 
 
 class TracebackVerbosity(StrEnum):
@@ -136,6 +135,19 @@ def _reraise_if_fatal(e: BaseException, timeout_owner: object) -> None:
 class PythonREPLConfig(TypedDict, total=False):
     """Configuration dictionary for PythonREPL."""
 
+    # The allow-lists are typed ``list[str] | tuple[str, ...]`` rather than ``list[str]``: this is
+    # a render/describe bag, and every consumer downstream (``secure_compile``,
+    # ``REPLPermissionPolicy``, ``allows_everything``, the Jinja template) already takes a
+    # ``Sequence``. Keeping it at ``list`` would have cost a defensive copy of each list per
+    # ``description`` read, since a configured REPL holds them as frozen tuples (#741).
+    #
+    # Not the plain ``Sequence[str]`` that would also express it: ``str`` IS a ``Sequence[str]``,
+    # so that spelling type-checks ``allowed_imports="math"`` and iterates it character by
+    # character. ``compile_allowlist`` and ``secure_open._compile_patterns`` both carry explicit
+    # runtime guards for exactly that mistake, which is the sign it is worth keeping the static
+    # check on a *sandbox* key. The union admits the tuples and the YAML-authored lists and
+    # nothing else.
+
     allow_raise: bool
     repl_description_template: str
     # Present for the same reason as ``allow_raise``: ``get_description`` renders the effective
@@ -146,8 +158,8 @@ class PythonREPLConfig(TypedDict, total=False):
     # Fail-closed file-access allowlists (gitignore globs, #804 follow-up). Anchors //=fs, ~/=home,
     # /=cwd, ./=cwd, bare=cwd; a slash anchors, a slash-less name recurses. Absent/[] denies all;
     # ["**"] = cwd subtree, ["//**"] = whole filesystem; reads/writes gated separately. No None.
-    allowed_read_paths: list[str]
-    allowed_write_paths: list[str]
+    allowed_read_paths: list[str] | tuple[str, ...]
+    allowed_write_paths: list[str] | tuple[str, ...]
     # Compiler sandbox (#688). Enforced at secure_compile on every exec. The import and file
     # allow-lists are also stated to the agent (get_description renders them into the system
     # prompt); the attribute allow-list is enforced silently — see the sandbox-policy comment in
@@ -158,10 +170,11 @@ class PythonREPLConfig(TypedDict, total=False):
     # sub-invokes. Keep the sandbox off the agent's reach if that matters.
     # Uniform gitignore-glob allow-lists (imports/attributes/files), no "unrestricted"/None state:
     # key absent → the secure default; []: deny all; [...]: allow-list; ["*"]: allow all.
-    allowed_imports: list[str]  # default [] (deny all); matched on the root module name
+    # default [] (deny all); matched on the root module name
+    allowed_imports: list[str] | tuple[str, ...]
     # default DEFAULT_ALLOWED_ATTRIBUTES: allow all attrs except double-underscore-PREFIXED names
     # and the frame-bearing interpreter surface (f_back/gi_frame/...); [] denies all.
-    allowed_attributes: list[str]
+    allowed_attributes: list[str] | tuple[str, ...]
     # for -R, suppress recursion (install RecursionLimit(max_depth=1) so the agent has no
     # recursive jaz.invoke)
     reject_finish_on_printed_output: (
@@ -390,7 +403,7 @@ DEFAULT_ALLOWED_WRITE_ATTRIBUTES: list[str] = [
 ]
 
 
-def _effective_allowed_attributes(config: PythonREPLConfig) -> list[str]:
+def _effective_allowed_attributes(config: PythonREPLConfig) -> Sequence[str]:
     """Attribute allow-list to enforce: the secure default (``DEFAULT_ALLOWED_ATTRIBUTES``) unless
     the host set the key explicitly. Returns a fresh list on the default path so a caller mutating
     the result can't corrupt the shared module-level default for later invokes."""
@@ -489,7 +502,7 @@ def _parse_timeout_pragma(src: str) -> float | None:
     return None
 
 
-def _effective_allowed_imports(config: PythonREPLConfig) -> list[str]:
+def _effective_allowed_imports(config: PythonREPLConfig) -> Sequence[str]:
     """Import allow-list to enforce, fail-closed by default. Absent key → the module default
     (``[]`` in production: deny ALL imports); an explicit value passes through. There is no
     ``None`` opt-out — ``["*"]`` is the explicit "allow all". Returns a fresh list on the default
@@ -540,7 +553,7 @@ _DEFAULT_ALLOWED_WRITE_PATHS: list[str] = []
 # allow-list mean something other than what it says.
 
 
-def _effective_allowed_read_paths(config: PythonREPLConfig) -> list[str]:
+def _effective_allowed_read_paths(config: PythonREPLConfig) -> Sequence[str]:
     """Read-path gitignore allowlist, fail-closed by default (absent key → deny all reads).
 
     Unlike ``_effective_allowed_imports`` there is no ``None`` opt-out: file access is a plain
@@ -552,7 +565,7 @@ def _effective_allowed_read_paths(config: PythonREPLConfig) -> list[str]:
     return config["allowed_read_paths"]
 
 
-def _effective_allowed_write_paths(config: PythonREPLConfig) -> list[str]:
+def _effective_allowed_write_paths(config: PythonREPLConfig) -> Sequence[str]:
     """Write-path gitignore allowlist, fail-closed by default (absent key → deny all writes).
     Same absent→module-default / explicit-passthrough rule as ``_effective_allowed_read_paths``.
     """
@@ -757,8 +770,7 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
       ``BaseException``-rooted signal a caller introduces). Using a cookie for ``Exception`` — rather
       than emitting the *name* ``Exception`` — makes it immune to the agent shadowing ``Exception``
       locally or mutating ``__builtins__['Exception']`` (a plain mutable dict) before the handler is
-      reached. This *replaces* the old ``reject_bare_except`` ban (#869): bare ``except:`` is made
-      safe instead of rejected.
+      reached. Bare ``except:`` is made safe rather than rejected.
 
     ``ast.TryStar`` (``try/except*``) gets an **abort guard only** (:meth:`visit_TryStar`). For
     ``_JazReturnSignal`` no guard is needed: ``except*`` cannot be bare (nothing for Defense B to
@@ -797,6 +809,9 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
     allowlisted ``Exception`` with no caller cooperation, which is why it is force-guarded rather
     than left to the builtins allowlist.
     """
+
+    # Defense B replaces #869's `reject_bare_except` ban: making a bare `except:` safe beats
+    # rejecting it, since the agent writes them naturally and a rejection costs a whole turn.
 
     def __init__(self, jar: CookieJar) -> None:
         self.jar = jar
@@ -864,7 +879,6 @@ class _ExceptGuardTransformer(ast.NodeTransformer):
         return node
 
 
-@register_repl("python")
 class PythonREPL(BaseREPL):
     """REPL implementation that enforces compile-time safety policies.
 
@@ -884,11 +898,51 @@ class PythonREPL(BaseREPL):
     # A configured REPL is a pure, reusable template — two invokes cannot bleed into each other
     # because there is no ``self`` for either to write to.
     allow_raise: bool
-    allowed_imports: list[str]
-    allowed_attributes: list[str]
 
-    # PythonREPL surfaces __history__ in its namespace (see base REPL).
-    maintains_repl_history = True
+    # The five sandbox allow-lists below are frozen tuples in private slots, read through
+    # setter-less properties (#741) — which is why they no longer carry a class-level annotation
+    # here beside ``allow_raise``. They are the sandbox boundary, and ``secure_compile`` re-reads
+    # them on EVERY exec, so a mutation takes effect immediately and for every invoke this REPL
+    # serves: one configured REPL is held per config, and a ``ConfigOverride`` that does not
+    # override ``repl`` shares that instance by reference with the base config (see
+    # ``Config._folded``). Both ways of widening it are therefore closed structurally rather than
+    # by convention — the tuple makes ``repl.allowed_imports.append("os")`` an ``AttributeError``
+    # (and item assignment a ``TypeError``), the missing setter makes
+    # ``repl.allowed_imports = [...]`` an ``AttributeError`` too. A getter returning a defensive
+    # copy of a list was rejected: it would turn widening a *sandbox* into a silent no-op, and it
+    # would allocate on the per-exec compile path. ``tuple(...)`` in ``__init__`` copies as well as
+    # freezes, which closes the older aliasing hole where an explicitly-passed allow-list was
+    # stored by reference (only the ``None``-default branch copied) and stayed writable through the
+    # caller's own name. Enforcement only iterates and tests membership, both of which a tuple
+    # serves.
+
+    @property
+    def allowed_imports(self) -> tuple[str, ...]:
+        """Module names the agent's code may import (``["*"]`` allows all) — read-only."""
+        return self._allowed_imports
+
+    @property
+    def allowed_attributes(self) -> tuple[str, ...]:
+        """Attribute-name patterns the agent's code may read — read-only."""
+        return self._allowed_attributes
+
+    @property
+    def allowed_write_attributes(self) -> tuple[str, ...]:
+        """Attribute-name patterns the agent's code may write — read-only.
+
+        Derived from ``allowed_attributes`` at construction, not a constructor parameter.
+        """
+        return self._allowed_write_attributes
+
+    @property
+    def allowed_read_paths(self) -> tuple[str, ...]:
+        """Glob patterns the agent's code may read files under — read-only."""
+        return self._allowed_read_paths
+
+    @property
+    def allowed_write_paths(self) -> tuple[str, ...]:
+        """Glob patterns the agent's code may write files under — read-only."""
+        return self._allowed_write_paths
 
     @property
     def description(self) -> str:
@@ -995,8 +1049,7 @@ class PythonREPL(BaseREPL):
     def _format_error(self, exception: BaseException, stdout: str = "") -> str:
         """Format an exception's full output (stdout + filtered traceback) for an
         ERROR result. The agent-facing summary is derived separately by each consumer
-        calling ``summarize_exception`` on the stored exception (#566 step C, #590
-        follow-up), so it isn't built here.
+        calling ``summarize_exception`` on the stored exception, so it isn't built here.
 
         How much of the traceback the agent sees is governed by
         ``self.traceback_verbosity`` (a :class:`TracebackVerbosity`); see that enum
@@ -1023,6 +1076,8 @@ class PythonREPL(BaseREPL):
         Returns:
             formatted_output: Full output including stdout and the filtered traceback.
         """
+        # Formatting from the stored exception rather than the live traceback is #566 step C;
+        # #590 is the follow-up that keeps the agent's view stable across the protocol seam.
         chain = self._exception_chain(exception)
         originals = [exc.__traceback__ for exc in chain]
         try:
@@ -1179,7 +1234,7 @@ class PythonREPL(BaseREPL):
         #
         # The payoff is that `declared_init_keys(PythonREPL)` is now the structural source of
         # truth for `repl.params`, exactly as it already is for an LLM backend — so
-        # `REGISTRY[tag].from_dict(params)` is real for REPLs too, with no per-field
+        # `<resolved class>.from_dict(params)` is real for REPLs too, with no per-field
         # special-casing. That row of the design doc's audit table read "no" because
         # `REPL.initialize` mixed an opaque `configs[lang]` bag with named runtime kwargs; the
         # split is what closes it. A configured REPL is a *recipe* (serializable); an
@@ -1228,33 +1283,33 @@ class PythonREPL(BaseREPL):
         # "not configured" and takes the module-level default — deny all imports, the secure
         # attribute set, deny all file access. There is no `None` opt-out: `["*"]` is the explicit
         # allow-all. The module constants are indirected (rather than inlined) so the test suite
-        # can relax them for tests that are not about the sandbox; a fresh list is taken so a
-        # caller mutating the result cannot corrupt the shared default for later invokes.
-        self.allowed_imports = (
-            list(_DEFAULT_ALLOWED_IMPORTS)
-            if allowed_imports is None
-            else allowed_imports
+        # can relax them for tests that are not about the sandbox.
+        #
+        # Stored as frozen tuples in private slots, read through the read-only properties on the
+        # class (#741 — the rationale is beside them).
+        self._allowed_imports: tuple[str, ...] = tuple(
+            _DEFAULT_ALLOWED_IMPORTS if allowed_imports is None else allowed_imports
         )
-        self.allowed_attributes = (
-            list(DEFAULT_ALLOWED_ATTRIBUTES)
+        self._allowed_attributes: tuple[str, ...] = tuple(
+            DEFAULT_ALLOWED_ATTRIBUTES
             if allowed_attributes is None
             else allowed_attributes
         )
         # Derived, not a constructor parameter: the read/write split exists to undo the *default's*
         # dunder re-admission on the write axis, so a host that states its own `allowed_attributes`
         # gets that one list on both axes rather than a silent subtraction it never asked for.
-        self.allowed_write_attributes = (
-            list(DEFAULT_ALLOWED_WRITE_ATTRIBUTES)
+        self._allowed_write_attributes: tuple[str, ...] = tuple(
+            DEFAULT_ALLOWED_WRITE_ATTRIBUTES
             if allowed_attributes is None
-            else self.allowed_attributes
+            else self._allowed_attributes
         )
-        self.allowed_read_paths = (
-            list(_DEFAULT_ALLOWED_READ_PATHS)
+        self._allowed_read_paths: tuple[str, ...] = tuple(
+            _DEFAULT_ALLOWED_READ_PATHS
             if allowed_read_paths is None
             else allowed_read_paths
         )
-        self.allowed_write_paths = (
-            list(_DEFAULT_ALLOWED_WRITE_PATHS)
+        self._allowed_write_paths: tuple[str, ...] = tuple(
+            _DEFAULT_ALLOWED_WRITE_PATHS
             if allowed_write_paths is None
             else allowed_write_paths
         )
@@ -1287,8 +1342,9 @@ class PythonREPL(BaseREPL):
 
         Takes only the *invoke-time* arguments — everything here belongs to one run rather than
         to the REPL's configuration, which was fixed at construction. Builds the namespace
-        (``__builtins__`` under this REPL's sandbox policy, ``__inputs__``, ``__history__``,
-        and a binding per input) on a copy, leaving the receiver a clean, reusable template.
+        (``__builtins__`` under this REPL's sandbox policy, ``__history__``, and a binding per
+        input) inside the returned state; the REPL itself is not touched, so one configured
+        instance serves every invoke.
 
         Arguments:
             inputs: The invoke's inputs, already payload-resolved (see ``jaz.inputs``).
@@ -1298,11 +1354,6 @@ class PythonREPL(BaseREPL):
             initial_repl_history: The list object the driver owns and surfaces as
                 ``__history__``, or None to start a fresh empty one.
         """
-        # This used to bind onto `self` and return it, which made the object single-use: calling
-        # it twice silently replaced the first run's namespace, library binding and session id.
-        # Tolerable while every caller constructed a fresh REPL per invoke — but it means a
-        # *configured* REPL cannot be held and reused, and holding one is exactly what a config
-        # that stores components has to do.
         permission_policy = REPLPermissionPolicy(
             allowed_read_paths=self.allowed_read_paths,
             allowed_write_paths=self.allowed_write_paths,
@@ -1351,20 +1402,27 @@ class PythonREPL(BaseREPL):
         # REPL never special-cases it. (Direct callers that pass raw wrappers should
         # resolve them first via resolve_inputs.)
 
-        # Initialize magic variables for accessing initialization info. The former
-        # `__task__` builtin is gone (#538): the prompt is now an ordinary input, so the
-        # agent reaches it as the corresponding input variable (conventionally `task`)
-        # via `__inputs__` / its direct binding, not a dedicated magic variable.
+        # No magic variables for initialization info. The former `__task__` builtin went in #538
+        # (the prompt is an ordinary input, reached as its own input variable, conventionally
+        # `task`), and the `__inputs__` snapshot follows it here: an input is reachable by its own
+        # name and nothing else.
         #
-        # Inputs are ALWAYS bound now (#568 removed the `expose_inputs_in_repl` flag): both the
-        # `__inputs__` snapshot and the direct input-name bindings (below) are created here. "Inputs
-        # off" is the evals `WithholdInputsFromREPL` hook, which drops those bindings (and
-        # `__inputs__`) via a DropVariables effect on the first turn — the inputs stay *passed to the
-        # invoke* (so they still render in the user prompt), they just aren't REPL variables. The
-        # prompt's closing sentence is switched to the withheld wording by a config-set
-        # `user_prompt_template` (paired with the hook), the same way history pairs with a
-        # config-set description.
-        allowed_builtins["__inputs__"] = inputs.copy()
+        # Why it went, rather than staying as a convenience: `__inputs__` was a SECOND path to every
+        # input value, which made "the agent cannot see input X" two removals rather than one. A hook
+        # that unbound the names but forgot the snapshot left the values readable as
+        # `__inputs__["x"]` while the prompt said they were withheld -- silently measuring the
+        # opposite of what it claimed. One binding per input has no such second door.
+        #
+        # It also lived in `allowed_builtins`, not the namespace, so it survived a namespace-level
+        # drop and could only be removed by a `DropVariables` that knew to name it -- a trap for any
+        # hook author who reasoned about the REPL namespace alone.
+        #
+        # Inputs are ALWAYS bound (#568 removed the `expose_inputs_in_repl` flag); the direct
+        # input-name bindings below are the whole surface. "Inputs off" is the evals
+        # `WithholdInputsFromREPL` hook dropping those bindings on the first turn -- the inputs stay
+        # *passed to the invoke* (so they still render in the user prompt), they just are not REPL
+        # variables. The prompt's closing sentence switches to the withheld wording via a config-set
+        # `user_prompt_template`, the same way history pairs with a config-set description.
 
         # __history__ is ALWAYS present in the REPL state and owned by the core agent loop
         # (the single writer of iteration entries) — the former `repl_history` on/off flag was
@@ -1378,7 +1436,7 @@ class PythonREPL(BaseREPL):
         # pass no list get an equivalent empty default here. See ``agent`` and
         # ``design/design_features/basics.md``.
         # An empty list is the whole initial history — there is no index-0 init snapshot (#568):
-        # the old ``REPLHistoryInit(inputs)`` duplicated ``__inputs__`` and leaked withheld inputs.
+        # the old ``REPLHistoryInit(inputs)`` duplicated the inputs and leaked withheld ones.
         allowed_builtins["__history__"] = (
             initial_repl_history if initial_repl_history is not None else []
         )
@@ -1397,13 +1455,14 @@ class PythonREPL(BaseREPL):
         # it would clobber the sandbox dict. Refuse it here too for a uniform guarantee.
         init_repl_state_locals.update(inputs)
 
-        # Return the per-invoke state as one object (#1058); the REPL itself is untouched. There is
-        # no ``copy.copy`` and no per-attribute rebinding: the whole "no mutable attribute is
-        # shared" hazard is gone because the REPL holds nothing per-invoke to share. The sandbox
-        # allow-lists live only on the config REPL and are read (never mutated) on every exec, so
-        # one configured REPL safely serves every invoke; the native-``raise`` tagging scratch is
-        # call-local per exec (``_new_raise_tagger``), not an attribute, so concurrent execs from
-        # sibling invokes on the shared template don't race on it.
+        # Return the per-invoke state as one object; the REPL itself is untouched, so there is no
+        # "which mutable attribute did we forget to copy" question to get wrong. The sandbox
+        # allow-lists live only on the config REPL as frozen tuples behind read-only properties
+        # (#741), so "read, never mutated, on every exec" is structural rather than a property of
+        # the current call sites, and one configured REPL safely serves every invoke. The
+        # native-``raise`` tagging scratch is call-local per exec (``_new_raise_tagger``), not an
+        # attribute, so concurrent execs from sibling invokes on the shared template don't race
+        # on it.
         return REPLState(
             repl_state_locals=init_repl_state_locals,
             invoke_tool=invoke_tool,
@@ -1420,8 +1479,8 @@ class PythonREPL(BaseREPL):
         injected `Library` binds its root module, not the `Library` wrapper. Both the
         initialize-time and hook-injected binding paths route through that one primitive.
 
-        Updates repl_state_locals directly. Does NOT update __inputs__ magic
-        variable as per design decision - that remains a snapshot of initialization.
+        Updates repl_state_locals directly. There is no inputs snapshot to keep in sync: an input
+        is reachable only by its own name.
 
         Args:
             inputs: Dictionary of variable name -> value to add
@@ -1444,8 +1503,8 @@ class PythonREPL(BaseREPL):
 
         ``__builtins__`` is refused (it holds the compiler sandbox) — composition
         raises ``SandboxKeyError`` on it via the shared conflict-error rule, so
-        it never reaches here through the effect path; this skip is a defensive backstop. Does NOT
-        update the ``__inputs__`` snapshot (same as ``add_inputs``).
+        it never reaches here through the effect path; this skip is a defensive backstop. Binds the
+        name and nothing else: there is no inputs snapshot to mirror (same as ``add_inputs``).
 
         Overwriting a name that is **already bound** in the REPL namespace (a top-level input, the
         agent's own variable, or a prior binding) raises ``REPLInputConflictError`` rather than
@@ -1487,7 +1546,7 @@ class PythonREPL(BaseREPL):
         (the exec locals/globals) then ``__builtins__``. So to make a name *genuinely*
         undefined we ``pop`` it from **both** — invoke inputs live at the top level
         (``init_repl_state_locals.update(inputs)``), while framework magics like
-        ``__history__`` / ``__inputs__`` live inside ``__builtins__``.
+        ``__history__`` live inside ``__builtins__``.
 
         Dropping a name that is **not bound** raises ``MissingDropTargetError`` — a drop of an
         absent name is a hook bug (a typo, or a "re-drop every turn" pattern that should be
@@ -1584,10 +1643,10 @@ class PythonREPL(BaseREPL):
         carries the return-signal / tag-raise / exception references as co_consts cookies (seeded
         here, where all three are in scope); :func:`secure_compile` substitutes them into the
         compiled code object. ``tag_raise`` is the caller's per-exec tagger (see
-        ``_new_raise_tagger``). Parsing — including the module-level-``return`` tolerance and the
-        (defensive) def-wrap fallback — is delegated to :func:`parse_allowing_toplevel_return`.
+        ``_new_raise_tagger``). Parsing is delegated to :func:`parse_or_none`, which hands back
+        ``None`` on a syntax error so ``_handle_syntax_error`` can position it.
         """
-        tree = parse_allowing_toplevel_return(src)
+        tree = parse_or_none(src)
         if tree is None:
             return None
         jar = CookieJar()
@@ -1681,11 +1740,7 @@ class PythonREPL(BaseREPL):
         if self.reject_finish_on_printed_output and string_io.getvalue():
             error = RuntimeError(
                 "Your `return` statement was not executed because your code produced "
-                "printed output. Please review the output below. If you are "
-                "confident and wish to finish, re-run only the `return` statement.\n"
-                "⚠️ You cannot continue working in any way on this task after "
-                "returning, so make sure you are confident with your work before "
-                "returning."
+                "printed output. Do not write a `return` statement after printing."
             )
             formatted_output = self._format_error(error, string_io.getvalue())
             return Continue(
@@ -1710,12 +1765,11 @@ class PythonREPL(BaseREPL):
         never a finish. Tagging a non-exception is harmless — ``raise`` then fails with Python's
         own ``TypeError``, which (being untagged) surfaces as a recoverable error.
         """
-        # Call-local, NOT on ``self``: one config REPL is shared across every invoke at a depth
-        # (#1058 — there is no per-invoke copy anymore), so a single shared list would be raced by
-        # concurrent execs from sibling invokes (e.g. ``asyncio.gather`` over multiple ``ainvoke``
-        # under one config) — one exec's reset would wipe another's tag and misclassify its
-        # finishing ``raise`` as a recoverable ``Continue``. Per-exec scratch keeps the template
-        # holding no exec state.
+        # Call-local, NOT on ``self``: one config REPL is shared across every invoke at a depth,
+        # so a single shared list would be raced by concurrent execs from sibling invokes (e.g.
+        # ``asyncio.gather`` over multiple ``ainvoke`` under one config) — one exec's reset would
+        # wipe another's tag and misclassify its finishing ``raise`` as a recoverable
+        # ``Continue``. Per-exec scratch keeps the template holding no exec state.
         tagged: list[BaseException] = []
 
         def tag_raise(exception: object) -> object:
@@ -1741,11 +1795,8 @@ class PythonREPL(BaseREPL):
         # Continue and the agent must re-run only the ``raise`` statement.
         if self.reject_finish_on_printed_output and string_io.getvalue():
             error = RuntimeError(
-                "Your `raise` statement did not finish the task because your code produced "
-                "printed output. Please review the output below. If you are "
-                "confident and wish to finish, re-run only the `raise` statement.\n"
-                "⚠️ You cannot continue working in any way on this task afterwards, "
-                "so make sure you are confident with your work before finishing."
+                "Your `raise` statement was not executed because your code produced "
+                "printed output. Do not write a `raise` statement after printing."
             )
             formatted_output = self._format_error(error, string_io.getvalue())
             return Continue(
@@ -1866,10 +1917,11 @@ class PythonREPL(BaseREPL):
     ) -> ExecResult[Any]:
         """Async exec: compiles with top-level-await enabled and runs the code as a
         coroutine, so the agent can ``await`` (e.g. ``x = await ainvoke()`` then native
-        ``return x``) - #567. Dispatched from ``aexec`` (which owns the shared timeout
+        ``return x``). Dispatched from ``aexec`` (which owns the shared timeout
         setup). The whole submission runs on the async path; there is no separate command
         syntax to route synchronously.
         """
+        # The async exec path is #567.
         tagged, tag_raise = self._new_raise_tagger()
         filename = self._repl_filename(state, code_id)
         compiled = self._compile_native(

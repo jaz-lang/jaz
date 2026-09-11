@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaz-lang"
-version = "0.2.0a3"
+version = "0.2.0a4"
 description = "JAZ: The language of building and optimizing LLM-agents"
 authors = [
     { name = "Zhening Li", email = "zli11010@mit.edu" },
@@ -37,6 +37,9 @@ tracing = [
 ]
 tokens = [
     "transformers>=4.44",
+]
+copilot = [
+    "github-copilot-sdk>=1.0.11",
 ]
 
 [project.urls]

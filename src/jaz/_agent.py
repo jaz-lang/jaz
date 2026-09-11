@@ -39,7 +39,6 @@ from .provenance import (
     to_wire_messages,
 )
 from .repl.base import BaseREPL, REPLState
-from .repl.registry import REPL_LANGUAGE_MAP
 from .repl.types import (
     Continue,
     ExecResult,
@@ -54,7 +53,7 @@ class REPLIterationResult[ReturnT](NamedTuple):
 
     Attributes:
         exec_result: The execution result from the REPL
-        state: The per-invoke :class:`REPLState` threaded across iterations (#1058); the REPL
+        state: The per-invoke :class:`REPLState` threaded across iterations; the REPL
             itself is stateless config, so it is not carried here.
         response_content: The LLM response content. Never None: the no-response cases
             that used to produce one (a failed LLM call, an ``Abort`` at ``LLMQueryEnter``)
@@ -73,7 +72,6 @@ class REPLIterationResult[ReturnT](NamedTuple):
 class Agent:
     def __init__(
         self,
-        repl: str,
         prehook: "Prehook | None" = None,
         *,
         config: Config,
@@ -81,36 +79,34 @@ class Agent:
     ) -> None:
         """Construct an agent. ``config`` is REQUIRED — there is no ambient fallback.
 
-        **Why required (#826 §3, executive call).** ``config`` used to default to ``None`` and fall
-        back to reading the ambient config, which was the last depth-less ``get_config()`` read left
-        in the codebase — the read shape #826 set out to retire, because it silently diverges from
-        the config an invoke actually ran under whenever a per-depth override is in scope. Two other
-        resolutions were considered and rejected:
-
-        - *Resolve the fallback at depth 1* (treat a bare Agent as a top-level agent). Rejected: an
-          Agent has no recursion depth. It carries an optional ``prehook`` and is just an object a
-          caller can drive at any level, so "depth 1" is an invented fact — and inventing it widens
-          ``configure_by_depth({1: ...})`` to silently reach Agents that are not top-level invokes.
-        - *Keep the fallback depth-less* and document it as the one legitimate ambient read.
-          Rejected: honest about the semantics (no depth ⇒ no per-depth layer applies), but it
-          leaves an implicit ambient read on a public constructor for no ergonomic gain.
-
-        Requiring the argument resolves the tension instead of picking a side of it: the caller
-        decides, so no depth has to be invented and no ambient read remains in this path. The
-        framework never relied on the fallback anyway — ``_build_invoke_setup`` has always passed
-        the depth-resolved ``config`` explicitly (it is the only in-tree construction site), so this
-        is unreachable-in-practice surface, not a capability being taken away.
-
-        **Compatibility.** This is a breaking change to the public ``jaz.Agent`` signature; direct
-        construction was exported but never documented (no example in README/docs/design). Callers
-        that want the old behavior pass ``config=jaz.get_config()`` explicitly — which now says at
-        the call site that an ambient, depth-less config is what they meant.
-
-        Keyword-only (rather than reordered ahead of ``prehook``) so existing positional
-        ``Agent(repl, prehook)`` calls keep working; only the implicit config default is removed.
+        The REPL, LLM and protocol all come off ``config``; there is nothing else to pass.
+        To run against the process-wide configuration, pass it at the call site:
+        ``Agent(config=jaz.get_config())``. That read is *depth-less*, so it differs from the
+        config an invoke runs under whenever a per-depth override is in scope.
         """
-        if not repl:
-            raise ValueError("A REPL language must be specified")
+        # Requiring `config` is #826 §3 (executive call): the `None`-defaulting shape silently read a
+        # different config than the caller's, and it was the read shape #826 set out to retire — it
+        # was the last depth-less `get_config()` read in the codebase. Two other resolutions were
+        # considered and rejected:
+        #
+        #   - *Resolve the fallback at depth 1* (treat a bare Agent as a top-level agent). Rejected:
+        #     an Agent has no recursion depth. It carries an optional `prehook` and is just an
+        #     object a caller can drive at any level, so "depth 1" is an invented fact — and
+        #     inventing it widens `configure_by_depth({1: ...})` to silently reach Agents that are
+        #     not top-level invokes.
+        #   - *Keep the fallback depth-less* and document it as the one legitimate ambient read.
+        #     Rejected: honest about the semantics (no depth => no per-depth layer applies), but it
+        #     leaves an implicit ambient read on a public constructor for no ergonomic gain.
+        #
+        # Requiring the argument resolves the tension instead of picking a side of it: the caller
+        # decides, so no depth has to be invented and no ambient read remains in this path. The
+        # framework never relied on the fallback anyway — `_build_invoke_setup` has always passed
+        # the depth-resolved `config` explicitly (it is the only in-tree construction site), so this
+        # was unreachable-in-practice surface, not a capability taken away. It is nonetheless a
+        # breaking change to the public `jaz.Agent` signature; direct construction was exported but
+        # never documented (no example in README/docs/design).
+        #
+        # `config` is keyword-only; `prehook` is the first positional.
         self.config = config
         # The components come straight off the config — there is nothing left to build here.
         # This used to be three resolution blocks (a tag-or-instance branch for the backend, the
@@ -118,9 +114,11 @@ class Agent:
         # `{tag, params}` description into an object and each able to fail at `Agent.__init__`
         # for a config error written much earlier. Config now holds the configured components,
         # so a bad one raised at the `configure`/`ConfigOverride` call site that wrote it.
-        if repl not in REPL_LANGUAGE_MAP:
-            raise ValueError(f"Unsupported REPL language: {repl}")
-        self.repl_language: str = repl
+        # There is no `repl` parameter to reconcile with `config.repl` any more. It used to take
+        # a language STRING, checked here against the configured REPL's declared name — a check
+        # that existed only because the same fact was expressed twice. `invoke` derived the string
+        # from `config.repl` in the first place, so the disagreement it policed was one the caller
+        # had to construct deliberately.
         # The configured REPL is a stateless *template*: `initialize` returns a fresh `REPLState`
         # per invoke and the template holds no per-invoke state, so one config safely serves many
         # concurrent invokes (#1056, #1058).
@@ -211,7 +209,7 @@ class Agent:
         # falls back to them for every kwarg left `None`.
         #
         # This used to forward `retry_*` out of `llm.params` as per-call overrides, but only for
-        # an instance tag: a tag-built client got them through `create_llm`, while a pre-built
+        # an instance tag: a tag-built client got them through the config boundary, while a pre-built
         # one never went through it, so the config keys would otherwise have been silently
         # ignored for instance tags. With the configured backend itself in the config there is
         # no second place for a retry setting to live, so there is nothing to reconcile.
@@ -373,7 +371,7 @@ class Agent:
         ``messages`` is the loop's real buffer, and the edit indices anchor to exactly it:
         prompt additions now flow through the message-edit fold rather than being baked into
         a longer query snapshot ahead of it (``AddInstructionPrompt`` was removed in favour
-        of ``AddMessages`` — #660), so the query snapshot coincides with the buffer and no
+        of ``AddMessages``), so the query snapshot coincides with the buffer and no
         trailing transient instruction has to be stripped. Fold the persistent subset over
         the buffer. A no-op unless a hook emitted a persistent ``DropMessages`` /
         ``AddMessages`` (context compaction).
@@ -383,6 +381,8 @@ class Agent:
         put a non-serializable provenance value into ``AddMessages.messages`` before the
         fold's ``json.dumps`` sort-key computation runs over it.
         """
+        # Persistent edits are applied against the buffer, not the query snapshot, so the two coincide
+        # for the next query — the invariant #660 established for `AddMessages`.
         edits = self._pending_message_edits
         if edits is None or not edits.has_persistent:
             return
@@ -527,7 +527,7 @@ class Agent:
         # a synthesized one on the mock path), so a protocol can read ``.content is None`` /
         # ``.raw_response`` (refusal / finish_reason / tool_calls) rather than a coerced string.
         code, exec_timeout_override = self.protocol.parse(
-            self._llm_response_to_record(response_content), self.repl_language
+            self._llm_response_to_record(response_content)
         )
 
         enter_event = REPLExecEnter(
@@ -545,7 +545,7 @@ class Agent:
         code: str,
         state: REPLState,
         response_content: str,
-        repl_history: list[object] | None,
+        repl_history: list[object],
     ) -> REPLIterationResult[Any]:
         """Apply exit-time overrides and append the iteration's history entry.
 
@@ -553,10 +553,12 @@ class Agent:
         Complete-time ModifyExecResult / Abort; the core loop is the single writer
         of ``__history__`` and appends one entry per iteration from that FINAL
         (post-override) result — so a result-override hook (e.g. BudgetForcing) is
-        reflected in history without the REPL knowing (#448), and an enter-time override
+        reflected in history without the REPL knowing, and an enter-time override
         that skipped exec() still records an entry. ``repl_history`` is the same list the
-        REPL surfaced as ``__history__`` (by reference); None means no history.
+        REPL surfaced as ``__history__`` (by reference).
         """
+        # History must not record a REPL result the REPL never saw (#448), which is why the exit-time
+        # and enter-time override paths are kept distinct here.
         exec_result = span.get_final_exec_result()
         self._record_history(
             repl_history,
@@ -598,7 +600,7 @@ class Agent:
 
     def _record_history(
         self,
-        repl_history: list[object] | None,
+        repl_history: list[object],
         llm_response: LLMResponse,
         exec_result: ExecResult,
     ) -> None:
@@ -614,8 +616,9 @@ class Agent:
 
         ``llm_response`` (resolved by :meth:`_llm_response_to_record`) is the whole ``LLMResponse``,
         not the bare content string, so the configurable ``self.protocol.build_history_entry`` seam
-        can record a richer entry (#566).
+        can record a richer entry.
         """
+        # The ``build_history_entry`` seam is #566's.
         # Every turn that reaches here records an entry, so ``__history__`` holds exactly one per
         # iteration (#719), and no guard is needed to say so: ``response_content`` is a ``str`` by
         # the time it reaches ``_llm_response_to_record``, so that always returns an object. An
@@ -627,12 +630,9 @@ class Agent:
         # nothing addresses history *by iteration number*, and anything naming the current turn's
         # entry uses ``[-1]``, which holds without it. This append runs inside
         # ``_finalize_iteration``, before the turn's observation is rendered, so ``[-1]`` is that
-        # turn — hence ``repl_output_truncation_advice.jinja2``.
-        #
-        # The remaining guard means history is disabled for this REPL, not that there was nothing
-        # to record.
-        if repl_history is None:
-            return
+        # turn — the property the deleted truncation-advice templates relied on when they pointed
+        # the agent at ``__history__[-1].repl_output``, and that any host template restating that
+        # pointer still relies on.
         repl_history.append(
             self.protocol.build_history_entry(llm_response, exec_result)
         )
@@ -645,7 +645,7 @@ class Agent:
         messages: list[MessageDict],
         state: REPLState,
         invoke_id: str,
-        repl_history: list[object] | None = None,
+        repl_history: list[object],
     ) -> REPLIterationResult[Any]:
         # TODO: Fix static types
         # The query snapshot is the buffer itself — prompt additions arrive as message
@@ -736,19 +736,20 @@ class Agent:
         """Render the REPL observation via the protocol and append it to ``messages``.
 
         ``render_observation`` returns the observation as one or more ready messages, which
-        append verbatim — persisted history stays pure protocol output, with no per-turn
-        footer folded in. (#634 removed the budget-status / "enter your next REPL input"
-        footer: the next-input nudge is unneeded scaffolding for the models JAZ targets, and
+        append verbatim — persisted history stays pure protocol output, with no per-turn footer
+        folded in. (The next-input nudge is unneeded scaffolding for the models JAZ targets, and
         persisting it froze a stale invoke-call count into every turn. The invoke-call budget
-        could return as a transient per-query addition — see #657.) Each appended message is
-        stamped with OBSERVATION provenance.
+        could return as a transient per-query addition.) Each appended message is stamped with
+        OBSERVATION provenance.
         """
+        # #634 removed the budget-status / "enter your next REPL input" footer from every observation;
+        # #657 tracks re-surfacing the budget half as a transient per-query addition.
         new_messages: list[MessageDict] = list(
             self.protocol.render_observation(exec_result, iteration)
         )
         for message in new_messages:
-            # Stamp each observation message so consumers (ATIFTrace,
-            # SlidingWindow, …) can identify it by provenance. #566 step C moved the
+            # Stamp each observation message so consumers (TrajectoryRecorder, a
+            # context-management hook, …) can identify it by provenance. #566 step C moved the
             # append into this helper (render_observation now returns ready messages), so
             # the OBSERVATION stamp moved here with it.
             set_provenance(
@@ -964,21 +965,16 @@ class Agent:
 
             # Get REPL configs from Config
 
-            # __history__ is owned by the core agent loop (the single writer): when
-            # the REPL maintains history, build the full list here (index-0 init snapshot
-            # included, using core-resolved inputs), pass it into initialize() (the REPL
-            # surfaces it by reference), and retain the reference to append iteration
-            # entries in the loop. A REPL that declares no history support is skipped via
-            # the maintains_repl_history capability flag.
-            repl_history: list[object] | None = (
-                # Empty list = the whole initial history (no index-0 init snapshot, #568). The core
-                # loop is the single writer; the REPL surfaces this list as __history__ by ref.
-                []
-                # __history__ is always maintained now (#568 removed the repl_history
-                # flag); only a REPL with maintains_repl_history=False gets None.
-                if type(self.repl_template).maintains_repl_history
-                else None
-            )
+            # __history__ is owned by the core agent loop (the single writer): build the list
+            # here, pass it into initialize() (the REPL surfaces it by reference), and retain the
+            # reference to append iteration entries in the loop. Unconditional, for every REPL —
+            # whether the name is *reachable* from agent code is the REPL's business (one that
+            # cannot bind it ignores the argument) and whether the prompt names it is the
+            # template's, so neither is core's to decide. `do_one_repl_iteration` takes the list
+            # as a REQUIRED argument for the same reason: an optional one that silently dropped
+            # every entry was a contract nothing exercised. Empty list = the whole initial
+            # history — no index-0 init snapshot (#568).
+            repl_history: list[object] = []
             # Build the REPL state and the opening prompt only when no result was supplied at
             # Send: a SupplyInvokeResult short-circuits the whole invoke, and `initialize` resolves
             # the invoke's inputs (possibly with I/O) while `render_initial_message_list` can run
@@ -1005,7 +1001,6 @@ class Agent:
                     invoke_tool=effective_invoke_tool,
                     depth=depth,
                     recursion_available=can_recurse,
-                    repl_language=self.repl_language,
                     input_display_overrides=None,
                 )
                 # A custom BaseProtocol must return a non-empty opener. Guard it loudly
@@ -1060,7 +1055,7 @@ class Agent:
             # iteration number, and the heaviest consumers (the oolong/stulife history-search
             # prompts) scan ``prev_repl_history + __history__[:-1]``, a concatenation across
             # agent boundaries whose positions cannot correspond to this agent's turns under any
-            # base. The truncation advice still says ``[-1]`` for that reason.
+            # base. ``_REPL_HISTORY_DESCRIPTION`` says ``[-1]`` for that reason.
             #
             # Watch for falsiness when adding a consumer: iteration 0 is falsy, so ``if iteration:``
             # silently means "not the first turn". Use ``is not None``.
@@ -1187,7 +1182,7 @@ class Agent:
         messages: list[MessageDict],
         state: REPLState,
         invoke_id: str,
-        repl_history: list[object] | None = None,
+        repl_history: list[object],
     ) -> REPLIterationResult[Any]:
         # Mirrors do_one_repl_iteration exactly except for the two awaited steps — the
         # LLM query above and repl.aexec below. Everything else is the shared
@@ -1311,15 +1306,7 @@ class Agent:
             session_id = uuid.uuid4().hex[:8]
 
             # Single-writer __history__ ownership (see the sync invoke()).
-            repl_history: list[object] | None = (
-                # Empty list = the whole initial history (no index-0 init snapshot, #568). The core
-                # loop is the single writer; the REPL surfaces this list as __history__ by ref.
-                []
-                # __history__ is always maintained now (#568 removed the repl_history
-                # flag); only a REPL with maintains_repl_history=False gets None.
-                if type(self.repl_template).maintains_repl_history
-                else None
-            )
+            repl_history: list[object] = []
             # Build the REPL state and the opening prompt only when no result was supplied at Send
             # (the sync path documents why); they stay None for a supplied invoke, which the loop
             # below short-circuits before reading either.
@@ -1346,7 +1333,6 @@ class Agent:
                     invoke_tool=effective_invoke_tool,
                     depth=depth,
                     recursion_available=can_recurse,
-                    repl_language=self.repl_language,
                     input_display_overrides=None,
                 )
                 # A custom BaseProtocol must return a non-empty opener. Guard it loudly

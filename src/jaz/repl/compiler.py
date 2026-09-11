@@ -179,8 +179,8 @@ class ImportPolicyChecker(ast.NodeVisitor):
     **name** can't false-positive on any ``.import_module()`` (that is an ``ast.Attribute``, not an
     ``ast.Name`` load).
 
-    Why static-reject the name rather than lean solely on the runtime ``make_secure_import`` wrapper
-    (#470): the wrapper fires only when an import *executes*, so a function that closes over
+    Why static-reject the name rather than lean solely on the runtime ``make_secure_import``
+    wrapper: the wrapper fires only when an import *executes*, so a function that closes over
     ``__builtins__["__import__"]("time")`` can be **defined and returned** from an invoke without
     ever tripping it — the forbidden-intent object escapes the sandbox as a first-class value and
     only fails when the *caller* runs it. Rejecting the name at *definition* time closes that
@@ -203,7 +203,7 @@ class ImportPolicyChecker(ast.NodeVisitor):
       * ``vars()["__builtins__"][...]`` — no-arg ``vars()`` returns the caller namespace unpoliced
         (``vars(obj)`` *is* policed by the secure wrapper).
       * frame/generator introspection — ``(x for x in []).gi_frame.f_builtins["__import__"]("x")``.
-        Closed by the shipped default since #827: ``gi_frame``/``f_builtins``/``f_globals`` are
+        Closed by the shipped default: ``gi_frame``/``f_builtins``/``f_globals`` are
         non-dunder and so were allowed by the bare ``["*", "!__*"]``, but
         ``DEFAULT_ALLOWED_ATTRIBUTES`` now denies them by name, and the computed-name route
         (``getattr(gen, "gi_" + "frame")``) is refused by the runtime backstop. Reopens if a host
@@ -225,6 +225,10 @@ class ImportPolicyChecker(ast.NodeVisitor):
     only reachable when a host allow-lists ``importlib``, itself an escape hatch); under a permissive
     allow-list a host needing a computed dynamic import can still reach it that way.
     """
+
+    # The static/runtime split is #470's defence-in-depth: this checker sees statements at compile
+    # time, the policy-bound ``__import__`` wrapper catches executed imports. The frame-surface
+    # closure named above is the shipped default from #827.
 
     def __init__(self, allowed_imports: Sequence[str]) -> None:
         self._spec = compile_allowlist(allowed_imports)
@@ -338,7 +342,7 @@ def secure_compile(
     ``allow_top_level_await`` adds ``PyCF_ALLOW_TOP_LEVEL_AWAIT`` to the final compile so
     a top-level ``await`` is legal (the code object gains ``CO_COROUTINE``) — the async
     ``aexec``/``aeval`` path. The flag only affects the final ``compile()``; the *same*
-    policy-validated AST is compiled, so every restriction still holds. See #567.
+    policy-validated AST is compiled, so every restriction still holds.
 
     ``cookie_jar`` (passed by the REPL, ``None`` for direct non-agent callers) carries the
     return-signal / tag-raise / exception references the REPL's transforms embedded as co_consts
@@ -358,6 +362,8 @@ def secure_compile(
     separately from reads; ``None`` (the default) applies ``allowed_attributes`` to both, so a
     caller that does not care about the distinction sees no change.
     """
+    # The async path compiles through here too (#567): the flag only changes what the compiler
+    # accepts, and the same policy-validated AST is compiled either way.
     # Keyword-only past ``src``. The dropped ``code_id`` used to sit at position 2, so a stale
     # positional caller would otherwise bind its id string to ``filename`` — which feeds
     # ``ast.parse``, the ``linecache`` key, and ``compile()``, so the damage is a wrong filename

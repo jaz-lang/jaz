@@ -65,9 +65,9 @@ _PARAM_MAPPING = {
 # Dormant for v1: LiteLLM is the sole registered backend
 # (design/design_features/litellm_sole_backend_v1.md, #1082). This class stays in-tree and
 # importable — `AnthropicLLM(...)` still works if constructed directly — but carries no
-# `@register_llm` tag, so `backend: anthropic` no longer resolves; reach Anthropic via
+# entry in any consumer's tag map, so `backend: anthropic` names nothing; reach Anthropic via
 # `anthropic/…` on the litellm backend. Revive the built-in (for the deferred lean-core split) by
-# restoring the `@register_llm("anthropic")` decorator (the class stays exported from
+# adding it to the eval harness's / console's tag map (the class stays exported from
 # `llm/__init__.py`).
 class AnthropicLLM(BaseLLM):
     """The Anthropic messages backend.
@@ -103,6 +103,66 @@ class AnthropicLLM(BaseLLM):
         ).rstrip("/")
         self.timeout = timeout
 
+    def _build_payload(
+        self, model: str, messages: list[MessageDict], kwargs: dict[str, Any]
+    ) -> tuple[dict[str, Any], float]:
+        """The request body and transport timeout for one call, shared by both paths.
+
+        ``kwargs`` is not modified: the params consumed here (``max_tokens``,
+        ``max_completion_tokens``, ``timeout``) are taken from a private copy.
+
+        Returns the payload and the per-call HTTP timeout, which sizes the transport rather
+        than riding in the body.
+        """
+        # One builder for `complete` and `acomplete` because they had already drifted: the sync
+        # path applied `DEFAULT_MAX_TOKENS` when the caller supplied none, the async path (added
+        # a week later, `77a12aad`) omitted the key entirely. Anthropic REQUIRES `max_tokens`, so
+        # every `acomplete` without an explicit one 400'd — and a non-context 400 maps to
+        # `UnsupportedParamsError`, which is non-retryable, so it failed fast. `llm.py`'s history
+        # note says the `LLMClient`/`Provider` merge existed to end exactly this kind of
+        # sync/async divergence on the RESPONSE side; the request side never got the treatment.
+
+        # Copy rather than consume the caller's dict. The pops were self-evident while they sat
+        # inline in `_request`; behind a `(model, messages, kwargs)` signature they read as three
+        # read-only inputs, and both call sites are safe today only because each `**kwargs` frame
+        # is fresh and untouched after the call. Same argument as the shared builder itself:
+        # make the hazard structurally absent rather than document it and hope.
+        kwargs = dict(kwargs)
+
+        system_prompt, anthropic_messages = self._convert_messages(messages)
+
+        payload: dict[str, Any] = {"model": model, "messages": anthropic_messages}
+        if system_prompt is not None:
+            payload["system"] = system_prompt
+
+        # Anthropic uses "max_tokens" where OpenAI uses "max_completion_tokens". Both spellings
+        # are taken here and the Anthropic name written directly, so `_PARAM_MAPPING` is never
+        # consulted for `max_completion_tokens` — the loop below never sees it.
+        #
+        # Popped on separate statements rather than inline in the `or` chain, which short-
+        # circuited: with both spellings supplied, `max_tokens` won the chain and the second pop
+        # never ran, leaving `max_completion_tokens` in `kwargs` for the loop to map back onto
+        # `max_tokens` — so the OpenAI alias silently overrode the explicit Anthropic param.
+        max_tokens = kwargs.pop("max_tokens", None)
+        max_completion_tokens = kwargs.pop("max_completion_tokens", None)
+        payload["max_tokens"] = (
+            max_tokens or max_completion_tokens or DEFAULT_MAX_TOKENS
+        )
+
+        # A per-call `timeout` (e.g. from model_config) sizes the HTTP transport, not the
+        # request body — pop it before forwarding the rest as Anthropic params. (#623)
+        request_timeout = self._resolve_request_timeout(kwargs, self.timeout)
+
+        # Map remaining kwargs, dropping OpenAI-only params.
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if key in _OPENAI_ONLY_PARAMS:
+                continue
+            payload[_PARAM_MAPPING.get(key, key)] = value
+
+        return payload, request_timeout
+
     def complete(
         self, model: str, messages: list[MessageDict], **kwargs: Any
     ) -> LLMResponse:
@@ -134,45 +194,7 @@ class AnthropicLLM(BaseLLM):
                 llm_provider="anthropic",
             )
 
-        # Convert OpenAI-style messages to Anthropic format.
-        # System messages become a top-level "system" field; user/assistant
-        # messages go in the "messages" array.
-        # https://docs.anthropic.com/en/api/messages
-        system_prompt, anthropic_messages = self._convert_messages(messages)
-
-        # Sent verbatim, so the id is checked rather than converted.
-
-        self.validate_model(model)
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": anthropic_messages,
-        }
-
-        if system_prompt is not None:
-            payload["system"] = system_prompt
-
-        # Anthropic uses "max_tokens" where OpenAI uses "max_completion_tokens".
-        # Pop both and let the mapped name go into the payload via _PARAM_MAPPING.
-        max_tokens = (
-            kwargs.pop("max_tokens", None)
-            or kwargs.pop("max_completion_tokens", None)
-            or DEFAULT_MAX_TOKENS
-        )
-        payload["max_tokens"] = max_tokens
-
-        # A per-call `timeout` (e.g. from model_config) sizes the HTTP transport, not the
-        # request body — pop it before forwarding the rest as Anthropic params. (#623)
-        request_timeout = self._resolve_request_timeout(kwargs, self.timeout)
-
-        # Map remaining kwargs, dropping OpenAI-only params.
-        for key, value in kwargs.items():
-            if value is None:
-                continue
-            if key in _OPENAI_ONLY_PARAMS:
-                continue
-            mapped_key = _PARAM_MAPPING.get(key, key)
-            payload[mapped_key] = value
+        payload, request_timeout = self._build_payload(model, messages, kwargs)
 
         # https://docs.anthropic.com/en/api/getting-started#authentication
         headers = {
@@ -218,36 +240,7 @@ class AnthropicLLM(BaseLLM):
                 llm_provider="anthropic",
             )
 
-        system_prompt, anthropic_messages = self._convert_messages(messages)
-
-        # Sent verbatim, so the id is checked rather than converted.
-
-        self.validate_model(model)
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": anthropic_messages,
-        }
-
-        if system_prompt is not None:
-            payload["system"] = system_prompt
-
-        max_tokens = kwargs.pop("max_tokens", None) or kwargs.pop(
-            "max_completion_tokens", None
-        )
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-
-        # See complete(): a per-call `timeout` sizes the transport, not the payload. (#623)
-        request_timeout = self._resolve_request_timeout(kwargs, self.timeout)
-
-        for key, value in kwargs.items():
-            if value is None:
-                continue
-            if key in _OPENAI_ONLY_PARAMS:
-                continue
-            mapped_key = _PARAM_MAPPING.get(key, key)
-            payload[mapped_key] = value
+        payload, request_timeout = self._build_payload(model, messages, kwargs)
 
         headers = {
             "x-api-key": self.api_key,

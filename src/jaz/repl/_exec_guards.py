@@ -51,7 +51,7 @@ next deadline pushed on the origin thread releases its latched entries
 
 Memory guard -- a per-thread RSS cap checked in the same Layer 1 LINE callback
 (there is no SIGALRM analogue: a single blocking C-level allocation can outrun
-it, so it is a growth guard, not a hard ceiling -- see jaz-lang/jaz#812). The
+it, so it is a growth guard, not a hard ceiling). The
 check reads current *process* RSS from ``/proc/self/statm`` (throttled to one
 read per ``_MEMORY_CHECK_INTERVAL``) and raises an owner-tagged
 ``REPLMemoryError`` when that total exceeds the nearest cap on the thread's
@@ -67,6 +67,9 @@ not task submission), and raw ``_thread.start_new_thread`` (bypasses
 its own: a single large C-level allocation can outrun the throttle before the
 next Python line, and spawned threads escape the per-thread cap.
 """
+
+# The memory guard is a growth guard rather than a hard ceiling because a single blocking
+# C-level allocation can outrun the LINE-callback check; jaz-lang/jaz#812 tracks that gap.
 
 import asyncio
 import contextlib
@@ -470,7 +473,7 @@ class _GuardRegistry:
     def check_deadline_current_thread(self) -> None:
         """Raise if the nearest deadline *enforceable against the running code* expired.
 
-        "Enforceable" is not simply "outstanding on this thread" (#489). The stack model
+        "Enforceable" is not simply "outstanding on this thread". The stack model
         assumes **dynamic nesting**: any other entry on your thread is an *enclosing*
         exec, so raising the thread's nearest deadline — tagged with that entry's owner —
         is right, and ``is_our_timeout`` sorts own-vs-foreign afterwards.
@@ -502,6 +505,9 @@ class _GuardRegistry:
         interruption of a child that is CPU-bound *and* never awaits. Recovering it needs
         real Task ancestry, which would mean hooking Task creation.
         """
+        # TODO(#489): the accepted cross-Task gap above — an outer exec's deadline no longer
+        # line-enforces against a child exec spawned as a separate Task, since asyncio exposes no Task
+        # parentage to tell a child from an unrelated peer.
         tid = threading.get_ident()
         stack = self._thread_stacks.get(tid)
         if not stack:
@@ -955,7 +961,7 @@ async def aexec(code: CodeType, globals_dict: dict[str, object]) -> None:
     ``await`` has ``CO_COROUTINE`` unset and runs synchronously here (free fallback).
     ``globals_dict`` is reused as both globals and locals (``eval(code, g)``) so
     top-level-await name binding writes back to the REPL namespace. No timeout — see
-    ``guarded_aexec``. (#567)
+    ``guarded_aexec``.
     """
     result = eval(code, globals_dict)
     if code.co_flags & inspect.CO_COROUTINE:
@@ -965,7 +971,7 @@ async def aexec(code: CodeType, globals_dict: dict[str, object]) -> None:
 async def aeval(code: CodeType, globals_dict: dict[str, object]) -> object:
     """Async ``eval``: evaluate a code object (compiled with
     ``PyCF_ALLOW_TOP_LEVEL_AWAIT``), awaiting the result when it is a coroutine
-    (top-level ``await`` present). No timeout — see ``guarded_aeval``. (#567)"""
+    (top-level ``await`` present). No timeout — see ``guarded_aeval``."""
     result = eval(code, globals_dict)
     if code.co_flags & inspect.CO_COROUTINE:
         result = await result
@@ -980,7 +986,7 @@ async def guarded_aexec(
     memory_limit_bytes: int | None = None,
 ) -> None:
     """Async ``exec`` under a ``timeout`` (and optional ``memory_limit_bytes``),
-    for the ``ainvoke`` REPL path (#567). The memory cap is enforced independently
+    for the ``ainvoke`` REPL path. The memory cap is enforced independently
     of the timeout, mirroring the sync path.
 
     Two complementary bounds, **no SIGALRM** (Layer 2): a Layer-1 (``sys.monitoring``)
@@ -989,12 +995,13 @@ async def guarded_aexec(
     *suspended* at an ``await``, cancelling cleanly into the coroutine. Layer 2 is
     dropped because a SIGALRM firing while the loop is parked in epoll raises into the
     loop internals and tears it down; the cost is that blocking C calls *between* awaits
-    aren't interruptible under async (see the aexec design doc / #567).
+    aren't interruptible under async (see the aexec design doc).
 
     Raises this module's owner-tagged ``REPLTimeoutError``: an own deadline (Layer 1 *or*
     ``asyncio.timeout``) is tagged with ``owner``; an outer exec's Layer-1 deadline keeps
     its own owner, so ``is_our_timeout`` still distinguishes foreign timeouts.
     """
+    # The async path and its no-SIGALRM tradeoff are #567 / design/design_features (aexec).
     owner = owner_id if owner_id is not None else new_owner()
     # Memory cap wraps the whole body so it is active even when timeout is None
     # (no Layer-2/SIGALRM for memory; the LINE callback observes RSS on this and
@@ -1040,7 +1047,7 @@ async def guarded_aeval(
 ) -> object:
     """Async ``eval`` under a ``timeout`` (and optional ``memory_limit_bytes``) —
     the eval-mode counterpart of ``guarded_aexec`` (same Layer-1 +
-    ``asyncio.timeout``, no SIGALRM; memory cap independent of timeout). (#567)"""
+    ``asyncio.timeout``, no SIGALRM; memory cap independent of timeout)."""
     owner = owner_id if owner_id is not None else new_owner()
     mem_cap = (
         _registry.push_memory(memory_limit_bytes, owner)

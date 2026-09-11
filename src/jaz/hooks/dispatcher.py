@@ -20,7 +20,13 @@ from jaz.repl.types import Raise, Return
 
 from .base import Event
 from .blackboard import Blackboard
-from .context import _reset_hook_context, _set_hook_context, get_current_hooks
+from .context import (
+    _pop_activation_token,
+    _push_activation_token,
+    _reset_hook_context,
+    _set_hook_context,
+    get_current_hooks,
+)
 from .effects import (
     Abort,
     AddInputs,
@@ -192,6 +198,26 @@ class Hook:
     anything it accumulates or enforces (a budget, a limit, a log) covers the outer invoke's
     own turns and nothing below them. Use ``with`` when sub-invokes must be included.
 
+    **Re-activating one instance.** A hook may be activated again after its previous scope
+    ended — the same ``FileLogger`` or ``BudgetPool`` passed to several invokes in turn. Only
+    *overlapping* activation is rejected. A hook that carries per-run state must therefore pick
+    one of two policies, because nothing else will:
+
+    - **Clean**, when everything the run produced lives in the hook's own memory. Clear that
+      state so each activation starts empty. Clear it in ``setup`` if a caller is meant to read
+      the finished run *after* the scope ends, in ``teardown`` if promptly releasing it matters
+      more.
+    - **Reject**, when a second run would *destroy* what the first one produced — typically a
+      file the hook rewrites from scratch each time. Cleaning memory does not un-write a file.
+      Call :meth:`forbid_reactivation` at the top of ``setup``.
+
+    Producing output outside the hook does not by itself call for rejecting: what matters is
+    whether reuse overwrites it. A span exporter appends, so re-activating a tracing hook adds
+    the second run's spans beside the first's and needs neither policy.
+
+    A hook with no per-run state, such as a validator that only inspects each event, needs
+    neither and can be reused freely.
+
     For a list of hooks known only at runtime, use ``contextlib.ExitStack``, which unwinds in
     reverse order and hands the in-flight exception to each hook's ``__exit__`` exactly as
     nested ``with`` blocks do::
@@ -238,8 +264,8 @@ class Hook:
         handler (the override points below).
 
         **Do not override this.** It is the dispatcher's internal router; overriding it
-        replaces the routing, so any ``on_<event>`` handlers would silently never run
-        (#597). To extend a hook, override the typed handlers below — you get typed
+        replaces the routing, so any ``on_<event>`` handlers would silently never run.
+        To extend a hook, override the typed handlers below — you get typed
         attribute access and implement only the events you care about, with no
         ``isinstance``/``match`` boilerplate and no "remember to ``return []``" footgun.
 
@@ -250,6 +276,7 @@ class Hook:
 
         Returns the effects expressing how to influence execution (empty for none).
         """
+        # The typed-handler dispatch replaced a single untyped on_event in #597.
         match event:
             case InvokeEnter():
                 return self.on_invoke_enter(event)
@@ -444,11 +471,10 @@ class Hook:
         # say honestly; a hook whose configuration is worth recording says more by overriding.
         #
         # Known loss against the serialized record this replaced: it carried a `qualified_name`,
-        # so two hooks with the same class name from different modules — a user's own
-        # `Compaction`, or one subclassed inside a test — were distinguishable in a trace and are
-        # not now. Deliberate: module-qualifying every hook would make every built-in's string
-        # longer for a collision that is rare, and a hook that expects to collide can qualify
-        # itself in its own override. Reach for that before concluding a trace is lying to you.
+        # so two hooks with the same class name from different modules — a user's own hook, or one
+        # subclassed inside a test — were distinguishable in a trace and are not now. Deliberate:
+        # module-qualifying every hook would make every built-in's string longer for a collision
+        # that is rare, and a hook that expects to collide can qualify itself in its own override. Reach for that before concluding a trace is lying to you.
         #
         # A dataclass hook needs nothing: @dataclass generates its own __repr__ on the subclass,
         # which wins over this by MRO and already lists the fields.
@@ -469,7 +495,46 @@ class Hook:
         runs once per activation and a stateful hook need not make it idempotent.
         Separating resource lifecycle from contextvar registration is what lets
         ``local_hooks`` run cleanup without re-introducing propagation.
+
+        ``setup()`` may run more than once on one instance, at different times: re-activating a
+        hook whose previous scope has ended is allowed. See the class docstring for the two
+        policies a stateful hook must choose between, and :meth:`forbid_reactivation`.
         """
+
+    #: Set by :meth:`forbid_reactivation` on the first activation; reserved on every hook so the
+    #: read is a plain attribute access. A subclass ``@dataclass`` does not collect it as a field —
+    #: only the subclass's own annotations are.
+    _jaz_activated_before: bool = False
+
+    def forbid_reactivation(self) -> None:
+        """Refuse a second activation of this instance. Call from ``setup`` if reuse is unsafe.
+
+        Raises :class:`~jaz.exceptions.HookActivationError` on every activation after the first,
+        whether or not the earlier one has ended. An activation whose ``setup`` went on to fail
+        still counts as the first: this runs before the rest of ``setup`` and cannot know how it
+        turns out, so a retry after a transient failure is refused too.
+        """
+        # Offered rather than imposed, because the right policy is not uniform — it varies by hook
+        # and even by CONFIGURATION of one hook. `TrajectoryRecorder(output_path=None)` must clean
+        # rather than refuse: `get_trajectories()` is documented readable after the scope ends, so
+        # refusing reuse would be gratuitous. The same class with `output_path` set must refuse:
+        # the second run's `teardown` overwrites the first run's file, and no amount of clearing
+        # in-memory state un-writes it. `IterationLimit` and `RecursionLimit` hold no per-run state
+        # at all and want neither. Only the hook knows which it is, so the base class supplies the
+        # mechanism and a uniform message, and leaves the decision where the knowledge is.
+        #
+        # Deliberately NOT keyed on whether the previous scope is still open. That weaker check is
+        # already the dispatcher's, in `__enter__`; this one exists for hooks whose objection is to
+        # the second run existing at all.
+        if self._jaz_activated_before:
+            raise HookActivationError(
+                f"{type(self).__name__} instance has already been activated and cannot be "
+                "reused; construct a new one for each activation."
+            )
+        # `object.__setattr__`, because a hook may be a FROZEN dataclass — three built-ins are
+        # dataclasses already — and a plain assignment would raise `FrozenInstanceError` on the
+        # FIRST activation, naming an attribute the hook's author never wrote.
+        object.__setattr__(self, "_jaz_activated_before", True)
 
     def teardown(self, exc: BaseException | None = None) -> None:  # noqa: B027 - optional override point, intentionally a no-op default
         """Release resources for this hook (flush/close files, end spans, ...).
@@ -514,7 +579,7 @@ class Hook:
         # __enter__ without updating that guard (see _activate_local_hooks in invoke.py).
         self.setup()
         new_context = get_current_hooks().with_hook(self)
-        self._token = _set_hook_context(new_context)
+        _push_activation_token(self, _set_hook_context(new_context))
         return self
 
     def __exit__(self, _exc_type, exc_val, _exc_tb):
@@ -523,10 +588,21 @@ class Hook:
         De-registration happens before teardown(); ordering is immaterial since
         resource cleanup does not depend on contextvar membership.
         """
-        # `_token` is only set by __enter__. A hook used as a plain instance and
-        # exited manually (or never entered) has nothing to de-register.
-        if hasattr(self, "_token"):
-            _reset_hook_context(self._token)
+        # A token is recorded only by __enter__, and only in the context that entered. `None` back
+        # therefore means one of three things — never entered, already exited, or entered in a
+        # DIFFERENT context — and none of them is de-registerable from here, so all three are
+        # swallowed. That is a deliberate widening: while the token sat on the instance, a second
+        # `__exit__` raised `RuntimeError: Token has already been used once`.
+        #
+        # The cost is that `teardown()` below still runs on those calls, so a doubled `__exit__`
+        # tears down twice for one activation. Left as-is because the alternative — raising, or
+        # tracking "has been exited" separately — reintroduces per-instance lifecycle state, which
+        # is the thing that was wrong: a hook can be live in two contexts at once, so "already
+        # exited" is not a property of the instance. A hook for which a repeated teardown is
+        # destructive should refuse reuse outright (`forbid_reactivation`).
+        token = _pop_activation_token(self)
+        if token is not None:
+            _reset_hook_context(token)
         self.teardown(exc_val)
         return False
 
@@ -685,18 +761,20 @@ class HookDispatcher:
 
         Baseline is resolved from the given EFFECTIVE config — NOT ambient
         get_config() — so a ConfigOverride / depth-specific config / worker-thread
-        invoke uses the baseline it actually configured (#463).
+        invoke uses the baseline it actually configured.
 
         No dedup is needed across propagating and local: a hook instance can be active
         in at most one live scope. Every overlap shape raises ``HookActivationError`` at
-        activation time (see ``Hook.__enter__`` and ``invoke._activate_local_hooks``,
-        #533 / #540) — ``with``+``with``, ``with``+local, ``[h, h]`` in one call, AND a
+        activation time (see ``Hook.__enter__`` and ``invoke._activate_local_hooks``) —
+        ``with``+``with``, ``with``+local, ``[h, h]`` in one call, AND a
         ``with``/local re-activation nested inside an invoke where the instance is
         already a live local (this last caught via the ``HookContext.local_active`` id
         set the contextvar carries for a local's dynamic extent). So the streams are
         disjoint by construction and this stays a plain concatenation; the old identity
         filter here was a symptom of tolerating that overlap.
         """
+        # Baseline hooks resolve per invoke (#463) so a nested invoke uses the baseline it configured.
+        # The duplicate-instance rejection covers every route into one live scope (#533 / #540).
         propagating = list(get_current_hooks().hooks)
         local = list(self._local_hooks)
         return propagating + local
@@ -820,20 +898,18 @@ class HookDispatcher:
     ) -> None:
         """Warn (do not raise) about board keys no active hook consumes.
 
-        Executive decision (thread on #542): orphan producers are a **lint, not a
-        failure**, applied *identically* to seeds and writes. The earlier design
-        validated seed orphans by raising but left writes unchecked — an asymmetry with
-        no principled basis, since "require a live consumer" couples a producer to the
-        ambient hook set the same way whether it seeds or writes. Producing board data
-        whose consumer isn't active is legitimate (an optional or not-yet-activated
-        consumer), so failing loud would be wrong for both; warning catches the real
-        target — a typo'd / dead key — without aborting the invoke or blocking a
-        standalone producer. Value *conflicts* (two different values for one key) still
-        raise: that is an irresolvable ambiguity, not an orphan.
-
+        Applied identically to seeds and writes. Value *conflicts* (two different values
+        for one key) still raise — that is an irresolvable ambiguity, not an orphan.
         Each orphan key is warned at most once per invoke (writes recur every
         generation), tracked on ``self._warned_orphan_keys``.
         """
+        # Lint-not-error is an executive call from the thread on #542. The earlier design validated
+        # seed orphans by raising but left writes unchecked — an asymmetry with no principled basis,
+        # since "require a live consumer" couples a producer to the ambient hook set the same way
+        # whether it seeds or writes. Producing board data whose consumer isn't active is legitimate
+        # (an optional or not-yet-activated consumer), so failing loud would be wrong for both;
+        # warning catches the real target — a typo'd / dead key — without aborting the invoke or
+        # blocking a standalone producer.
         unknown = sorted(keys - accepted - self._warned_orphan_keys)
         if not unknown:
             return
@@ -1024,17 +1100,19 @@ class HookDispatcher:
           conflict-error rule (identical coalesces, divergent raises); ``__builtins__`` refused.
         - DropVariables (drop namespace names): unioned into ``dropped_variables``
           (order-independent, like DropMessages). ``__builtins__`` — the compiler sandbox
-          (#688/#690) — is refused, so a stray drop can't reopen it.
+          is refused, so a stray drop can't reopen it.
         - InsertCode / DeleteCode (edit the proposed code): accumulated into ``code_inserts`` /
           ``code_deletes`` (no conflict at collection, like AddMessages/DropMessages); folded
           against the enter code in ``span_repl_exec`` via ``apply_code_edits``.
         - Any other effect raises ``InvalidEffectError`` — notably ``SupplyExecResult``,
           which composes at ``REPLExecSend`` (a supplier must see the committed code).
 
-        ``AddInputs``/``DropInputs`` are **not** collected here — they are ``InvokeEnter``-only
-        (#481): inputs are per-invoke setup, applied once before the prompt renders. The per-turn
+        ``AddInputs``/``DropInputs`` are **not** collected here — they are ``InvokeEnter``-only:
+        inputs are per-invoke setup, applied once before the prompt renders. The per-turn
         namespace counterpart is ``AddVariables``/``DropVariables`` here.
         """
+        # Refusing a drop of the sandbox builtins keeps #688/#690's allow-list closed. The
+        # inputs-at-InvokeEnter-only split is #481: inputs are per-invoke setup, variables are per-turn.
         ctx = REPLExecContext()
 
         # Apply REPL-specific effects
@@ -1176,7 +1254,7 @@ class HookDispatcher:
         return ctx
 
     def _compose_invoke_complete(self, effects: list[Effect]) -> InvokeCompleteContext:
-        """Compose effects for invoke *complete* events (#568).
+        """Compose effects for invoke *complete* events.
 
         The invoke-boundary twin of ``_compose_repl_exec_complete``: collect ``ModifyInvokeResult``
         (transform the terminal result) / ``Abort`` (abort — ``span_invoke`` raises the combined
@@ -1189,6 +1267,7 @@ class HookDispatcher:
         downgrade a wrong-typed / invalid final ``Return`` to a ``Raise`` (the backstop for another
         hook's ``REPLExecComplete`` override reinstating a ``Return``).
         """
+        # Complete events are #568's seam for the return-type contract.
         ctx = InvokeCompleteContext()
 
         for effect in effects:
@@ -1309,7 +1388,7 @@ class HookDispatcher:
           exception; the span closes ``Aborted``).
           The result-scoped effects (SupplyExecResult / ModifyExecResult) are not valid here — an
           invoke has no execution result to supply or transform; ``Finish`` (a graceful
-          Return-terminate) is deliberately excluded (#481, YAGNI: no built-in forces a
+          Return-terminate) is deliberately excluded (YAGNI: no built-in forces a
           Return; governance hooks Abort or push the agent to return via AddMessages).
         - AddInputs: unioned into ``added_inputs`` via the shared conflict-error rule (identical
           coalesces, divergent raises) — order-independent, no silent overwrite.
@@ -1323,6 +1402,7 @@ class HookDispatcher:
         - Any other effect raises ``InvalidEffectError`` (this composer used to drop them
           silently — the worst variant of the pre-loud-rejection patchwork).
         """
+        # Return-terminate excluded as YAGNI in #481.
         ctx = InvokeContext()
 
         # Apply invoke-specific effects
@@ -1506,17 +1586,19 @@ class HookDispatcher:
         This handles the ``Completed`` (normal-close) arm; the abnormal arms (``Aborted`` /
         ``Failed``) have a twin, :meth:`_emit_guarded_exit_honoring_abort`, so ``Abort`` at a
         per-turn ``*Exit`` is honored on EVERY arm — the uniform contract. The two differ only in
-        how they preserve #892 when an exception is already unwinding: there is none on the
+        how they preserve close-then-propagate when an exception is already unwinding: there is none on the
         ``Completed`` arm, so the abort simply raises; on the abnormal arms it is *folded into* the
         in-flight exception via an ``ExceptionGroup`` rather than replacing it. ``InvokeExit``
         deliberately uses neither (it keeps ``_reject_observation_only_effects`` on both arms): an
         invoke aborting at its own terminal Exit would make that Exit's payload diverge from the
         caller's exception, with no enclosing span to record the abort — and ``InvokeComplete``
         already gives full control over the final invoke result. (This is the deliberate, narrow
-        reversal of #1059's "Exit is pure observation" — traded for letting a hook abort on the
+        reversal of "Exit is pure observation" — traded for letting a hook abort on the
         *post-transform* result/response, e.g. ``BudgetPool`` aborting on the final, re-priced
         cost.)
         """
+        # Close-then-propagate is #892's contract. Honouring Abort at Exit reverses #1059's "Exit is
+        # pure observation", traded deliberately for letting a hook abort on the terminal turn.
         abort_errors: list[Exception] = []
         invalid: list[Effect] = []
         for effect in effects:
@@ -1568,7 +1650,7 @@ class HookDispatcher:
         This is the abnormal-arm twin of :meth:`_resolve_completed_exit_effects`: ``Abort`` at a
         per-turn ``*Exit`` is valid on EVERY arm, not just ``Completed``. But the span is already
         unwinding ``in_flight`` here, so the hook's abort cannot simply *replace* it — that would
-        drop the terminating exception, violating #892's close-then-propagate. Instead the two are
+        drop the terminating exception, violating close-then-propagate. Instead the two are
         folded into one group via :meth:`_record_own_abort` and returned for the CM to raise in
         place of the bare re-raise: ``in_flight`` stays present (so ``is_fatal`` still sees any
         ``FatalError`` in the group and a tree-kill survives), and the group is recorded as this
@@ -1591,6 +1673,8 @@ class HookDispatcher:
         what its *control plane* did (a hook Aborted). It is cosmetic for propagation regardless:
         ``is_fatal`` walks the group and drives how far it travels, not the outcome label.
         """
+        # Dropping the terminating exception would violate #892's close-then-propagate, so the abort
+        # and the in-flight exception are combined rather than one replacing the other.
         try:
             effects = self.emit(exit_event)
         except Exception:
@@ -1772,7 +1856,7 @@ class HookDispatcher:
                 _abort(ctx.abort_errors)
             span = REPLExecSpan(ctx=ctx)
             # Fold enter-time InsertCode / DeleteCode onto the proposed code once, here, so the
-            # committed code is a single string both REPLExecSend observers (ValidateREPLInput,
+            # committed code is a single string both REPLExecSend observers (ValidateREPLCode,
             # suppliers) and the executor read — no Send/exec desync. Reuse the enter code
             # verbatim when nothing edits it (the common path), avoiding a needless rebuild.
             span.committed_code = (

@@ -39,8 +39,8 @@ as regular `Hook` instances. Each such built-in ships with its own dedicated,
 behavior-specific opt-out (e.g., a hypothetical `bypass_budget()`).
 
 There is deliberately **no** generic disable/clear mechanism — neither a
-class-keyed `disable_hook(SomeClass)` nor a blanket `clear_all_hooks()` (#466
-removed both). Hook lifecycle is managed purely by lexical `with` scoping:
+class-keyed `disable_hook(SomeClass)` nor a blanket `clear_all_hooks()`. Hook lifecycle is
+managed purely by lexical `with` scoping:
 
 1. Multiple instances of the same `Hook` class can be active simultaneously
    (e.g., two `PrintLogger`s at different log levels). A class-keyed disable
@@ -58,6 +58,9 @@ See Also
 - Hook base class: Implements context manager protocol for easy activation
 - get_dispatcher(): Get the singleton dispatcher that reads from context
 """
+
+# Neither a class-keyed disable_hook nor a blanket clear_all_hooks is offered — see #466 for
+# the argument that both make hook state non-local to read.
 
 from collections.abc import Iterable
 from contextvars import ContextVar, Token
@@ -151,3 +154,53 @@ def _reset_hook_context(token: Token[HookContext]) -> None:
     Internal function - users should use context managers instead.
     """
     _hook_context.reset(token)
+
+
+#: One activation's context token, keyed by the activating hook's identity.
+#
+# A `ContextVar`, not an attribute on the hook, because the token belongs to the ACTIVATION and a
+# hook instance can have more than one live at a time. `Hook.__enter__`'s duplicate guard reads
+# `_hook_context`, which is per-context, so a worker thread — starting from its own empty context —
+# is allowed to activate an instance already live on another thread. With the token on the
+# instance there is one slot: the worker's `__enter__` overwrote the parent's, the parent's
+# `__exit__` was handed the worker's spent token and raised `RuntimeError: Token has already been
+# used once`, and because de-registration precedes `teardown()` the parent's teardown never ran
+# and its hook stayed registered for the rest of the process.
+#
+# Keying by context gives each thread and each async task its own view, which is the same
+# isolation a `Token` itself demands — `reset` is only valid in the context that produced it.
+# `default=None` rather than `{}`: a mutable ContextVar default is one object shared by every
+# context that never set it, so an in-place mutation would leak across all of them. Every write
+# below rebinds a fresh dict instead, which is what keeps each context's view its own.
+_activation_tokens: ContextVar[dict[int, tuple[object, Token[HookContext]]] | None] = (
+    ContextVar("hook_activation_tokens", default=None)
+)
+
+
+def _push_activation_token(owner: object, token: Token[HookContext]) -> None:
+    """Record ``token`` as the current context's active token for ``owner``."""
+    _activation_tokens.set(
+        {**(_activation_tokens.get() or {}), id(owner): (owner, token)}
+    )
+
+
+def _pop_activation_token(owner: object) -> Token[HookContext] | None:
+    """Take back ``owner``'s token for this context, or ``None`` if it never activated here."""
+    current = _activation_tokens.get() or {}
+    entry = current.get(id(owner))
+    # The stored owner is checked by identity, not just found by key. `id()` is only unique among
+    # LIVE objects: an entry that outlives its hook — an `__exit__` that never came, or one taken
+    # out of order so a later reset already covered it — leaves the address free for CPython to
+    # reuse, and a brand-new hook allocated there would otherwise pop the dead one's token and
+    # reset the contextvar to a state that re-registers an already-exited hook.
+    #
+    # Holding the owner in the value is also what makes that impossible rather than merely
+    # detected: a live entry keeps its hook alive, so the address cannot be recycled underneath
+    # it. The strong reference lasts as long as the context that entered the hook, which is the
+    # same lifetime the activation itself has.
+    if entry is None or entry[0] is not owner:
+        return None
+    remaining = dict(current)
+    del remaining[id(owner)]
+    _activation_tokens.set(remaining)
+    return entry[1]

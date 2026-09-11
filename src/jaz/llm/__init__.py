@@ -1,7 +1,7 @@
 """LLM backends — one class per backend (:class:`BaseLLM`), selected by one tag.
 
 The ``litellm`` backend routes through the LiteLLM library; the ``OpenAILLM``/``AnthropicLLM``
-classes post directly to a vendor's HTTP API. Add your own with ``@register_llm("mybackend")``;
+classes post directly to a vendor's HTTP API. Add your own by subclassing ``BaseLLM``;
 see :mod:`jaz.llm.llm` for what a backend owns and why the former ``LLMClient``/``Provider``
 split was merged away.
 """
@@ -31,6 +31,7 @@ from .base import Usage as Usage
 from .base import declared_init_keys as declared_init_keys
 from .chat_format import ChatFormat as ChatFormat
 from .chat_format import HFChatFormat as HFChatFormat
+from .copilot import CopilotLLM as CopilotLLM
 from .exceptions import APIError as APIError
 from .exceptions import AuthenticationError as AuthenticationError
 from .exceptions import ContentPolicyViolationError as ContentPolicyViolationError
@@ -51,8 +52,6 @@ from .pricing import compute_cost as compute_cost
 from .pricing import cost_per_token as cost_per_token
 from .pricing import get_all_models as get_all_models
 from .pricing import get_model_info as get_model_info
-from .registry import LLM_REGISTRY as LLM_REGISTRY
-from .registry import register_llm as register_llm
 from .sglang import SGLangLLM as SGLangLLM
 
 __all__ = [

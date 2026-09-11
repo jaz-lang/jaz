@@ -6,7 +6,7 @@ after ``compile()``.
 Why cookies instead of a name binding
 -------------------------------------
 The REPL rewrites a top-level ``return``/``raise`` into a ``raise`` of an internal sentinel, and
-the except-guard transform (#869) injects ``except`` handlers that reference that sentinel and the
+the except-guard transform injects ``except`` handlers that reference that sentinel and the
 real ``Exception`` class. Those references must resolve at runtime *without being nameable by the
 agent*. The old approach bound the sentinel in ``__builtins__`` (``builtins["_JazReturnSignal"] =
 …``) so a rewritten ``raise _JazReturnSignal(v)`` could resolve the name — but that also let agent
@@ -29,6 +29,8 @@ and unforgeable. As belt-and-suspenders, :meth:`CookieJar.substitute` *raises* i
 loud compile error, never a silent ``except b'...':`` that would ``TypeError`` at runtime. (A cookie
 merely *absent* — legitimately dropped by dead-code elimination — is fine, not a collision.)
 """
+
+# The except-guard transform that references this sentinel is #869.
 
 import ast
 import secrets

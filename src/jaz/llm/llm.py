@@ -2,8 +2,9 @@
 
 A :class:`BaseLLM` owns everything about talking to one model service — the HTTP call, error
 mapping, retry, cost accounting and model metadata. It is selected by a single tag
-(``"litellm"``, ``"sglang"``, plus anything ``@register_llm``\\ ed) and built from
-that tag's params: ``LLM_REGISTRY[tag].from_dict(params)``.
+(``"litellm"``, ``"copilot"``, ``"sglang"``) and built from that tag's params:
+``<the class the consumer's resolver returns>.from_dict(params)``. Core holds no tag -> class
+mapping; see ``jaz.instantiate.build_config``'s ``resolvers``.
 
 A backend declares its ``__init__`` (whose signature declares its config surface) and implements
 ``complete``; :meth:`BaseLLM.finalize` gives it cost accounting and the base gives it retry.
@@ -13,7 +14,7 @@ A backend declares its ``__init__`` (whose signature declares its config surface
 # job across an ``LLMClient`` (retry, cost, model info; returned an ``LLMResponse``) and a
 # ``Provider`` beneath it (the HTTP call; returned a ``CompletionResponse``), with
 # ``DefaultLLMClient`` delegating between them. The split was never a real seam: one ``llm`` config
-# field resolved into two constructor layers (``create_llm`` hardcoded which keys went where);
+# field resolved into two constructor layers (the builder hardcoded which keys went where);
 # backends outside that pairing got no retry or cost accounting; and response normalization was
 # duplicated across ``complete``/``acomplete`` and had drifted (the async copy dropped
 # ``cached_tokens`` and the ``extra`` bag). ``Provider``, ``register_provider``, ``PROVIDER_REGISTRY``
@@ -23,6 +24,7 @@ A backend declares its ``__init__`` (whose signature declares its config surface
 from __future__ import annotations
 
 import asyncio
+import copy
 import difflib
 import logging
 import numbers
@@ -31,7 +33,8 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from types import MappingProxyType
+from typing import Any, ClassVar, Self
 
 from tenacity import (
     RetryCallState,
@@ -246,7 +249,6 @@ class BaseLLM(ABC):
 
     Subclass this and register it to add a backend::
 
-        @register_llm("mybackend")
         class MyLLM(BaseLLM):
             def __init__(self, base_url: str | None = None, **retry):
                 super().__init__(**retry)
@@ -298,7 +300,32 @@ class BaseLLM(ABC):
     retry_wait_multiplier: float = _DEFAULT_WAIT_MULTIPLIER
     retry_wait_min: float = _DEFAULT_WAIT_MIN
     retry_wait_max: float = _DEFAULT_WAIT_MAX
-    retry_policy: dict[str, int] | None = None
+    # The two container settings are stored in private slots behind read-only properties
+    # (see ``request_defaults`` / ``retry_policy`` below); the class-level defaults are here with
+    # their scalar siblings for the same "resolves without a super() call" reason.
+    #
+    # What is *stored* is a plain ``dict``, and the property wraps it in a ``MappingProxyType``
+    # view on the way out (#741). Storing the proxy itself would have been one allocation cheaper
+    # per read (0.069 vs 0.100 us — neither matters next to the request it rides), but a
+    # ``mappingproxy`` is unpicklable, and ``deepcopy`` falls back to pickle, so storing one would
+    # have made every backend instance uncopyable. That is a regression against a plain dict on a
+    # public class, prospective rather than live — nothing in-tree copies a backend today, and
+    # ``copy.copy`` would not have minded either, since a shallow copy just shares the value.
+    #
+    # Scope of the fix, precisely: ``pickle``/``deepcopy`` walk ``__dict__``, which now holds a real
+    # dict, so the *instance* copies again. The *property result* is still a ``mappingproxy``, so
+    # ``json.dumps(llm.request_defaults)`` still raises where it used to work — the JSON encoder
+    # tests for a concrete ``dict``, not for ``Mapping``, so no immutable mapping would satisfy it.
+    # Callers that need JSON pass ``dict(...)``. Accepted: nothing in ``src/`` or ``evals/``
+    # serializes a built component (eval ``config.json`` is written from the authored YAML dict),
+    # and the alternative — returning a plain dict copy — trades a ``TypeError`` at the offending
+    # write, plus the pyright error on ``[k] = v``, for a silent no-op.
+    #
+    # The view gives the freeze guarantee regardless: a write through it is a ``TypeError``, and the
+    # only handle on the underlying dict is private. The class-level defaults stay immutable so a
+    # backend that skips ``super().__init__()`` cannot poison every sibling through a shared default.
+    _request_defaults: Mapping[str, Any] = MappingProxyType({})
+    _retry_policy: Mapping[str, int] | None = None
 
     #: The model id this backend serves. Required — there is no default; ``get_model`` raises
     #: when it is unset rather than letting ``"model": ""`` reach the API.
@@ -319,15 +346,11 @@ class BaseLLM(ABC):
     # `jaz.invoke("hi")` with nothing configured now raises rather than quietly calling gpt-5-mini.
     # A backend that genuinely does serve a canonical model may still override this with a literal.
 
-    #: The tag ``@register_llm`` registered this class under; ``None`` for an unregistered
-    #: one. Declared with the other class attributes so the class surface reads in one place.
-    registry_tag: ClassVar[str | None] = None
-
     #: Reserved sidecar keys (see ``jaz.provenance.RESERVED_KEYS``) this backend reads and
     #: therefore receives on the wire; every other reserved key is stripped at egress.
     #: Default: none — a text backend's wire list carries no internal keys.
     #
-    # A per-class declaration like ``registry_tag`` (and a class attribute for the same
+    # A per-class declaration (and a class attribute for the same
     # reason as the retry fields above: it must resolve even when a subclass skips
     # ``super().__init__()``). Text backends drop ``messages`` straight into their request
     # payloads, so nothing internal may survive egress for them; a token-native backend
@@ -345,7 +368,7 @@ class BaseLLM(ABC):
         retry_wait_multiplier: float | None = None,
         retry_wait_min: float | None = None,
         retry_wait_max: float | None = None,
-        retry_policy: dict[str, int] | None = None,
+        retry_policy: Mapping[str, int] | None = None,
         **request_defaults: Any,
     ) -> None:
         # `model` and the open `**request_defaults` tail (`temperature`, `reasoning_effort`,
@@ -405,7 +428,7 @@ class BaseLLM(ABC):
                     raise ValueError(
                         f"retry_policy[{exc_name!r}] must be a non-negative integer"
                     )
-        self.request_defaults: dict[str, Any] = request_defaults
+        self._request_defaults = dict(request_defaults)
         _warn_on_misspelled_request_params(request_defaults, type(self).__name__)
         if model is not None:
             self.model = model
@@ -416,18 +439,92 @@ class BaseLLM(ABC):
             ("retry_wait_multiplier", retry_wait_multiplier),
             ("retry_wait_min", retry_wait_min),
             ("retry_wait_max", retry_wait_max),
-            ("retry_policy", retry_policy),
         ):
             if value is not None:
                 setattr(self, name, value)
+        # Set apart from the loop above because it writes the private slot behind the
+        # ``retry_policy`` property (#741) — the public name has no setter.
+        if retry_policy is not None:
+            self._retry_policy = dict(retry_policy)
+
+    @property
+    def request_defaults(self) -> Mapping[str, Any]:
+        """The per-request defaults this backend rides on every call — read-only.
+
+        Set once, at construction, from the ``**request_defaults`` tail. The mapping cannot be
+        written to (``TypeError``) and the attribute cannot be rebound (``AttributeError``); build
+        a new backend, or use ``ConfigOverride(llm=...)``, to change them. The freeze is shallow:
+        a nested dict held as one of the *values* is still mutable.
+        """
+        # A per-request value that varies (a ``prompt_cache_key``, say) belongs in the authored
+        # spec the backend is *built* from, not stamped onto a built one — see #1313.
+        # Read-only because a config that does not override ``llm`` shares this backend instance —
+        # and therefore this container — by reference with the base config (see
+        # ``Config._folded``), so both an in-place write and a whole-attribute rebind would corrupt
+        # the global default and every other live config. #741 asked for that isolation to be
+        # structural rather than upheld by the "never mutate a container in place" convention;
+        # ``MappingProxyType`` makes the write a ``TypeError`` and the setter-less property makes
+        # the rebind an ``AttributeError``, both at the offending line rather than as a silent leak
+        # discovered later. Freezing alone would have left the rebind open; a copy-returning getter
+        # was rejected because it turns a mutation into a silent no-op, which is a worse diagnostic
+        # than either error.
+        return MappingProxyType(self._request_defaults)
+
+    @property
+    def retry_policy(self) -> Mapping[str, int] | None:
+        """The per-error-type retry budget, or ``None`` for the uniform ``max_retries``.
+
+        Read-only in the same way as :attr:`request_defaults`; pass ``retry_policy=`` to the
+        constructor to set it, or to ``complete_with_retry`` for a single call.
+        """
+        return (
+            None if self._retry_policy is None else MappingProxyType(self._retry_policy)
+        )
+
+    def _with_request_defaults(self, **extra: Any) -> Self:
+        """Return a copy of this backend with ``extra`` merged into its request defaults.
+
+        Private and interim — not API. The copy is shallow, so a handle the backend built in
+        ``__init__`` (an HTTP client, a rate limiter) is shared with the original rather than
+        duplicated; only the request defaults are replaced.
+        """
+        # Safe for the backends the one caller can actually reach: ``_maybe_cache_key_llm`` gates
+        # on ``model.startswith("openai/")``, and LiteLLM/OpenAI/Anthropic/SGLang all build their
+        # handles at construction. It is NOT safe in general — ``CopilotLLM`` builds its runtime
+        # lazily per instance with a per-instance ``weakref.finalize``, so a clone taken before
+        # first use would spawn a second CLI subprocess rather than share one, and ``copy.copy``
+        # skips ``__init__``, bypassing that backend's ``UnsupportedParamsError`` gate. That gate
+        # in ``evals/`` is what keeps this unreachable, so the two must move together.
+        # TODO(#1313): delete this together with `evals/eval_harness.py`'s per-task
+        # `prompt_cache_key` path, when `evals/` here is superseded by `jaz-evals-internal`.
+        #
+        # It exists because freezing the container (#741) closed a *legitimate* operation along
+        # with the leak it was aimed at: replacing the whole mapping on a private clone never
+        # touches the shared original, and `_llm_with_cache_key` — the one caller — does exactly
+        # that per task. Keeping the copy-and-freeze here rather than letting `evals/` assign
+        # `clone._request_defaults` keeps that invariant in one audited place.
+        #
+        # Underscored rather than public because one internal caller does not earn permanent
+        # surface on the core LLM base class, and the pattern is already superseded: the newer
+        # harness stamps `prompt_cache_key` into the authored spec dict *before* construction
+        # (`jaz_harness.py::_stamped`), so the backend is built once with the key in its
+        # `**request_defaults` tail — no clone, no `ConfigOverride` swap, nothing to rebind.
+        # A per-request stamping hook would be the principled fix if the per-task keying outlives
+        # `evals/`; there is no effect for editing outgoing request kwargs today. See #1313.
+        clone = copy.copy(self)
+        clone._request_defaults = {**self._request_defaults, **extra}
+        return clone
 
     @abstractmethod
     def complete(self, model: str, messages: list[Any], **kwargs: Any) -> LLMResponse:
         """Execute a completion call against the LLM.
 
         Args:
-            model: The model identifier, as this backend's API expects it
-                (e.g. ``"gpt-4"``) — see :meth:`~BaseLLM.validate_model`.
+            model: The model identifier, exactly as this backend's API expects it
+                (e.g. ``"gpt-5-mini"``). JAZ neither rewrites it nor infers anything from it;
+                what a backend does with it is the backend's own business — most put it on the
+                wire, while a token-native one (``SGLangLLM``) serves a preloaded model and uses
+                the id only to pick a chat format and label the record.
             messages: The conversation messages in OpenAI format.
             **kwargs: Additional provider-specific parameters (temperature, max_tokens, etc.).
 
@@ -485,7 +582,7 @@ class BaseLLM(ABC):
         wait_min: float,
         wait_max: float,
         on_retry: Callable[[RetryCallState], None] | None,
-        retry_policy: dict[str, int] | None = None,
+        retry_policy: Mapping[str, int] | None = None,
     ) -> Callable[[Any], Any]:
         """Build the tenacity retry decorator shared by ``complete_with_retry``
         and its async mirror ``acomplete_with_retry`` — tenacity wraps sync and
@@ -578,7 +675,7 @@ class BaseLLM(ABC):
         retry_wait_min: float | None = None,
         retry_wait_max: float | None = None,
         on_retry: Callable[[RetryCallState], None] | None = None,
-        retry_policy: dict[str, int] | None = None,
+        retry_policy: Mapping[str, int] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Execute ``complete`` with automatic retry on transient errors.
@@ -628,7 +725,7 @@ class BaseLLM(ABC):
         retry_wait_min: float | None = None,
         retry_wait_max: float | None = None,
         on_retry: Callable[[RetryCallState], None] | None = None,
-        retry_policy: dict[str, int] | None = None,
+        retry_policy: Mapping[str, int] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
         """Async mirror of ``complete_with_retry`` — wraps ``acomplete``.
@@ -654,9 +751,8 @@ class BaseLLM(ABC):
     def get_model(self) -> str:
         """The model id this backend serves.
 
-        Raises ``ValueError`` when none is configured, or when the id carries a backend prefix
-        this backend would not send (see :meth:`~BaseLLM.validate_model`). Override only for a backend whose
-        model is not the ``model`` constructor argument (``MockLLMClient`` does).
+        Raises ``ValueError`` when none is configured. Override only for a backend whose model is
+        not the ``model`` constructor argument (``MockLLMClient`` does).
         """
         # Read from the instance rather than from a passed-in config bag: the backend now holds
         # its own `model`, so a caller cannot supply a different one here and silently disagree
@@ -671,60 +767,7 @@ class BaseLLM(ABC):
                 f"{type(self).__name__} has no model configured (model={self.model!r}). "
                 f"Set it, e.g. jaz.configure(llm={type(self).__name__}(model='gpt-5-mini'))."
             )
-        # Validated here rather than where the request is built, for the same reason the check
-        # above lives here: this is the seam every entry point passes through — the Python API,
-        # a settings file, an eval YAML — so a bad id surfaces once, at `Agent.__init__`, rather
-        # than once per call site that remembers to look. `validate_model` is the per-backend
-        # rule, so a transport that legitimately keeps the prefix overrides it and inherits the
-        # right behaviour here for free.
-        self.validate_model(self.model)
         return self.model
-
-    def validate_model(self, model: str) -> None:
-        """Reject a model id this backend would not send verbatim.
-
-        The configured id **is** the wire id: nothing is stripped, rewritten or inferred, so
-        this only says yes or no. A leading ``segment/`` naming a registered backend tag is an
-        error, and the message names the id to use instead::
-
-            OpenAILLM().validate_model("gpt-5-mini")                       -> ok (bare id)
-            OpenAILLM().validate_model("meta-llama/Llama-3.1-8B-Instruct") -> ok (slash, not a tag)
-            OpenAILLM().validate_model("litellm/gpt-5-mini")               -> ValueError (registered tag)
-
-        The rule that makes this predictable: **write the id the backend's own documentation
-        uses.** OpenAI documents ``gpt-5-mini`` and Anthropic documents ``claude-sonnet-4-5`` —
-        bare. A leading ``provider/`` is an *aggregator* convention.
-
-        Override to a no-op where that convention is the real one: a transport-style backend
-        routing by provider name (LiteLLM) documents ``openai/gpt-5-mini``, so the prefix is its
-        routing key and there is nothing to reject. That is the same rule, not an exception.
-        """
-        # Returns nothing, and is named for what it does. It began as a `strip_tag` that
-        # rewrote the id, and kept a `-> str` through the move to literal ids even though every
-        # path — here and in the anticipated transport override — returns its input unchanged.
-        # A signature promising a transformation that never happens made two call sites read as
-        # conversions (`"model": self.wire_model(model)`) and two others read as no-ops.
-        #
-        # Per-backend rather than the module-level `strip_tag` this replaced: that function
-        # consulted the *global* registry, so it stripped any leading segment naming any
-        # registered tag no matter which backend was running — `anthropic/claude-…` on an
-        # OpenAI backend silently became a request for `claude-…` against OpenAI. Only the
-        # backend knows what its own prefix means, so only the backend can judge it.
-        from .registry import registered_llm_tags
-
-        head, sep, rest = model.partition("/")
-        # Only a *registered tag* is rejected. Any other slash belongs to the id, so
-        # Hugging-Face-style names survive — the norm against a local OpenAI-compatible server,
-        # which is the deployment the README leads with.
-        if sep and head in registered_llm_tags():
-            if self.registry_tag is not None and head == self.registry_tag:
-                hint = f"drop the prefix and use {rest!r}"
-            else:
-                hint = f"configure the {head!r} backend and use {rest!r}, or drop the prefix"
-            raise ValueError(
-                f"model {model!r} carries the backend prefix {head + '/'!r}. The model id is "
-                f"sent verbatim, so write it the way the backend's own docs do: {hint}."
-            )
 
     def _price_key(self, model: str) -> str:
         """The price-table key for ``model``: the full id if the table has it, else unprefixed.
@@ -735,9 +778,9 @@ class BaseLLM(ABC):
 
         The fallback exists for transport-style backends, where the *literal* model id carries a
         provider prefix by design (``openai/gpt-5-mini``, ``vertex_ai/gemini-2.5-pro``) while the
-        table keys the model bare. It is deliberately not restricted to registered jaz tags:
-        those prefixes are the transport's provider names, not jaz's. Only a fallback, so a
-        table hit on the full id always wins.
+        table keys the model bare. Any prefix is looked past, not a chosen few: these are the
+        transport's own provider names and JAZ has no list to check them against. Only a
+        fallback, so a table hit on the full id always wins.
         """
         if _get_model_info(model):
             return model
@@ -770,7 +813,7 @@ class BaseLLM(ABC):
 
     @classmethod
     def from_dict(cls, params: Mapping[str, Any] | None = None) -> BaseLLM:
-        """Build this backend from its construction params — ``REGISTRY[tag].from_dict(params)``.
+        """Build this backend from its construction params.
 
         The default maps params to constructor kwargs. Override for a backend whose config
         shape does not match its ``__init__``.
@@ -787,8 +830,10 @@ class BaseLLM(ABC):
 
         A per-call ``timeout`` applies to the HTTP *transport*, not the request body — so it
         must be popped out of ``kwargs`` before the rest are forwarded into the payload,
-        otherwise it is sent as an API field and ignored or rejected (#623).
+        otherwise it is sent as an API field and ignored or rejected.
         """
+        # Sent as a client-level setting rather than an API field (#623): as a field it is ignored or
+        # rejected depending on the provider.
         override = kwargs.pop("timeout", None)
         return default if override is None else override
 

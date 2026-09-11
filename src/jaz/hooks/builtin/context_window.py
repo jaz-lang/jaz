@@ -165,12 +165,3 @@ class ContextWindowWarning(Hook):
         if not info:
             return None
         return info.get("max_input_tokens")
-
-
-#: Deprecated aliases for the pre-rename spellings — see the rationale block in
-#: ``jaz/hooks/__init__.py``. ``ContextWindowHook`` is the original ``*Hook`` alias; ``ContextWindow``
-#: is the spelling this hook carried before it gained a required ``warning_text`` and was renamed to
-#: ``ContextWindowWarning``. Both keep the deep-path import working (the alias map is checked by
-#: ``test_legacy_hook_names_still_importable``).
-ContextWindowHook = ContextWindowWarning
-ContextWindow = ContextWindowWarning

@@ -24,8 +24,12 @@ both of them carried comments about, and which had already drifted once.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
+
+#: A consumer's tag -> class mapping for one group; returning ``None`` means "unknown name".
+Resolver = Callable[[str], Any]
+Resolvers = Mapping[str, Resolver]
 
 #: The key each group names its component with, in the authored form.
 _SELECTOR_KEY = {"llm": "backend", "repl": "language", "protocol": "name"}
@@ -39,7 +43,13 @@ _SELECTOR_KEY = {"llm": "backend", "repl": "language", "protocol": "name"}
 #: The REPL a config selects when nothing names one.
 _DEFAULT_LANGUAGE = "python"
 
-__all__ = ["build_component", "build_config", "unknown_option_error"]
+__all__ = [
+    "Resolver",
+    "Resolvers",
+    "build_component",
+    "build_config",
+    "unknown_option_error",
+]
 
 # `_normalize_group` is `build_config`'s internal, not surface: nothing outside this module calls
 # it. `build_config` is public because the phase-5 data sources (eval harness, worker, user
@@ -127,7 +137,10 @@ def _normalize_group(
 
 
 def build_config(
-    updates: Mapping[str, Any], *, default_language: str | None = None
+    updates: Mapping[str, Any],
+    *,
+    default_language: str | None = None,
+    resolvers: Resolvers | None = None,
 ) -> dict[str, Any]:
     """Authored grouped config -> canonical kwargs for :meth:`Config.update`.
 
@@ -143,7 +156,9 @@ def build_config(
     ``default_language`` is the REPL language a legacy ``repl.configs`` map is folded against
     when the update does not name one. It defaults to the schema default; a caller applying an
     update *onto an existing config* passes that config's language instead, so a
-    ``configs: {bash: ...}`` map still lands in a session already switched to bash.
+    ``configs: {bash: ...}`` map still lands in a session already switched to bash. It selects
+    no class — that is ``resolvers``' job — so it affects only which slice of a legacy
+    ``configs`` map survives.
 
     Idempotent: running it on its own output changes nothing, which is what lets
     :meth:`Config.update` apply it unconditionally without caring whether a caller already did.
@@ -180,7 +195,7 @@ def build_config(
             valid={_SELECTOR_KEY[group], "params"},
             default_language=default_language,
         )
-        out[group] = build_component(group, leaves, default_language=default_language)
+        out[group] = build_component(group, leaves, resolvers=resolvers)
     return out
 
 
@@ -188,25 +203,20 @@ def build_component(
     group: str,
     spec: Mapping[str, Any],
     *,
-    default_language: str | None = None,
+    resolvers: Resolvers | None = None,
 ) -> Any:
     """A ``{<selector>, params}`` spec -> the configured component it describes.
 
-    ``spec`` is the canonical form: the group's selector key (``backend`` / ``language`` / ``name``) plus
-    a ``params`` mapping. The registry resolves the selector to a class and the params become its
-    constructor arguments, so **the component's own signature is the config schema** — a
-    backend, REPL or protocol declares what it accepts simply by declaring ``__init__``, and
+    ``spec`` is the canonical form: the group's selector key (``backend`` / ``language`` /
+    ``name``) plus a ``params`` mapping. ``resolvers`` maps the selector to a class and the params
+    become its constructor arguments, so **the component's own signature is the config schema** —
+    a backend, REPL or protocol declares what it accepts simply by declaring ``__init__``, and
     this module holds no per-component knowledge.
 
-    Raises ``ValueError`` for an unregistered tag and ``TypeError`` for a param the selected
-    component does not accept — both at the call that wrote them, rather than at the first
-    invoke.
+    Raises ``ValueError`` for a name no resolver answers, ``TypeError`` for a resolver return
+    that is not the group's base class or for a param the selected component does not accept —
+    all at the call that wrote them, rather than at the first invoke.
     """
-    # Lazy for the same reason as `build_config`'s import: `config` imports this module.
-    from ._llm_client import create_llm, validate_llm_tag
-    from .protocol import create_protocol
-    from .repl.registry import REPL_LANGUAGE_MAP
-
     params = dict(spec.get("params") or {})
     tag = spec.get(_SELECTOR_KEY[group])
 
@@ -220,57 +230,37 @@ def build_component(
         # same silent-fallback shape as the component-in-the-tag-slot case above. An empty tag
         # is a config error, and the useful thing is to say so.
         raise ValueError(
-            f"{group}.{_SELECTOR_KEY[group]} must be a non-empty string naming a registered {group}"
+            f"{group}.{_SELECTOR_KEY[group]} must be a non-empty string naming a {group}"
         )
     if tag is not None and not isinstance(tag, str):
         key = _SELECTOR_KEY[group]
         raise ValueError(
-            f"{group}.{key} must be a string naming a registered {group} "
+            f"{group}.{key} must be a string naming a {group} "
             f"(got {type(tag).__name__}). A configured component is now passed directly: "
             f"{group}=<component>, not {group}={{{key!r}: <component>}}."
         )
 
+    cls = _select_class(group, tag, resolvers)
+
     if group == "llm":
-        # The MODEL is required — no silent default. But the BACKEND now defaults to `litellm`,
-        # v1's sole backend (design/design_features/litellm_sole_backend_v1.md), just as repl
-        # defaults to `python` and protocol to `code_only`. This retires #1086's *backend* half:
-        # #1086 forbade a default backend because "an implicit backend rides on whichever one
-        # happens to be first" — a real footgun with several registered backends — but with exactly
-        # one registered backend that ambiguity is gone, so defaulting to it is safe and is the
-        # executive call recorded in the design doc. #1086's *model* half stands: an implicit model
-        # pins one nobody wrote, so a missing `model` is still rejected here at the authored-data
-        # boundary (not only at `Agent.__init__`'s `get_model` guard) so a YAML/settings block
-        # fails at the call that wrote it. The Python path (`configure(llm=LiteLLM(...))`)
-        # bypasses this and is guarded by the empty-model default + that same guard.
-        if tag is None:
-            tag = "litellm"
-        # Validate the backend name BEFORE requiring the model: a wrong backend is the more
-        # fundamental error (what a model even means is backend-specific), and reporting it first
-        # matches the "name your replacement" stance of the rest of this module. `create_llm`
-        # would validate the tag anyway, but only after the model check, so it is called here.
-        validate_llm_tag(tag)
+        # The MODEL is required — no silent default. #1086's *model* half: an implicit model pins
+        # one nobody wrote, so a missing `model` is rejected here at the authored-data boundary
+        # (not only at `Agent.__init__`'s `get_model` guard) so a YAML/settings block fails at the
+        # call that wrote it. The Python path (`configure(llm=LiteLLM(...))`) bypasses this and is
+        # guarded by the empty-model default + that same guard.
         if "model" not in params:
             raise ValueError(
                 "llm.model is required: e.g. llm={'model': 'openai/gpt-5-mini'}. "
                 "An LLM with no model is underspecified, so there is no default."
             )
-        # No key check beyond that: `LLM.__init__` ends in `**request_defaults`, a genuinely open
-        # tail (a backend forwards unrecognised kwargs to its API), so there is no closed set to
-        # check against. This is the deliberate exception — see `_check_declared`.
-        return create_llm(tag, params)
+        # No key check: `BaseLLM.__init__` ends in `**request_defaults`, a genuinely open tail (a
+        # backend forwards unrecognised kwargs to its API), so there is no closed set to check
+        # against. This is the deliberate exception — see `_check_declared`.
+        return cls.from_dict(params)
     if group == "protocol":
-        cls = _resolve_protocol(tag or "code_only")
         _check_declared(group, cls, params)
-        return create_protocol(tag or "code_only", params)
+        return cls.from_dict(params)
 
-    language = tag or default_language or _DEFAULT_LANGUAGE
-    if language not in REPL_LANGUAGE_MAP:
-        raise ValueError(
-            f"Unsupported REPL language: {language!r}. Known languages: "
-            f"{', '.join(sorted(REPL_LANGUAGE_MAP))}. Custom REPLs must be registered "
-            "with @register_repl before they are configured."
-        )
-    cls = REPL_LANGUAGE_MAP[language]
     # No key check on the REPL path, unlike the protocol path. `repl.configs[language]` is an
     # open, host-authored bag — an eval YAML may carry a key meant for another REPL, or one
     # whose feature has since been removed — and `REPL.from_dict` documents that it drops those
@@ -278,15 +268,68 @@ def build_component(
     # an unrelated stale key fatal at invoke time: four such keys (`allow_inspect_commands` and
     # friends) sit in ~96 eval configs today.
     # `from_dict` rather than `cls(**params)`: a REPL may map its config shape onto a different
-    # constructor, and this is the same seam `create_llm` / `create_protocol` use.
+    # constructor.
     return cls.from_dict(params)
 
 
-def _resolve_protocol(name: str) -> type:
-    from .protocol import INTERACTION_PROTOCOL_MAP, validate_protocol_name
+def _select_class(group: str, tag: str | None, resolvers: Resolvers | None) -> Any:
+    """The class a group's spec names, via the caller's resolver — or the group's default.
 
-    validate_protocol_name(name)
-    return INTERACTION_PROTOCOL_MAP[name]
+    An unnamed component is core's own default (``LiteLLM`` / ``PythonREPL`` /
+    ``CodeOnlyProtocol``), which core legitimately knows: a default is not a registry, it is one
+    class per group. A *named* one is the caller's resolver's to answer, because the tag -> class
+    mapping belongs to whoever defined the config format — only the eval harness knows what
+    ``docker_python`` is meant to select.
+    """
+    # Lazy: `config` imports this module, so a module-level import back would close a cycle.
+    from .config import _default_components
+
+    default = _default_components()[group]
+    if tag is None:
+        return type(default)
+
+    # The resolver is consulted FIRST, and the default's own name is only a fallback for a caller
+    # that supplied none. The reverse order silently outranked the caller: a consumer deliberately
+    # mapping `litellm` to an instrumented subclass got core's class back with no diagnostic,
+    # which is the one silent fallback this module otherwise refuses (see the empty-tag and
+    # component-in-the-tag-slot guards above).
+    resolver = (resolvers or {}).get(group)
+    if resolver is not None:
+        cls = resolver(tag)
+        if cls is not None:
+            return _checked(group, tag, cls)
+
+    if resolver is None:
+        raise ValueError(
+            f"{group}.{_SELECTOR_KEY[group]}={tag!r} names a component, but no {group} "
+            f"resolver was supplied. Pass resolvers={{{group!r}: <tag -> class>}} to map the "
+            f"name, or pass the built component directly as {group}=<component>."
+        )
+    raise ValueError(
+        f"Unknown {group}.{_SELECTOR_KEY[group]}: {tag!r}. The supplied {group} resolver "
+        "does not know that name."
+    )
+
+
+def _checked(group: str, tag: str, cls: Any) -> Any:
+    """Reject a resolver return that is not the group's base class.
+
+    The three ``@register_*`` decorators this replaced each did an ``issubclass`` check at
+    registration. Without one the mistake surfaces several frames later as
+    ``AttributeError: ... has no attribute 'from_dict'``, naming neither the group nor the
+    mapping that produced it.
+    """
+    from .llm.llm import BaseLLM
+    from .protocol.base import BaseProtocol
+    from .repl.base import BaseREPL
+
+    base = {"llm": BaseLLM, "repl": BaseREPL, "protocol": BaseProtocol}[group]
+    if not (isinstance(cls, type) and issubclass(cls, base)):
+        raise TypeError(
+            f"the {group} resolver returned {cls!r} for {tag!r}; expected a "
+            f"{base.__name__} subclass"
+        )
+    return cls
 
 
 def _check_declared(group: str, cls: type, params: Mapping[str, Any]) -> None:
@@ -313,26 +356,3 @@ def _check_declared(group: str, cls: type, params: Mapping[str, Any]) -> None:
     unknown = set(params) - declared
     if unknown:
         raise unknown_option_error(unknown, group=group)
-
-
-def language_of(repl: Any) -> str:
-    """The registered language name of a configured REPL, for folding a legacy ``configs`` map.
-
-    Reverse-looked-up rather than stored on the REPL: the language is the registry's name for a
-    class, not a property of an instance, and duplicating it onto every REPL would be a second
-    place for it to be wrong. Falls back to the default for a REPL that is not registered (a
-    test double), where a legacy per-language map could not have selected it anyway.
-    """
-    from .repl.registry import REPL_LANGUAGE_MAP
-
-    # Exact type first, `isinstance` only as a fallback. A registered REPL that *subclasses*
-    # another registered one matches both, and an isinstance-first scan would answer with
-    # whichever was registered earlier — naming a `dummylang` REPL "python" because it happens
-    # to extend `PythonREPL`.
-    for name, cls in REPL_LANGUAGE_MAP.items():
-        if type(repl) is cls:
-            return name
-    for name, cls in REPL_LANGUAGE_MAP.items():
-        if isinstance(repl, cls):
-            return name
-    return _DEFAULT_LANGUAGE

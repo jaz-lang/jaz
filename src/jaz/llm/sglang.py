@@ -92,7 +92,6 @@ from .exceptions import (
     UnsupportedParamsError,
 )
 from .llm import BaseLLM, LLMResponse
-from .registry import register_llm
 
 # Body markers of SGLang's over-length 400 ("the input (N tokens) is longer than the
 # model's context length (M tokens)" family). Matched lowercased. Prose matching is
@@ -139,10 +138,16 @@ def _mapped_exception(exc: BaseException) -> Exception | None:
     return None
 
 
-@register_llm("sglang")
 class SGLangLLM(BaseLLM):
     """Token-native LLM backend for SGLang's ``/generate`` API. See the module docstring
     for usage and limitations."""
+
+    # The model id is never sent: `/generate` takes `input_ids` and serves whatever the server
+    # was launched with. It only picks the default chat format (`HFChatFormat(model)`) and labels
+    # the record, so a wrong id is not a request that fails — with `chat_format` set explicitly
+    # it is a mislabelled `TurnRecord` and nothing else. Nothing here can detect that: the server
+    # holds the only ground truth about which model is loaded, and it does not report it on this
+    # path.
 
     # Declares the token sidecar so to_wire_messages leaves TokenStamps on this backend's
     # wire list — the stamped-reuse path below reads them. Provenance stays stripped.

@@ -287,14 +287,17 @@ _EMPTY_DEPTH_MAP: Mapping[int, Mapping[str, Any]] = MappingProxyType({})
 
 
 class _LayerBase(ABC):
-    """Common interface for a composable stack layer (#727): its per-depth config contribution.
+    """Common interface for a composable stack layer: its per-depth config contribution.
 
     Two concrete kinds — a plain ``Layer`` (applies at every depth) and a ``DepthLayer`` (applies
-    only at matching depths). Kept as a shared base so ``ConfigStack`` folds them uniformly —
-    ``partial_for(depth)`` in ``resolve_for_depth`` and ``depthless_partial()`` in the depth-less
-    ``get_config()`` fold — with no ``isinstance`` ladder, and so ``DepthLayer`` needn't carry a
-    meaningless ``overrides`` field just to satisfy inheritance.
+    only at matching depths).
     """
+
+    # Introduced with the layered stack model (#727). Kept as a shared base so ``ConfigStack``
+    # folds both kinds uniformly — ``partial_for(depth)`` in ``resolve_for_depth`` and
+    # ``depthless_partial()`` in the depth-less ``get_config()`` fold — with no ``isinstance``
+    # ladder, and so ``DepthLayer`` needn't carry a meaningless ``overrides`` field just to
+    # satisfy inheritance.
 
     @abstractmethod
     def applies_at(self, depth: int) -> bool: ...
@@ -310,15 +313,16 @@ class _LayerBase(ABC):
 
 @dataclass(frozen=True)
 class Layer(_LayerBase):
-    """One propagating :class:`ConfigOverride`'s raw diff — the plain, depth-unconditional layer
-    (#727).
+    """One propagating :class:`ConfigOverride`'s raw diff — the plain, depth-unconditional layer.
 
-    A layer carries only the field→value assignments the override requested
-    (``ConfigOverride.overrides``), never a resolved ``Config``. This is what makes it
-    **base-independent**: folding a layer onto any base is just replaying those
-    ``Config.update`` setattrs (last-wins), so a stack of layers can be re-based onto a
-    different ancestor after the fact — the property the worker-thread re-base relies on.
+    Carries only the field→value assignments the override requested
+    (``ConfigOverride.overrides``), never a resolved ``Config``.
     """
+
+    # Part of the layered stack model (#727). Carrying the raw diff rather than a resolved
+    # ``Config`` is what makes a layer **base-independent**: folding one onto any base is just
+    # replaying those ``Config.update`` setattrs (last-wins), so a stack can be re-based onto a
+    # different ancestor after the fact — the property the worker-thread re-base relies on.
 
     overrides: Mapping[str, Any]
 
@@ -336,13 +340,15 @@ class Layer(_LayerBase):
 
 @dataclass(frozen=True)
 class DepthLayer(_LayerBase):
-    """A ``ConfigOverrideByDepth``'s ``{depth: partial}`` — a depth-conditional layer (#727).
+    """A ``ConfigOverrideByDepth``'s ``{depth: partial}`` — a depth-conditional layer.
 
-    Carries only its ``{depth: partial}`` map — no ``overrides`` field (a depth-conditional layer
-    has no unconditional diff, so ``depthless_partial`` inherits the empty default). It contributes
-    nothing to the depth-less ``get_config()`` fold; it only applies its matching depth's partial
-    during ``ConfigStack.resolve_for_depth``.
+    Contributes nothing to the depth-less ``get_config()`` fold; it applies only its matching
+    depth's partial, during ``ConfigStack.resolve_for_depth``.
     """
+
+    # Part of the layered stack model (#727). No ``overrides`` field: a depth-conditional layer
+    # has no unconditional diff, so ``depthless_partial`` inherits the empty default rather than
+    # the class carrying a meaningless field.
 
     depth_map: Mapping[int, Mapping[str, Any]] = _EMPTY_DEPTH_MAP
 
@@ -356,15 +362,18 @@ class DepthLayer(_LayerBase):
 def _shallow_fold(partials: Iterable[Mapping[str, Any]]) -> Config:
     """Fold ``partials`` (in order, last-wins) onto a SHALLOW copy of ``_default_config``.
 
-    Shallow (not ``deepcopy``) so a non-copyable instance ``llm_client``/``interaction_protocol``
-    stays SHARED, not duplicated per fold (which would lose connection-pool / rate-limit state, and
-    could raise on a lock/open-socket). ``Config.update`` rebinds whole fields via ``setattr`` and
-    never mutates a container in place, so the copy is leak-safe by convention: overridden fields
-    are the partials' own objects; unoverridden fields stay shared-by-reference with the base
-    (#741 tracks making that isolation structural). When NO partial actually applies (all empty —
-    e.g. a stack of only non-matching ``DepthLayer``s), returns ``_default_config`` by identity, no
-    copy — preserving the ``resolve_for_depth(n) is _default_config`` fast path.
+    When NO partial actually applies (all empty — e.g. a stack of only non-matching
+    ``DepthLayer``s), returns ``_default_config`` by identity, no copy — preserving the
+    ``resolve_for_depth(n) is _default_config`` fast path.
     """
+    # Shallow, not ``deepcopy``, so a non-copyable ``llm``/``protocol`` component stays SHARED
+    # rather than duplicated per fold (which would lose connection-pool / rate-limit
+    # state, and could raise on a lock/open socket). ``Config.update`` rebinds whole fields via
+    # ``setattr`` and never mutates a container in place, so the copy is leak-safe: overridden
+    # fields are the partials' own objects, and unoverridden fields stay shared-by-reference with
+    # the base. That sharing is safe because each component holds its own containers frozen and
+    # read-only (#741) — mutating or rebinding one through a shared component raises rather than
+    # corrupting the base.
     cfg: Config | None = None
     for partial in partials:
         if partial:
@@ -377,19 +386,16 @@ def _shallow_fold(partials: Iterable[Mapping[str, Any]]) -> Config:
 @dataclass(frozen=True)
 class ConfigStack:
     """An ordered stack of propagating :class:`ConfigOverride` diffs relative to the
-    ``_default_config`` singleton — the runtime value of the ``_config_stack`` ContextVar (#727).
+    ``_default_config`` singleton — the runtime value of the ``_config_stack`` ContextVar.
 
-    Replaces the old resolved-``Config`` snapshot on the ContextVar. Storing raw *ordered
-    diffs* (not a flattened ``Config``) is what lets a raw ``ThreadPoolExecutor`` worker
-    reconstruct propagated state by **composition** — ``ancestor.layers + local.layers``,
-    last-wins — instead of the old either/or that had to pick one side and silently dropped the
-    other. The base is implicitly the live ``_default_config`` (so ``configure()`` mutations
-    stay visible with no rebuild); everything an operator/agent adds lives in ``layers``.
+    Stores raw *ordered diffs* rather than a flattened ``Config``, so a raw
+    ``ThreadPoolExecutor`` worker can reconstruct propagated state by **composition** —
+    ``ancestor.layers + local.layers``, last-wins. The base is implicitly the live
+    ``_default_config`` (so ``configure()`` mutations stay visible with no rebuild); everything an
+    operator/agent adds lives in ``layers``.
 
     The fold is **lazy** (see ``resolved``): a diff is only applied when the effective config is
-    *read*, not when the :class:`ConfigOverride` is entered. That laziness is the fix for the
-    sandbox-drop bug — a worker's benign override, pushed before its sub-invoke re-bases the
-    ancestor, still composes onto that ancestor at the first read once the base is corrected.
+    *read*, not when the :class:`ConfigOverride` is entered.
 
     **Layering semantics — why a :func:`configure` inside a :class:`ConfigOverride` block stays
     shadowed until exit.** :func:`configure` and :class:`ConfigOverride` are two different
@@ -403,12 +409,21 @@ class ConfigStack:
     effective for the block's whole extent and the new base value surfaces only once the scope
     lifts (the empty-stack ``resolved`` fast path returns the now-updated live
     ``_default_config``). This is the one coherent way to merge a permanent single base with a
-    LIFO scoped stack: letting a configure-inside punch through would force block exit to either
-    silently discard that :func:`configure` or restore unpredictably, and would break the scoped
-    override's guarantee that it deterministically shadows for its whole extent (including
-    against a nested ``jaz.invoke``'s mutations). The description system applies the identical
+    LIFO scoped stack. The description system applies the identical
     layering to :func:`jaz.describe` (permanent base) vs. :class:`jaz.DescriptionOverride`
     (scoped shadow) — see ``descriptions.DescriptionOverride``."""
+
+    # The stack model is #727. It replaced a resolved-``Config`` snapshot on the ContextVar, whose
+    # composition was an either/or that had to pick one side and silently dropped the other; raw
+    # ordered diffs compose instead. The laziness above is the fix for the sandbox-drop bug — a
+    # worker's benign override, pushed before its sub-invoke re-bases the ancestor, still composes
+    # onto that ancestor at the first read once the base is corrected.
+    #
+    # The alternatives-considered half of the layering paragraph: letting a ``configure`` inside an
+    # override punch through would force block exit to either silently discard that ``configure``
+    # or restore unpredictably, and would break the scoped override's guarantee that it
+    # deterministically shadows for its whole extent (including against a nested ``jaz.invoke``'s
+    # mutations).
 
     layers: tuple[_LayerBase, ...] = ()
     # True once a real invoke has established this stack as the ancestor for a subtree. A `with`
@@ -423,15 +438,16 @@ class ConfigStack:
         """Effective (depth-less) config = ``fold(_default_config, layers)``.
 
         Empty-stack fast path: return the live ``_default_config`` by identity, **uncached**, so
-        both ``configure()`` mutations *and* a rebind of the singleton stay visible (matches the
-        pre-#727 ``get_config()``). This matters because the module-default ``ConfigStack`` is
-        shared across every context/thread via the ContextVar default — caching ``_default_config``
-        on it would freeze whatever the singleton was at first read (e.g. stale after a test's
-        ``_reset_global_config`` rebinds it, so a worker reading the shared default stack would see
-        the old config). Non-empty stacks memoize their fold (``_folded``) instead — they are
-        short-lived (per ``with`` scope) and snapshot the singleton at first read, exactly as the
-        old ``ConfigOverride.__enter__`` did.
+        both ``configure()`` mutations *and* a rebind of the singleton stay visible. Non-empty
+        stacks memoize their fold instead, snapshotting the singleton at first read.
         """
+        # Uncached on the empty path because the module-default ``ConfigStack`` is shared across
+        # every context/thread via the ContextVar default: caching ``_default_config`` on it would
+        # freeze whatever the singleton was at first read (e.g. stale after a test's
+        # ``_reset_global_config`` rebinds it, so a worker reading the shared default stack would
+        # see the old config). This matches the pre-#727 ``get_config()``. A non-empty stack is
+        # short-lived (per ``with`` scope), so memoizing its fold is safe and snapshots the
+        # singleton exactly as the old ``ConfigOverride.__enter__`` did.
         if not self.layers:
             return _default_config
         return self._folded
@@ -443,28 +459,36 @@ class ConfigStack:
         contribute nothing here (empty unconditional ``overrides``) — they only apply in
         ``resolve_for_depth``.
 
-        Aliasing (load-bearing, #741): shallow — not ``deepcopy`` (which #815 used here, replaced in
-        #727) — so a non-copyable instance ``llm_client``/``interaction_protocol`` stays shared
-        rather than duplicated per fold (deepcopy would raise on a lock/open socket, or lose
-        connection-pool / rate-limit state). The consequence: EVERY ``get_config()`` under a
-        non-empty stack — i.e. every ``with ConfigOverride(...)`` — shares its *unoverridden* mutable
-        containers (``repl.configs``, ``llm.params``, and the subconfig objects themselves) BY
-        REFERENCE with ``_default_config``. Leak-safe only by the "no in-place container mutation;
-        every write rebinds the whole field via ``update``/``setattr``" convention: an in-place
-        mutation of one of these (``cfg.repl.configs[k] = ...``, ``cfg.<removed>.append(...)``)
-        would corrupt the shared global default and every other live config, not a private copy.
-        Pinned by ``test_configoverride_resolved_aliases_base_mutable_containers``. (Note the
-        asymmetry with ``ConfigOverride.apply_to``, which still deep-copies its mutable fields — see
-        ``test_apply_to_deep_copies_mutable_fields``.)
-
-        Cache thread-safety: one ``ConfigStack`` can be shared across worker threads (a contextvar
-        copies the reference). ``cached_property`` isn't locked, so two threads may both compute and
-        race on the ``__dict__`` write — but the write is a GIL-atomic dict setitem and both results
-        are pure and equal, so the worst case is a redundant fold, never corruption. No lock: it
-        would serialize this hot read path. (Works on a frozen dataclass because ``cached_property``
-        writes ``instance.__dict__`` directly, bypassing the frozen ``__setattr__`` — so
-        ``ConfigStack`` must not use ``slots``.)
+        The copy is shallow, so EVERY ``get_config()`` under a non-empty stack — i.e. every ``with
+        ConfigOverride(...)`` — shares its *unoverridden* component objects (``llm``/``repl``/
+        ``protocol``) BY REFERENCE with ``_default_config``.
         """
+        # Aliasing (load-bearing): shallow, not ``deepcopy`` (which #815 used here, replaced in
+        # #727), so a non-copyable ``llm``/``protocol`` component stays shared rather than
+        # duplicated per fold — deepcopy would raise on a lock/open socket, or lose connection-pool
+        # / rate-limit state.
+        #
+        # The mutation footgun that sharing creates is closed structurally at the component layer
+        # (#741), on both routes. Each component freezes its own containers in its constructor —
+        # the LLM's ``request_defaults`` / ``retry_policy`` to ``MappingProxyType``, the REPL's
+        # sandbox allow-lists to tuples — so an in-place write (``cfg.llm.request_defaults[k] =
+        # ...``, ``cfg.repl.allowed_imports.append(...)``) raises rather than silently corrupting
+        # the shared default; and each is exposed through a setter-less property, so rebinding the
+        # whole container on a shared component (``cfg.repl.allowed_imports = [...]``) is an
+        # ``AttributeError`` rather than a leak. What remains shared-by-reference is the component
+        # *objects* themselves, so the "rebind the whole field via ``update``/``setattr``, never
+        # mutate in place" convention still governs writes to a ``Config`` *field*. Pinned by
+        # ``test_configoverride_resolved_aliases_base_mutable_containers``.
+        # ``ConfigOverride.apply_to`` shares the same shallow semantics, per
+        # ``test_apply_to_shallow_aliases_unoverridden_mutable_fields``.
+        #
+        # Cache thread-safety: one ``ConfigStack`` can be shared across worker threads (a
+        # contextvar copies the reference). ``cached_property`` isn't locked, so two threads may
+        # both compute and race on the ``__dict__`` write — but the write is a GIL-atomic dict
+        # setitem and both results are pure and equal, so the worst case is a redundant fold, never
+        # corruption. No lock: it would serialize this hot read path. (Works on a frozen dataclass
+        # because ``cached_property`` writes ``instance.__dict__`` directly, bypassing the frozen
+        # ``__setattr__`` — so ``ConfigStack`` must not use ``slots``.)
         return _shallow_fold(layer.depthless_partial() for layer in self.layers)
 
     def push(self, layer: _LayerBase) -> ConfigStack:
@@ -486,20 +510,25 @@ class ConfigStack:
            contributes only its matching depth's partial.
 
         So a :class:`ConfigOverride` entered *after* a ``ConfigOverrideByDepth`` wins at that
-        depth — the #727 precedence flip (was: per-depth wins, applied last). Superset of
-        ``resolved``.
+        depth. Superset of ``resolved``.
 
         Fast path: when no layer applies at this depth (no global per-depth entry and no applicable
         stack ``DepthLayer``/plain layer), the depth fold equals the depth-less ``resolved`` —
         return it directly (identity to ``_default_config`` when the stack is empty).
 
-        Copy strategy — **shallow** (``_shallow_fold``), carried over from the removed
-        ``Config.resolve_for_depth``: an instance ``llm_client``/``interaction_protocol`` may wrap a
-        non-copyable resource (a lock, an open HTTP pool) that ``deepcopy`` would raise on or would
-        duplicate — losing shared connection-pool / rate-limit state. Shallow copy + whole-field
-        rebind keeps the one client shared and is leak-safe by the "no in-place container mutation"
-        convention (#741 tracks making that structural).
+        The copy is shallow, so the components themselves are shared with the base config rather
+        than duplicated.
         """
+        # The override-after-by-depth precedence is the #727 flip (before it, per-depth won by
+        # being applied last).
+        #
+        # Copy strategy — **shallow** (``_shallow_fold``), carried over from the removed
+        # ``Config.resolve_for_depth``: an ``llm``/``protocol`` component may wrap
+        # a non-copyable resource (a lock, an open HTTP pool) that ``deepcopy`` would raise on or
+        # would duplicate, losing shared connection-pool / rate-limit state. Shallow copy +
+        # whole-field rebind keeps the one client shared, and is leak-safe because each component's
+        # own containers are frozen and exposed read-only (#741) — see ``_folded`` for the full
+        # argument.
         layers = _configured_depth_layers() + self.layers
         applicable = [layer for layer in layers if layer.applies_at(depth)]
         if not applicable:
@@ -572,9 +601,10 @@ def get_config_stack() -> ConfigStack:
     this to re-establish propagated config across a raw worker-thread boundary: it composes the
     closure-threaded ancestor stack with any layers the worker pushed locally. ``stack.established``
     distinguishes a fresh worker (ContextVar didn't propagate → needs re-base) from a same-thread
-    subtree (already carries the ancestor). Replaces the old ``get_active_config_override()`` (which
-    returned a resolved ``Config | None``), matching the #727 stack model.
+    subtree (already carries the ancestor).
     """
+    # Replaces the old ``get_active_config_override()``, which returned a resolved
+    # ``Config | None`` rather than the ordered diffs the #727 stack model composes.
     return _config_stack.get()
 
 
@@ -631,7 +661,7 @@ def configure(
     Args:
         llm: How JAZ talks to the model — a :class:`BaseLLM` such as
             ``LiteLLM(model="openai/gpt-5-mini", temperature=0.7)``. ``litellm`` is the sole
-            built-in backend and the default; ``@register_llm`` adds your own. The constructor is the whole
+            built-in backend and the default; subclassing ``BaseLLM`` adds your own. The constructor is the whole
             surface: the ``model`` id, the backend's own settings (``base_url``, ``api_key``),
             the retry policy (``max_retries``, ``retry_wait_multiplier``,
             ``retry_wait_min``, ``retry_wait_max``, ``retry_policy``), and any per-request
@@ -829,22 +859,27 @@ class ConfigOverride:
         self._token: Token[ConfigStack] | None = None
 
     def _as_layer(self) -> _LayerBase:
-        """This override as a composable stack layer (#727). Plain overrides → a ``Layer``
-        carrying the raw diff; ``ConfigOverrideByDepth`` returns a ``DepthLayer`` instead."""
+        """This override as a composable stack layer. Plain overrides → a ``Layer`` carrying the
+        raw diff; ``ConfigOverrideByDepth`` returns a ``DepthLayer`` instead."""
+        # Two kinds because a depth-conditional override has no unconditional diff to contribute
+        # to the depth-less fold; ``ConfigStack`` dispatches on the layer rather than on the
+        # override, so this is the single place the distinction is made (#727).
         return Layer(self.overrides)
 
     def apply_to(self, config: Config) -> Config:
         """Return a SHALLOW copy of ``config`` with these overrides applied.
 
-        The input ``config`` is never *rebound* — ``update`` replaces whole fields via ``setattr``,
-        never mutating a container in place — so a shallow copy is leak-safe by the same "no in-place
-        container mutation" convention the stack fold relies on.
-        Consistent with ``ConfigStack._shallow_fold`` (they were reconciled — both shallow — so
-        there is one copy semantics for "resolve overrides onto a base"); the returned config's
-        *unoverridden* mutable fields (``repl.configs``/``llm.params``/…) therefore stay shared
-        by identity with ``config``. Shallow also avoids ``deepcopy`` raising on / duplicating a
-        non-copyable instance ``llm_client``/``interaction_protocol`` (a lock, an open HTTP pool).
+        The input ``config`` is never mutated. The copy is shallow, so the returned config's
+        *unoverridden* component objects (``llm``/``repl``/``protocol``) stay shared by identity
+        with ``config`` rather than being duplicated.
         """
+        # Leak-safe by the same "no in-place container mutation" convention the stack fold relies
+        # on — ``update`` replaces whole fields via ``setattr`` — and, since #741, by each
+        # component holding its own containers frozen and read-only. Same shallow semantics as the
+        # module-level ``_shallow_fold``, so there is one copy semantics for "resolve overrides
+        # onto a base"; pinned by ``test_apply_to_shallow_aliases_unoverridden_mutable_fields``.
+        # Shallow also avoids ``deepcopy`` raising on, or duplicating, a component wrapping a
+        # non-copyable resource (a lock, an open HTTP pool).
         new_config = copy.copy(config)
         if self.overrides:
             new_config.update(**self.overrides)

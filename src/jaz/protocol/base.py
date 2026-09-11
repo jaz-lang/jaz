@@ -65,7 +65,7 @@ class BaseProtocol(ABC):
 
     @classmethod
     def from_dict(cls, params: Mapping[str, object] | None = None) -> BaseProtocol:
-        """Build this protocol from its params — ``REGISTRY[tag].from_dict(params)``.
+        """Build this protocol from its params.
 
         The default maps params to constructor kwargs. Override for a protocol whose config
         shape does not match its ``__init__``.
@@ -73,12 +73,10 @@ class BaseProtocol(ABC):
         return cls(**(params or {}))
 
     @abstractmethod
-    def parse(self, llm_response: LLMResponse, repl_language: str) -> ParsedCode:
+    def parse(self, llm_response: LLMResponse) -> ParsedCode:
         """Decode an LLM response into a :class:`ParsedCode` ``(code, exec_timeout_override)``.
 
-        Returns the extracted ``code`` and an optional per-exec timeout. The response carries no
-        language attribute — an agent has a single REPL, so ``repl_language`` is passed for
-        protocols that want it but the default does not validate against it.
+        Returns the extracted ``code`` and an optional per-exec timeout.
 
         ``llm_response`` is the whole :class:`~jaz._llm_client.LLMResponse`, not a pre-extracted
         content string: a protocol reads ``.content`` itself (``str | None`` — ``None`` on a
@@ -122,8 +120,8 @@ class BaseProtocol(ABC):
     # named argument, not the whole config.
     #
     # ``repl`` was removed the same way (#1055): render_observation never read it — the
-    # truncation advice moved onto the protocol, which renders from its own settings, not the
-    # REPL — and a dead param that *looks* live invites the same wrong assumption. This also lets
+    # truncation advice that once justified the param moved onto the protocol before being removed
+    # outright — and a dead param that *looks* live invites the same wrong assumption. This also lets
     # Replay reproduce an observation by *calling* this seam (which owns whatever transform,
     # abbreviation included, the protocol applies) instead of re-deriving the truncation from a
     # CodeOnlyProtocol attribute the ABC never declared; the seam must render from
@@ -139,15 +137,12 @@ class BaseProtocol(ABC):
         Returns the observation as one or more ready messages — the seam speaks the LLM's
         own message shape directly rather than a bare ``str`` body. The common case is a
         single user message carrying the text body, which is the ``CodeOnlyProtocol``
-        single-REPL path; that same protocol returns **two** messages when the output was
-        truncated, emitting the truncation advice separately so the observation stays the raw
-        output — so the list return is exercised by the default implementer, not only by
-        the hypothetical protocols below. The
-        list is load-bearing for protocols whose observation is inherently *multiple*
-        messages or a multi-block message: one ``tool`` message per parallel tool call
-        (OpenAI requires one result per ``tool_call_id``), or a single message carrying
-        several ``tool_result`` / image content blocks (Anthropic returns all parallel
-        results together in one user message). A ``str`` return could express neither.
+        single-REPL path and the only shape any in-tree protocol returns. The list is
+        load-bearing for protocols whose observation is inherently *multiple* messages or a
+        multi-block message: one ``tool`` message per parallel tool call (OpenAI requires one
+        result per ``tool_call_id``), or a single message carrying several ``tool_result`` /
+        image content blocks (Anthropic returns all parallel results together in one user
+        message). A ``str`` return could express neither.
 
         The driver appends the returned messages verbatim — persisted history is pure protocol
         output, with no per-turn footer folded in. Hook prompt additions, when present, are the
@@ -171,7 +166,6 @@ class BaseProtocol(ABC):
         invoke_tool: InvokeTool | None,
         depth: int,
         recursion_available: bool,
-        repl_language: str,
         input_display_overrides: Mapping[str, DisplayText] | None,
     ) -> list[MessageDict]:
         """Encode the session opening into the initial message list (system + user).
@@ -195,12 +189,11 @@ class BaseProtocol(ABC):
         Args:
             inputs: The invoke's inputs, each rendered as an input block.
             scope: Ambient scoped values (``jaz.scope``) in effect for this session.
-            repl: The initialized REPL, for its self-description and language.
+            repl: The initialized REPL, for its self-description.
             invoke_tool: The bound sub-invoke tool, or ``None`` when recursion is disabled.
             depth: This invoke's recursion depth (0 at the top level).
             recursion_available: Whether sub-invokes are still permitted at this depth,
                 for the delegation guidance.
-            repl_language: The REPL's language tag for the rendered code/observation blocks.
             input_display_overrides: Per-input display text (relabel/hide), or ``None``.
 
         As with :meth:`~BaseProtocol.render_observation`, the driver folds any hook ``AddInputs`` /
@@ -247,19 +240,34 @@ class BaseProtocol(ABC):
         # ``_llm_response_to_record`` is why the ``| None`` arm is never taken internally.
         ...
 
-    def describe_history_entry(self) -> str:
+    @abstractmethod
+    def get_history_description(self) -> str:
         """The model-facing description of the ``__history__`` record — the *describe* half.
 
         Returns the prompt text telling the agent what ``__history__`` holds and what an entry's
-        fields are, or ``""`` to say nothing. The system-prompt template splices it in verbatim,
-        exactly like :meth:`~BaseProtocol.format_instructions`; the template owns the placement,
-        the protocol owns the words. Not abstract: the default says nothing, so a protocol that
-        does not implement it describes no record.
+        fields are. The system-prompt template splices it in verbatim, exactly like
+        :meth:`~BaseProtocol.format_instructions`; the template owns the placement, the protocol
+        owns the words. Return ``""`` for a protocol whose record is not meant to be read by the
+        agent — but that is a decision to make explicitly, which is why this is abstract rather
+        than defaulted.
+
+        This decides only whether the record is *described*, not whether the section *renders*: a
+        system prompt template can drop the block while the protocol keeps describing its record
+        truthfully.
         """
-        # Concrete-with-""-default rather than abstract, for two reasons: a protocol whose record
-        # is not agent-readable (or that prefers to leave it undocumented) is a legitimate
-        # implementation, and this is a new method on a shipped ABC — an abstract one would break
-        # every out-of-tree protocol on upgrade for no gain.
+        # EXECUTIVE CALL (user): ABSTRACT, over a concrete `return ""` default. The argument for
+        # defaulting was that "say nothing" is a right answer for a protocol whose record is not
+        # agent-readable, so an abstract method only forces it to hand-write `return ""`. Overruled
+        # on JAZ's premise that everything the LLM sees should be reachable as a variable: a
+        # protocol that writes a record the agent cannot see is the case to make ARGUE for itself,
+        # not the one to fall into by not implementing a method. A silent default makes the
+        # inaccessible-history protocol the path of least resistance; abstract puts the choice in
+        # front of every protocol author exactly once, at the point they can still change it.
+        #
+        # Note this is a real break for out-of-tree protocols, which now fail to instantiate until
+        # they implement it. That is the intended shape of the change — a `TypeError` naming the
+        # missing method is the prompt to make the decision — and it is why the rename landed in
+        # the same PR: one break, not two.
         #
         # Why this exists at all: the entry SHAPE is the protocol's (see build_history_entry —
         # `object` return, "a custom protocol may return anything"), but until this seam the prose
@@ -270,26 +278,38 @@ class BaseProtocol(ABC):
         # format ("a protocol cannot instruct one wire format while parsing another") — the record
         # seam now has both halves on one owner too.
         #
-        # What stays OUTSIDE this seam: that the name `__history__` is bound at all is the REPL's
-        # (``BaseREPL.maintains_repl_history``), and the list's one-entry-per-iteration ordering is
-        # the core loop's (the single writer). CodeOnlyProtocol's block states all three because a
-        # coherent prompt paragraph has to, and the caller gates it on the REPL capability — but
-        # this method is only *authoritative* for the entry shape.
+        # NAMED `get_history_description`, not `get_history_description` (executive call, the user).
+        # It matches its sibling `get_subinvoke_description` — both return prompt text describing
+        # one thing the agent is given — and it is the more accurate of the two: the text covers
+        # the LIST as well as an entry's fields, so "entry" under-described it. The cost is losing
+        # the visual pair with `build_history_entry`, which was never symmetric anyway (that one
+        # really does build one entry).
         #
-        # TODO(#1171): the seam covers the SYSTEM PROMPT only. `repl_output_truncation_advice*
-        # .jinja2` still names `__history__[-1].repl_output` — a `REPLHistoryEntry` field — from a
-        # core template, gated on neither capability, so the observation path can still describe a
-        # record the configured protocol does not produce.
-        return ""
+        # What stays OUTSIDE this seam: that the name `__history__` is bound at all is the REPL's
+        # (whether it surfaces the list `initialize` is handed), and the list's
+        # one-entry-per-iteration ordering is the core loop's (the single writer).
+        # CodeOnlyProtocol's block states all three because a coherent prompt paragraph has to —
+        # but this method is only *authoritative* for the entry shape.
+        #
+        # This seam and the template block it feeds cover the SYSTEM PROMPT. The observation path
+        # used to describe the record too, and could not see it: the deleted
+        # `repl_output_truncation_advice*.jinja2` named `__history__[-1].repl_output` — a
+        # `REPLHistoryEntry` field — from a core template that consulted neither this seam nor the
+        # REPL, so swapping the protocol left it describing another object's field. That was all of
+        # #1171 (its system-prompt counterpart was #1169, already landed). The fix was deletion,
+        # not relocation — restating the pointer here would have changed agent-facing text under
+        # the default config — so no core template names a record field any more, and no core
+        # prompt tells the agent the record is untruncated either.
+        ...
 
     def get_subinvoke_description(self, invoke_tool: InvokeTool) -> str:
         """The agent-facing description of the recursive sub-invoke tool (bound as ``invoke``).
 
         Rendered into the system prompt as the ``invoke`` catalog entry. The default introspects
         the bound closure — its signature and docstring ARE the description, so the two cannot
-        drift. Not abstract, for the same reasons as :meth:`describe_history_entry`: the
-        introspection default fits every protocol, and adding an abstract method to a shipped ABC
-        would break out-of-tree protocols on upgrade.
+        drift. Not abstract, unlike :meth:`get_history_description`: this default is *derived from
+        the tool itself* rather than chosen, so there is no decision for an author to make and
+        forcing one would buy nothing.
 
         A protocol overrides this to author the description explicitly — typically to advertise a
         NARROWER surface than the closure actually supports. The motivating case is a

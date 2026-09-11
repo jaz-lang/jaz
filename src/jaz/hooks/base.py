@@ -107,7 +107,7 @@ class Event:
     # READ-ONLY BY CONVENTION: reading a peer's state is the supported use; mutating a peer through
     # this field is unsupported — the event is a passive record, not a back channel between hooks.
     # Observability consumers that want a renderable governance trace call ``repr()`` at
-    # their own edge (FileLogger / PrintLogger / ATIFTrace / OTelTracing,
+    # their own edge (FileLogger / PrintLogger / TrajectoryRecorder / OTelTracing,
     # all at ``InvokeEnter``): rendering lives at the log boundary, not
     # on this field — which is exactly why the field can hold live, non-serializable hook state
     # (open files, locks, spans) that a pre-serialized field could not.

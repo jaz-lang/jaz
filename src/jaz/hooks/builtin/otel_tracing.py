@@ -112,13 +112,15 @@ class OTelTracing(Hook):
     def _end_span_abnormal(self, span: Span, event: Any) -> None:
         """Close ``span`` for a non-completed ``*Exit`` (an ``Aborted``/``Failed`` outcome).
 
-        The #892 payoff: the span context managers now fire the exit events on the
+        The payoff: the span context managers fire the exit events on the
         exceptional path too (bottom-up as the exception unwinds), so this hook closes its
         OTel spans at their natural point, in order, with ERROR status and the terminating
         exception — instead of leaking them to ``teardown()`` with inflated, out-of-order
         durations. ``teardown()`` is retained as the backstop for the machinery gaps the
         design doc documents (a failure during the exit-emit itself).
         """
+        # The abnormal arm exists because #892 made the span context managers fire exit events on
+        # every path, including the one where an exception is already unwinding.
         outcome = event.outcome
         span.set_status(Status(StatusCode.ERROR))
         # The variant IS the status; its class name (lowercased) is the serialized form.
@@ -235,7 +237,7 @@ class OTelTracing(Hook):
                 # Re-stamp the invoke span's inputs with the COMMITTED set (post
                 # AddInputs/DropInputs) — the enter-time stamp above is the proposal,
                 # which misses hook-injected inputs (the input-side #906 pattern, e.g.
-                # ultrahorizon's per-child `env`; ATIFTrace made the same Enter→Send
+                # ultrahorizon's per-child `env`; TrajectoryRecorder made the same Enter→Send
                 # move). The enter stamp is kept as the early value for spans whose
                 # Send never fires (an enter-time abort). Hook-added/dropped names are
                 # recorded only when hooks edited the set, mirroring ATIF's
@@ -565,11 +567,3 @@ class OTelTracing(Hook):
                 invoke_roots.pop(span_key, None)
 
         self.provider.force_flush()
-
-
-#: Deprecated alias for the pre-rename spelling — see the rationale block in
-#: ``jaz/hooks/__init__.py``. Every renamed hook carries this alias at its definition
-#: site so the deep-path import keeps working and so the alias map stays checkable
-#: (``test_legacy_hook_names_still_importable``). This hook is absent from every ``__all__``,
-#: so that deep-path import is the only way it was ever reachable.
-OTelTracingHook = OTelTracing

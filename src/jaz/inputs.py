@@ -15,15 +15,15 @@ This resolution is a **core, REPL-agnostic input concern**: the protocol is defi
 framework objects (e.g. ``Library``), not by any one REPL, and every REPL that binds
 inputs needs the same substitution. So the agent loop resolves inputs *before* handing
 them to ``REPL.initialize`` — each REPL then receives already-bound payloads, and the
-resolved set is the single canonical input set used for namespace binding,
-``__inputs__``, and ``__history__``. The prompt builder keeps the *raw* wrappers so
+resolved set is the single canonical input set used for namespace binding
+and ``__history__``. The prompt builder keeps the *raw* wrappers so
 value-attached descriptions (``__jaz_description__`` / ``jaz.Display``) still render;
 resolution feeds binding, not display.
 
 Hook-injected inputs added *after* initialization via ``REPL.add_inputs`` route through
 this same ``resolve_inputs`` primitive, so every binding path applies ``__jaz_get__``
-identically. They augment the namespace but do not alter the canonical ``__inputs__``
-snapshot, which stays fixed at initialization.
+identically. They augment the namespace, which is the only place an input is reachable
+from -- there is no separate snapshot for a late-added input to be missing from.
 """
 
 from collections.abc import Mapping

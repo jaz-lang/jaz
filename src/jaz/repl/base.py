@@ -14,10 +14,9 @@ class REPLState:
     """The per-invoke state of a REPL run — everything one ``initialize()`` produces.
 
     A REPL is *configured* by construction (its sandbox policy, timeouts, finishing rules) and
-    *initialized* per invoke; this holds exactly the per-invoke half. Separating it from the REPL
-    object is the direction of #1058: with state in an explicit ``REPLState``, the REPL becomes
-    pure configuration and the "one template, many runs" mutable-sharing hazard becomes structural
-    rather than guarded by copy-on-initialize.
+    *initialized* per invoke; this holds exactly the per-invoke half. With the state here rather
+    than on the REPL, the REPL is pure configuration and one instance safely serves many invokes —
+    there is nothing per-run for two of them to share.
 
     Note the two distinct lifetimes: this is *per-invoke* state. Per-*exec* scratch (a REPL's
     per-turn bookkeeping) does not belong here — it lives for one ``exec`` call and is threaded
@@ -44,6 +43,12 @@ class BaseREPL(ABC):
     return-*value* validation, and REPL-*code* validation all live in hooks (``ReturnType`` /
     ``ValidateReturn`` / ``ValidateREPLCode``) that act on the effect path; the REPL only
     produces a ``Return`` carrying the value and the hooks decide whether it's acceptable.
+
+    A subclass that does not bind ``__history__`` (see :meth:`initialize`) must be paired with a
+    system prompt that does not describe it — the shipped template's ``repl_history`` block is
+    there to be emptied by a vendored template, or a hook can rewrite the system message before
+    the query. Nothing enforces the pairing and the block renders by default, so a REPL without an
+    in-process Python namespace has to opt out.
     """
 
     # The hooks-on-the-effect-path split is #528/#568.
@@ -51,13 +56,6 @@ class BaseREPL(ABC):
     # REPL-specific description shown in the system prompt
     # Subclasses should override this with their specific instructions
     description: str
-
-    # Whether this REPL type surfaces ``__history__`` in its namespace. A static
-    # *capability* (not session state): the core agent loop only builds and tracks a
-    # history list for REPLs that advertise support, so a REPL that keeps no history
-    # (e.g. a non-Python REPL) is skipped cleanly rather than
-    # accumulating a list nothing can read.
-    maintains_repl_history: bool = False
 
     @classmethod
     def get_description(cls, config: Mapping[str, Any] | None = None) -> str:
@@ -77,7 +75,7 @@ class BaseREPL(ABC):
 
     @classmethod
     def from_dict(cls: type[Self], params: Mapping[str, Any] | None = None) -> Self:
-        """Build a configured (not yet initialized) REPL — ``REGISTRY[tag].from_dict(params)``.
+        """Build a configured (not yet initialized) REPL.
 
         Params this REPL does not declare as constructor arguments are ignored rather than
         raising. Override for a REPL whose config shape does not match its ``__init__``.
@@ -133,15 +131,27 @@ class BaseREPL(ABC):
             allowed_builtins: A dictionary of allowed built-in functions and variables.
             session_id: Unique session identifier for this REPL instance.
             initial_repl_history: An empty list container the driver passes in to own
-                ``__history__``, or ``None`` when history is disabled. A REPL that
-                supports history surfaces this exact list object in its namespace as
-                ``__history__`` (by reference); the core agent loop then retains the
-                reference and is the single writer of subsequent (iteration) entries. REPLs
-                without a Python namespace (a non-Python REPL) ignore it (leaving it empty),
-                which signals to the driver that the REPL keeps no history.
+                ``__history__``. A REPL with an in-process Python namespace surfaces this
+                exact list object in it as ``__history__`` (by reference); the core agent
+                loop then retains the reference and is the single writer of subsequent
+                (iteration) entries. A REPL that cannot bind it — no Python namespace, or a
+                namespace in another process — ignores it; the loop keeps appending either
+                way, so the entries are simply unreachable from agent code. Such a REPL must be
+                paired with a system prompt that omits the ``__history__`` block (see the class
+                docstring), or the prompt will advertise a name the agent cannot reference.
+                ``None`` is accepted for a direct caller driving the REPL without a history list.
         Returns:
             A fresh :class:`REPLState` holding this invoke's namespace, tool binding and session id.
         """
+        # EXECUTIVE CALL (user): this pairing is a documented assumption, not an enforced one —
+        # the same stance the eval harness takes for `DisableREPLHistory`. Two mechanisms were
+        # rejected in turn: a REPL-side capability flag gating both the prompt block and the
+        # loop's allocation (one bit, restating what the record seam owns, and unreadable at
+        # `initialize` time because the prompt is built first), then a `describe_repl_history`
+        # switch on `CodeOnlyProtocol` (which made the codec answer a question about rendering —
+        # see `CodeOnlyProtocol.get_history_description`). Suppressing a prompt section is the
+        # template's job. The accepted cost is a history list the loop builds for a REPL that
+        # cannot surface it.
 
     @abstractmethod
     def exec(

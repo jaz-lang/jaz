@@ -33,21 +33,25 @@ from .llm import BaseLLM, LLMResponse
 # https://platform.openai.com/docs/api-reference/chat/create
 OPENAI_API_BASE = "https://api.openai.com/v1"
 
+# Named logger only — don't set a level or attach a handler here. `jaz.llm.__init__` imports
+# this module eagerly, so anything done at import time runs on every `import jaz`, and a
+# relative-path FileHandler would land in whatever directory the consumer happens to be in.
+# Level and destination are the application's call.
+#
+# Every call site below logs at DEBUG, including the failure paths. With no handler configured
+# anywhere on the chain, `logging.lastResort` prints WARNING and above to stderr, so an `error`
+# sitting next to a `raise` that carries the same text reaches the consumer twice — once
+# unformatted on stderr, once as the exception. The exception is the single channel; the log
+# record only adds the elapsed time, which is worth having when an application turns DEBUG on.
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    _fh = logging.FileHandler("openai_provider.log")
-    _fh.setLevel(logging.DEBUG)
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(_fh)
 
 
 # Dormant for v1: LiteLLM is the sole registered backend
 # (design/design_features/litellm_sole_backend_v1.md, #1082). This class stays in-tree and
 # importable — `OpenAILLM(...)` still works if constructed directly — but carries no
-# `@register_llm` tag, so `backend: openai` no longer resolves; reach OpenAI via `openai/…` on the
+# entry in any consumer's tag map, so `backend: openai` names nothing; reach OpenAI via `openai/…` on the
 # litellm backend. Revive the built-in (for the deferred lean-core split) by restoring the
-# `@register_llm("openai")` decorator (the class stays exported from `llm/__init__.py`).
+# entry in the console's / harness's tag map (the class stays exported from `llm/__init__.py`).
 class OpenAILLM(BaseLLM):
     """The OpenAI chat-completions backend.
 
@@ -118,8 +122,6 @@ class OpenAILLM(BaseLLM):
 
         # Build request payload — model and messages are required.
         # https://platform.openai.com/docs/api-reference/chat/create
-        # Sent verbatim, so the id is checked rather than converted.
-        self.validate_model(model)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -140,14 +142,16 @@ class OpenAILLM(BaseLLM):
         }
 
         _start = _time.time()
-        _prompt_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
-        logger.debug(
-            "POST %s/chat/completions | model=%s | ~%d prompt tokens | timeout=%ss",
-            self.base_url,
-            model,
-            _prompt_tokens,
-            request_timeout,
-        )
+        # Guarded because the token estimate stringifies every message: unguarded, it would copy
+        # the whole prompt on every request to fill a record that is discarded by default.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "POST %s/chat/completions | model=%s | ~%d prompt tokens | timeout=%ss",
+                self.base_url,
+                model,
+                sum(len(str(m.get("content", ""))) // 4 for m in messages),
+                request_timeout,
+            )
 
         try:
             with httpx.Client(timeout=request_timeout) as client:
@@ -158,14 +162,14 @@ class OpenAILLM(BaseLLM):
                 )
         except httpx.TimeoutException as e:
             _elapsed = _time.time() - _start
-            logger.error("TIMEOUT after %.1fs: %s: %s", _elapsed, type(e).__name__, e)
+            logger.debug("TIMEOUT after %.1fs: %s: %s", _elapsed, type(e).__name__, e)
             raise APIError(
                 f"Request timed out after {request_timeout}s",
                 llm_provider="openai",
             ) from e
         except httpx.RequestError as e:
             _elapsed = _time.time() - _start
-            logger.error(
+            logger.debug(
                 "REQUEST ERROR after %.1fs: %s: %s", _elapsed, type(e).__name__, e
             )
             raise APIError(
@@ -174,7 +178,7 @@ class OpenAILLM(BaseLLM):
             ) from e
         except Exception as e:
             _elapsed = _time.time() - _start
-            logger.error(
+            logger.debug(
                 "UNEXPECTED ERROR after %.1fs: %s: %s", _elapsed, type(e).__name__, e
             )
             raise
@@ -206,10 +210,6 @@ class OpenAILLM(BaseLLM):
                 llm_provider="openai",
             )
 
-        # Sent verbatim, so the id is checked rather than converted.
-
-        self.validate_model(model)
-
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -227,14 +227,15 @@ class OpenAILLM(BaseLLM):
             "Content-Type": "application/json",
         }
 
-        _prompt_tokens = sum(len(str(m.get("content", ""))) // 4 for m in messages)
-        logger.debug(
-            "POST %s/chat/completions | model=%s | ~%d prompt tokens | timeout=%ss",
-            self.base_url,
-            model,
-            _prompt_tokens,
-            request_timeout,
-        )
+        # See _request(): the token estimate is guarded so it costs nothing when DEBUG is off.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "POST %s/chat/completions | model=%s | ~%d prompt tokens | timeout=%ss",
+                self.base_url,
+                model,
+                sum(len(str(m.get("content", ""))) // 4 for m in messages),
+                request_timeout,
+            )
 
         try:
             async with httpx.AsyncClient(timeout=request_timeout) as client:
@@ -244,13 +245,13 @@ class OpenAILLM(BaseLLM):
                     headers=headers,
                 )
         except httpx.TimeoutException as e:
-            logger.error("TIMEOUT: %s: %s", type(e).__name__, e)
+            logger.debug("TIMEOUT: %s: %s", type(e).__name__, e)
             raise APIError(
                 f"Request timed out after {request_timeout}s",
                 llm_provider="openai",
             ) from e
         except httpx.RequestError as e:
-            logger.error("REQUEST ERROR: %s: %s", type(e).__name__, e)
+            logger.debug("REQUEST ERROR: %s: %s", type(e).__name__, e)
             raise APIError(
                 f"Request failed: {e}",
                 llm_provider="openai",

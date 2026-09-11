@@ -52,11 +52,15 @@ experimental and may change or be removed.
 #   forwarding shims; the definitions live in ``_``-prefixed siblings. Holding a
 #   ``_DEMOTED`` target — not merely "holds no public name" — is the criterion: a shim
 #   exists to close the second route to a name ``jaz.<name>`` already warns about.
-# - Two silent paths remain, each signposted by something other than a warning: importing
+# - Three silent paths remain, each signposted by something other than a warning: importing
 #   straight from a ``_``-prefixed module (``jaz._agent`` / ``jaz._library`` — the
-#   underscore is the contract); and a ``from`` import of a demoted name out of a module that
+#   underscore is the contract); a ``from`` import of a demoted name out of a module that
 #   *also* holds public ones (``from jaz.config import configure_by_depth``; ``jaz.config``
-#   cannot become a shim while ``configure`` is defined there).
+#   cannot become a shim while ``configure`` is defined there); and any module under a
+#   SUBPACKAGE, because ``warn_on_nonpublic_submodules`` is installed on ``jaz`` alone —
+#   ``jaz.protocol.prompts`` is silent where a hypothetical ``jaz.prompts`` would warn, and so
+#   is everything under ``jaz.repl`` / ``jaz.llm`` / ``jaz.hooks``. Moving a module into a
+#   subpackage therefore moves it onto this path; the subpackage's own name is the signpost.
 # - The supported move in every case is a name in ``__all__``.
 
 from typing import TYPE_CHECKING
@@ -88,6 +92,7 @@ from .descriptions import describe
 from .exceptions import NonPublicAPIWarning
 from .invoke import ainvoke, invoke
 from .scope import scope
+from .template_loader import add_template_loader
 
 if TYPE_CHECKING:
     # Static types for the reachable-but-demoted names (resolved lazily at runtime via
@@ -104,15 +109,15 @@ if TYPE_CHECKING:
     from .config import ConfigOverrideByDepth as ConfigOverrideByDepth
     from .config import configure_by_depth as configure_by_depth
     from .descriptions import DescriptionOverride as DescriptionOverride
+    from .descriptions import get_default_description as get_default_description
     from .descriptions import get_description as get_description
     from .hooks import ReturnType as ReturnType
     from .hooks import ValidateREPLCode as ValidateREPLCode
-    from .hooks import ValidateREPLInput as ValidateREPLInput  # deprecated alias
     from .hooks import ValidateReturn as ValidateReturn
     from .scope import current_scope as current_scope
     from .scope import get_scope as get_scope
 
-__version__ = "0.2.0a3"
+__version__ = "0.2.0a4"
 
 # The v1 public API — the documented, supported surface (API-surface review,
 # 2026-07-26). `__all__` is the single source of truth for several things at once:
@@ -134,7 +139,8 @@ __version__ = "0.2.0a3"
 #      on import regardless.
 #
 # Names NOT in this list (Agent, the per-depth config machinery, the LLM seams,
-# DescriptionOverride, Display, Catalog/as_catalog, get_scope (+ its current_scope alias),
+# DescriptionOverride, Display, Catalog/as_catalog, get_description,
+# get_default_description, get_scope (+ its current_scope alias),
 # parent_print, Library — experimental in v1, shimmed via `jaz.library` over `jaz._library` — and the
 # ReturnType/Validate* hooks — whose blessed path is now `jaz.hooks.ReturnType`) are
 # deliberately demoted. They are NOT eagerly bound: they resolve lazily via `__getattr__`
@@ -153,6 +159,12 @@ __all__ = [
     "get_config",
     "describe",
     "scope",
+    # The supported way to supply your own prompt templates. Public because the five
+    # `*_template` settings on `CodeOnlyProtocol` / `PythonREPL` exist for customization and
+    # were otherwise unreachable: they name templates, and every route to registering one was
+    # non-public. Takes a loader rather than a directory so templates can live in a package,
+    # in memory, or anywhere else a `jinja2.BaseLoader` reaches.
+    "add_template_loader",
     "NonPublicAPIWarning",
     "__version__",
     # Public submodules — reached as `jaz.hooks.X` / `jaz.repl.X` / `jaz.llm.X` /
@@ -169,7 +181,7 @@ __all__ = [
     # READS, not what it writes. The governing rule, settled after weighing #1076's
     # "unified vs split SDK/CLI credential model": **library code reads ambient
     # credentials; only the CLI writes them.** Reading is legitimate SDK surface — a
-    # `@register_llm` backend author needs `resolve_credential` to opt its tag into the
+    # backend author needs `resolve_credential` to opt its tag into the
     # store — so the submodule is advertised here and its own `__all__` publishes the
     # three readers. Writing is an administrative act that permanently changes the
     # machine, so the writer is `_set_credential`: reachable for the console, which is
@@ -229,12 +241,11 @@ _DEMOTED = {
     "DescriptionOverride": ("jaz.descriptions", "DescriptionOverride"),
     "Display": ("jaz._display", "Display"),
     "get_description": ("jaz.descriptions", "get_description"),
+    "get_default_description": ("jaz.descriptions", "get_default_description"),
     # blessed path: jaz.hooks.<name>
     "ReturnType": ("jaz.hooks", "ReturnType"),
     "ValidateReturn": ("jaz.hooks", "ValidateReturn"),
     "ValidateREPLCode": ("jaz.hooks", "ValidateREPLCode"),
-    # deprecated alias of ValidateREPLCode
-    "ValidateREPLInput": ("jaz.hooks", "ValidateREPLCode"),
     # Base classes are reached via their (now uniformly public) package — jaz.llm.BaseLLM,
     # jaz.protocol.BaseProtocol, jaz.repl.BaseREPL — so they are NOT demoted top-level aliases
     # of `jaz` (BaseREPL never was one; this makes LLM/Protocol match it).

@@ -2,8 +2,9 @@
 
 Provenance answers a question the raw message can't: is this the original system prompt,
 the task, an assistant turn, a REPL observation, or a hook-inserted summary? Consumers read
-it instead of guessing from role/position — ``ATIFTrace`` to log a message's
-true origin, ``SlidingWindow`` to pin the load-bearing prefix (system + task). The guess
+it instead of guessing from role/position — ``TrajectoryRecorder`` to log a message's
+true origin, and a context-management hook to pin the load-bearing prefix (system + task) if one
+is configured; core ships none today. The guess
 breaks the moment a persistent edit (compaction) reorders or inserts messages; explicit
 provenance does not.
 
@@ -53,9 +54,11 @@ class MessageKind(StrEnum):
     ``<task>`` + ``<inputs>`` + ``<return_type>``, still true once a pending refactor
     collapses that to just ``<inputs>``); a custom protocol may also seed extra context
     such as few-shot ``assistant`` examples, and those are seed too. This is the
-    load-bearing prefix consumers protect. One kind, not several: every current and
-    near-term consumer (``SlidingWindow``'s pinning, its eventual identity-based
-    successor) treats the seed as a single protected unit, never distinguishing within
+    load-bearing prefix a context-management hook would protect. NOTE core ships no such hook
+    since #1348 removed ``SlidingWindow``, so ``SEED`` is currently **write-only** — stamped by
+    the agent, read by nothing in this repo or the eval suite. Kept because the constraint it
+    encodes is the one a replacement has to honour: treat the seed as a single protected unit,
+    never distinguishing within
     it, and a consumer that does want a particular seed message (the system prompt, say)
     reads that message's own ``role`` — a finer kind would carry no information ``role``
     plus ``iteration is None`` doesn't already give. ``ASSISTANT``/``OBSERVATION`` are the
@@ -76,7 +79,7 @@ class MessageProvenance:
 
     Frozen so a surviving message can share one instance across turns/edits by reference.
     Intentionally not JSON-serializable (see the module docstring): serialize it explicitly
-    where a human-facing record is wanted (e.g. ``ATIFTrace``), and strip it
+    where a human-facing record is wanted (e.g. ``TrajectoryRecorder``), and strip it
     via :func:`to_wire_messages` everywhere else.
     """
 
@@ -107,7 +110,7 @@ class MessageProvenance:
         Explicit opt-in, not automatic ``json.dumps`` support: this dataclass stays
         deliberately non-serializable by default (see the module docstring) so a missed
         strip stays visible; call this only where a serialized record is actually wanted
-        (e.g. :class:`~jaz.hooks.builtin.atif_trace.ATIFTrace`).
+        (e.g. :class:`~jaz.hooks.builtin.atif_trace.TrajectoryRecorder`).
         """
         return {
             "id": self.id,

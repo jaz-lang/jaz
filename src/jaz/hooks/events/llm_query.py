@@ -185,7 +185,7 @@ class LLMQuerySend(Event):
 
     Fires after :class:`LLMQueryEnter`'s edits have composed, once per query, on **every**
     path where the input commits: before a live provider call, and equally when a
-    :class:`SupplyLLMResponse` (e.g. :class:`ATIFReplay`) answers here and skips the call — the
+    :class:`SupplyLLMResponse` (e.g. :class:`TrajectoryReplay`) answers here and skips the call — the
     commitment of the input is real on both. It does not fire when the query is aborted at
     :class:`LLMQueryEnter` (the input never commits).
 
@@ -336,7 +336,7 @@ class LLMQueryExit(Event):
     # construction site must say how the span ended.
     #
     # The former ``message_edits`` field is gone: :class:`LLMQuerySend` ships the same edits
-    # pre-resolved (``edits``), and its sole consumer (``ATIFTrace``) reads them there now.
+    # pre-resolved (``edits``), and its sole consumer (``TrajectoryRecorder``) reads them there now.
     # ``Send`` owns the final input; ``Exit`` owns the final outcome.
 
     outcome: LLMQueryOutcome

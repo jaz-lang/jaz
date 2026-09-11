@@ -175,9 +175,37 @@ Don't override `_dispatch_event`: it's the framework's private internal event ro
 (#597, renamed from `on_event` in #740 so the router no longer looks like an `on_<event>`
 override point). Override the typed `on_<event>` handlers or `on_any` instead.
 
+### Per-run state and re-activation
+
+One instance may be activated again once its previous scope has ended; only *overlapping*
+activation is rejected. `setup()` therefore runs once per activation, not once per instance, and a
+hook holding per-run state has to pick a policy. The base class cannot pick for it — it does not
+know which attributes are per-run, and the right answer is not even uniform per class:
+`TrajectoryRecorder` needs opposite answers depending on whether `output_path` is set.
+
+| what a second activation would do to the first run's output | policy | where |
+|---|---|---|
+| leave stale state behind in the hook's own memory | clear it each activation | `setup()` if callers read it after the scope ends, else `teardown()` |
+| **destroy** it — a file the hook rewrites from scratch | refuse reuse | `self.forbid_reactivation()` at the top of `setup()` |
+| nothing: the output is appended, or there is none | neither | — |
+
+The test is destruction, not externality. Cleaning memory does not un-write a file, so
+`TrajectoryRecorder(output_path=...)` and `TrajectoryDirectoryRecorder` must refuse — measured,
+a second activation leaves only the second run's trace on disk. A span exporter *appends*, so
+`OTelTracing` may be reused freely even though its output is as external as theirs: measured,
+3 spans after one run and 6 after two.
+
+Built-ins by row: `BudgetPool` / `RolloutRecorder` / `TrajectoryRecorder(output_path=None)` clear
+in `setup()`; `PrintLogger` / `WorkflowReplay` clear in `teardown()`; the two disk recorders above
+refuse; `IterationLimit` / `RecursionLimit` / `OTelTracing` need nothing.
+
+The contextvar token for an activation is held per *context*, not on the instance
+(`_push_activation_token` / `_pop_activation_token`), because a worker thread starts from its own
+context and may legitimately activate an instance that is live elsewhere.
+
 ### What a hook shows in a trace (`__repr__`)
 
-Observability consumers — `FileLogger`, `PrintLogger`, `ATIFTrace`, `OTelTracing` — render the
+Observability consumers — `FileLogger`, `PrintLogger`, `TrajectoryRecorder`, `OTelTracing` — render the
 active hook set at `InvokeEnter` by calling `repr()` on each hook. That string is the whole
 record of what governance applied, so a hook whose configuration constrains the run should say
 so:
@@ -217,12 +245,11 @@ Guidance for what to include:
   `<function w at 0x102e523e0>` is *not* sufficient on its own — a field whose common values read
   fine as-is (`None`, a plain string, a named function) should show them. (The governance hooks
   sidestep the question now: `IterationLimit` / `ContextWindowWarning` / `BudgetPool` take a plain
-  `warning_text: str | None`, not a callable.) The one field in-tree that is hidden is
-  `Compaction.summary_prompt`, and only when it holds the
-  default: a 440-character constant otherwise repeated in every record. It is *shown* when the
-  caller overrode it. A repr whose field list varies by instance is fine.
+  `warning_text: str | None`, not a callable.) The pattern worth copying, if you do hide one:
+  hide it *only* while it holds a large default that would otherwise be repeated in every record,
+  and show it once the caller overrides it. A repr whose field list varies by instance is fine.
 - **Don't count on the consumer to truncate.** The loggers do (`abbrev_repr(...,
-  max_field_length)`, default 1000), but `ATIFTrace` and `OTelTracing` write the string whole. A
+  max_field_length)`, default 1000), but `TrajectoryRecorder` and `OTelTracing` write the string whole. A
   value that is large *and* near-constant is worth suppressing at the source; a merely long one
   that carries real information is not.
 - **No JSON-safety requirement.** A repr is a string, so a value the old serializer had to encode
@@ -292,6 +319,26 @@ This works across any level of nesting - hooks propagate through:
 - Function calls within the hook context
 - Async functions (contextvars are async-safe)
 - Threads started *inside* the hook context (each inherits a copy)
+
+A hook can also be activated **mid-REPL** — in the agent's own turn of code, or by anything that
+turn calls. The agent loop executes each turn's code without `copy_context()`, so the activation
+lands on the live contextvar rather than a copy, and `with Hook():` there scopes the hook the
+ordinary Python way: over the `with` statement's **body**, and over every invoke started while
+that body runs. Statements before or after the body in the same turn are outside it.
+
+```python
+# one turn of agent code
+with BudgetPool(cost_budget=1.0):
+    a = invoke(ReturnType(int), task="drafting")   # covered
+b = invoke(ReturnType(int), task="checking")       # NOT covered — same turn, after the body
+```
+
+**A hook covers whole invokes, never part of one.** An invoke is either fully under a hook or
+fully above it. The invoke whose REPL this is was already running when the body was entered and
+keeps running after it, so it is never brought under the hook — and the body cannot be stretched
+to cover it, because the turn's code has to unwind the `with` before it can return. Mid-REPL
+activation is therefore how an agent scopes a hook over work *it* starts, not a way to change the
+terms of the invoke it is already running.
 
 > **Thread pool caveat**: `ThreadPoolExecutor` workers do **not** inherit the
 > calling thread's hooks — Python's `contextvars` only propagates to threads
@@ -457,9 +504,10 @@ class WrapUpHook(Hook):
     Note ``_iterations`` here is **tree-wide**: one hook instance propagates to
     nested ``invoke()`` calls via contextvars, so the count spans the whole
     invoke tree rather than each invoke separately. For per-invoke state, key your
-    tracking by ``event.invoke_id`` — which is exactly why the built-in
-    BudgetPool keys its trackers by invoke_id. For real LLM cost /
-    call-count budgets, use that built-in rather than rolling your own.
+    tracking by ``event.invoke_id``. (The built-in BudgetPool is the opposite case: it
+    enforces one *shared* allowance, so it keeps a single running scalar and reads no
+    ``invoke_id`` at all.) For real LLM cost / call-count budgets, use that built-in
+    rather than rolling your own.
     """
 
     def __init__(self, soft: int = 5, hard: int = 8):

@@ -245,7 +245,7 @@ class InvokeSendContext(ExecutionContext):
 
 @dataclass
 class InvokeCompleteContext(ExecutionContext):
-    """Context for invoke *complete* events (#568).
+    """Context for invoke *complete* events.
 
     The invoke-boundary twin of ``REPLExecCompleteContext``: the invoke's terminal result is a
     **transform** boundary, so a hook may replace it via :class:`ModifyInvokeResult` (or abort via
@@ -257,6 +257,8 @@ class InvokeCompleteContext(ExecutionContext):
     completes only on a terminal result, so a :class:`Continue` cannot be composed here (the effect
     rejects one at construction).
     """
+
+    # Complete events are #568's seam for the return-type contract.
 
     # Transform / abort effects, mirroring REPLExecCompleteContext: ``modify_effects`` holds the
     # ``ModifyInvokeResult``s (each carrying a terminal ExecResult) and ``abort_errors`` the Abort
@@ -294,9 +296,11 @@ class InvokeContext(ExecutionContext):
 
     The result-scoped effects (SupplyExecResult / ModifyExecResult / ModifyInvokeResult) are not
     valid here (an invoke has no execution result to supply or transform yet), and ``Finish`` (a graceful
-    Return-terminate) is deliberately excluded (#481, YAGNI) — so Abort is the only
+    Return-terminate) is deliberately excluded (YAGNI) — so Abort is the only
     terminating effect at invoke enter.
     """
+
+    # Return-terminate was excluded as YAGNI in #481: no built-in forces a return at this seam.
 
     # Inputs added by ``AddInputs`` (name -> value). Applied to the invoke's inputs before the
     # prompt renders, so they show in the prompt and bind in the REPL.

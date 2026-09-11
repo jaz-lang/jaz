@@ -50,7 +50,6 @@ from .exceptions import (
     UnsupportedParamsError,
 )
 from .llm import BaseLLM, LLMResponse
-from .registry import register_llm
 
 
 def _litellm() -> Any:
@@ -99,7 +98,6 @@ def _mapped_exception(litellm: Any, exc: BaseException) -> Exception | None:
     return None
 
 
-@register_llm("litellm")
 class LiteLLM(BaseLLM):
     """LLM backend that routes completions through LiteLLM. See the module docstring for usage,
     the model-id convention, how cost is computed, and the limitations."""
@@ -123,20 +121,32 @@ class LiteLLM(BaseLLM):
         # (`drop_params`) from a YAML/settings file rather than a code change. Held as attributes,
         # not folded into `request_defaults`, because they are LiteLLM-call controls — not model
         # params that belong on the wire.
-        self.allowed_openai_params = allowed_openai_params
+        # Frozen and read-only for the same reason as ``BaseLLM.request_defaults`` (#741): a
+        # ``ConfigOverride`` that does not name ``llm`` shares this instance by reference with the
+        # base config, so an in-place write or a rebind here would corrupt the global default.
+        # ``tuple(...)`` copies as well as freezes, closing the caller-aliasing route too.
+        self._allowed_openai_params: tuple[str, ...] | None = (
+            None if allowed_openai_params is None else tuple(allowed_openai_params)
+        )
         self.drop_params = drop_params
 
-    def validate_model(self, model: str) -> None:
-        # No-op override: the `provider/` prefix is LiteLLM's routing key, not a JAZ tag to
-        # reject. The base method's docstring documents exactly this transport-backend case.
-        return None
+    @property
+    def allowed_openai_params(self) -> tuple[str, ...] | None:
+        """Params LiteLLM would otherwise reject, forced through for a too-new model — read-only.
+
+        ``None`` (the default) leaves LiteLLM's own validation in charge. Pass the list to the
+        constructor to set it; it cannot be mutated or rebound afterwards.
+        """
+        return self._allowed_openai_params
 
     def _build_params(
         self, model: str, messages: list[Any], kwargs: dict[str, Any]
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"model": model, "messages": messages}
-        if self.allowed_openai_params is not None:
-            params["allowed_openai_params"] = self.allowed_openai_params
+        if self._allowed_openai_params is not None:
+            # A fresh list per call: the stored value is a frozen tuple (#741), and handing the
+            # shared container to litellm would let a callee mutating it corrupt the base config.
+            params["allowed_openai_params"] = list(self._allowed_openai_params)
         if self.drop_params is not None:
             params["drop_params"] = self.drop_params
         params.update(kwargs)
