@@ -29,6 +29,7 @@ for a slash-less token both code paths produce the identical match and the axes 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import pathspec
 
@@ -62,3 +63,46 @@ def allows_everything(patterns: Sequence[str]) -> bool:
     list (``["*", "*"]``, ``["**/*"]``, …) still works — it just goes through the matcher — so
     this only affects performance, never correctness."""
     return list(patterns) in (["*"], ["**"])
+
+
+@dataclass(frozen=True)
+class Allowlist:
+    """One permission axis as the REPL description template sees it.
+
+    ``patterns`` is the allow-list as configured. ``allow_all`` is whether it is the canonical
+    allow-all spelling (``["*"]`` or ``["**"]``): the template says "any" for that case and lists
+    the patterns otherwise, so a non-canonical allow-all list (``["**/*"]``) is printed as a
+    literal allow-list even though enforcement allows everything. Test ``patterns`` or
+    ``allow_all``, never the value itself: like any object it is always true.
+    """
+
+    # A value, not the predicate. The template used to be handed `allows_everything` itself and
+    # call it, the one callable in its contract; deciding here means the REPL answers "is this
+    # allow-all" once, the same way it answers every other setting the template renders, and a
+    # template author reads two attributes instead of calling into the sandbox module. The
+    # conservatism is inherited from `allows_everything`, and is sound in the safe direction
+    # only: the agent under-uses a permission it has, never the reverse.
+    #
+    # Named `allow_all`, not `unrestricted`: the sandbox reserves "unrestricted" for the `None`
+    # escape it deliberately does not have (see the module docstring), and this field is not
+    # that — it is the canonical spelling of the explicit allow-all, which is exactly the term
+    # the sandbox already uses for `["*"]`.
+    #
+    # No `__bool__` (executive call, user, 2026-09-19): a truthiness shim that followed
+    # `patterns` was considered so a template's old `{% elif allowed_imports %}` kept meaning
+    # "has any pattern", and rejected as surface that hides what the value is. A template tests
+    # `.patterns`; the shipped one does, and the CHANGELOG names the silent case (a bare test on
+    # the object is always true).
+
+    patterns: tuple[str, ...]
+    allow_all: bool
+
+    @classmethod
+    def from_patterns(cls, patterns: Sequence[str]) -> Allowlist:
+        # Same bare-string guard as `compile_allowlist`: `"**"` would iterate as two `*`s and
+        # render as an allow-list of two stars, silently.
+        if isinstance(patterns, str):
+            raise ValueError(
+                f"Expected a list of patterns, not a bare string {patterns!r}."
+            )
+        return cls(tuple(patterns), allows_everything(patterns))

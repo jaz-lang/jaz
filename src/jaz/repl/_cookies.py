@@ -50,6 +50,9 @@ class CookieCollisionError(RuntimeError):
     unreachable with 128-bit random values; raised rather than swallowed so a collision can never
     silently disable a guard."""
 
+    # TODO(#1776): a framework invariant breach rooted at ``RuntimeError``, which ``is_fatal``
+    # treats as recoverable, unlike its ``_JazInternalError`` peers.
+
 
 class CookieJar:
     """Per-compilation registry of cookie placeholders and the real objects they substitute to.

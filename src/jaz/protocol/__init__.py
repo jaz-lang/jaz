@@ -1,8 +1,7 @@
 """Interaction protocols — the codec between the LLM and the REPL.
 
 One of the three pluggable components of an agent loop (BaseREPL × BaseProtocol ×
-BaseLLM). Selected via ``Config.interaction_protocol`` (a registered name or a direct
-instance).
+BaseLLM). Selected by configuring an instance: ``jaz.configure(protocol=...)``.
 
 A protocol both decodes an LLM turn (``parse``) and encodes the messages sent back to
 it (``render_observation`` / ``render_initial_message_list``).
@@ -13,12 +12,9 @@ it (``render_observation`` / ``render_initial_message_list``).
 # first and the encode primitives in later PRs of the same stack.
 
 # Public surface: base + default concrete protocol only (see the uniform-surface note in
-# ``jaz.repl.__init__``). The registration seam and ``ParsedCode`` are re-exported for
-# reachability (internal call sites import them from the package) but kept OUT of ``__all__``
-# via the ruff-blessed ``X as X`` re-export idiom — not part of the v1 public promise.
-from .base import BaseProtocol
-from .base import ParsedCode as ParsedCode
-from .code_only import CodeOnlyProtocol
+# ``jaz.repl.__init__``).
+from ._base import BaseProtocol
+from ._code_only import CodeOnlyProtocol
 
 __all__ = [
     "BaseProtocol",

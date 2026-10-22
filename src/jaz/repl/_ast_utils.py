@@ -1,8 +1,8 @@
-"""Shared AST helpers for the native-return REPL and the eval layer."""
+"""AST helpers for the native-return REPL."""
 
 # Consolidated here by #552: the same top-level-return parsing had been copy-pasted across the
-# REPL, the (since-removed) delegate client and the eval harness's `repl_config_hooks`. Current
-# callers are `PythonREPL._parse_and_transform` and `evals/repl_config_hooks`.
+# REPL, a since-removed delegate client and a host's hooks. The in-package caller is
+# `PythonREPL._parse_and_transform`.
 
 import ast
 

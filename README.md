@@ -37,7 +37,7 @@ To pin a specific release, or to install one that has not reached PyPI, use the
 distribution repo and a release tag:
 
 ```bash
-pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a4"
+pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0b1"
 ```
 
 ### API Keys
@@ -56,9 +56,9 @@ takes precedence over your CLI login:
 
 ```python
 import jaz
-from jaz.llm import CopilotLLM
+from jaz.llm import GitHubCopilotLLM
 
-jaz.configure(llm=CopilotLLM(model="gpt-5-mini"))   # ids are Copilot's own, unprefixed
+jaz.configure(llm=GitHubCopilotLLM(model="gpt-5-mini"))   # ids are Copilot's own, unprefixed
 ```
 
 For CLI authentication, run `gh auth login`, or start `copilot` and enter `/login`.
@@ -136,7 +136,7 @@ with RecursionLimit(max_depth=3):  # optional cap; recursion is unbounded by def
     result = invoke(
         ReturnType(list),
         task="""
-        For each item, use jaz.invoke to process it.
+        For each item, use invoke to process it.
         Combine and return the results.
         """,
         items=data,
@@ -174,8 +174,9 @@ result = invoke(
 )
 ```
 
-To group related tools under one name, pass an object instead: its public methods render
-as a catalog under that name, and the agent calls them as `utils.my_tool(...)`.
+To group related tools under one name, pass an object instead: it renders as its class
+docstring with one bullet per public method, and the agent calls them as
+`utils.my_tool(...)`.
 
 ```python
 class Utils:
@@ -187,6 +188,16 @@ class Utils:
 
 result = invoke(ReturnType(int), task="Use utils.my_tool on 5", utils=Utils())
 ```
+
+The agent sees:
+
+```
+`utils` [Utils]: Utility helpers.
+  - `my_tool(x: int) -> int`: Double a number.
+```
+
+Data and other values render as their `str()`, so define `__str__` on a type to control what
+the agent sees for it, or `__repr__` for a value that sits inside a list or dict.
 
 To make a tool propagate automatically to nested `invoke` calls, bind it with
 `jaz.scope` instead of passing it per call:
@@ -213,7 +224,7 @@ with FileLogger("agent.log"), BudgetPool(cost_budget=1.0):
 
 Pool budgets (LLM cost / call count, shared across the whole invoke/recursion
 tree) are enforced by the opt-in `BudgetPool`; per-level execution limits
-are configuration:
+are opt-in hooks as well:
 
 ```python
 from jaz.hooks import BudgetPool, IterationLimit, RecursionLimit
@@ -237,7 +248,7 @@ update of one setting.
 
 ```python
 from jaz.llm import LiteLLM
-from jaz.repl.python_repl import PythonREPL
+from jaz.repl import PythonREPL
 
 # Per-invoke override
 with jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7, max_tokens=2000)):
@@ -250,16 +261,16 @@ jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"), repl=PythonREPL(exec_timeo
 
 ### Custom & Local LLM Backends
 
-JAZ talks to LLMs through a small `BaseLLM` layer. Currently, **LiteLLM is the only backend covered by the stable API, and the default** — one backend that routes to every provider LiteLLM supports (OpenAI, Anthropic, Gemini, Bedrock, Vertex, …). Other backends ship in the package but can change or be removed. You can add your own backend without forking.
+JAZ talks to LLMs through a small `BaseLLM` layer. **`LiteLLM` is the default** — one backend that routes to every provider LiteLLM supports (OpenAI, Anthropic, Gemini, Bedrock, Vertex, …) — and `GitHubCopilotLLM` and `SGLangLLM` cover the two cases it does not serve well: Copilot billing through GitHub AI credits, and a self-hosted SGLang server addressed token-in/token-out. All three are part of the stable API. You can add your own backend without forking.
 
-A config selects **one** backend: the `BaseLLM` you pass to `llm=`, defaulting to `LiteLLM`. Its constructor takes everything it needs — the `model` id (a LiteLLM route like `openai/gpt-5-mini`), the backend's own settings, and any per-request defaults. A config *file* can name a backend instead of constructing one, but the name lives in whatever reads the file: JAZ's own loaders (the eval harness, the console) each keep their own tag → class mapping, and core carries neither the mapping nor a name on the class. Because litellm is the default, a config need only name the `model`.
+A config selects **one** backend: the `BaseLLM` you pass to `llm=`, defaulting to `LiteLLM`. Its constructor takes everything it needs — the `model` id (a LiteLLM route like `openai/gpt-5-mini`), the backend's own settings, and any per-request params. A config *file* can name a backend instead of constructing one, but the name lives in whatever reads the file: JAZ's own loaders (the eval harness, the console) each keep their own tag → class mapping, and core carries neither the mapping nor a name on the class. Because litellm is the default, a config need only name the `model`.
 
 **Local OpenAI-compatible server** (Ollama, vLLM, LM Studio, llama.cpp, …) — no code, just config:
 
 ```python
 # route the litellm backend to a local OpenAI-compatible server
 # (api_key is required by the openai/ route even for a local server — a dummy value is fine;
-#  it rides request_defaults into litellm.completion)
+#  it rides the query params into litellm.completion)
 jaz.configure(
     llm=LiteLLM(model="openai/llama3", api_base="http://localhost:11434/v1", api_key="dummy"),
 )
@@ -269,46 +280,75 @@ jaz.configure(
 
 ```python
 import os
-from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
+from functools import cached_property
+from jaz.llm import BaseLLM, LLMResponse, ModelInfo, RetryPolicy
 
 class MyLLM(BaseLLM):
-    def __init__(self, base_url: str | None = None, **retry):
-        super().__init__(**retry)             # forwards the retry_* settings
-        self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
+    def __init__(self, model: str, base_url: str | None = None, retry_policy=RetryPolicy(), **query_params):
+        super().__init__(retry_policy=retry_policy)   # the one thing the base holds
+        self._model = model                          # yours: the base has no `model`
+        self._base_url = base_url or os.environ["MYBACKEND_API_BASE"]
+        self._query_params = query_params            # yours too; you put them on the call
 
-    def complete(self, model, messages, **kwargs):
-        # ... call self.base_url; raise jaz.llm.RateLimitError / AuthenticationError / ...
+    def complete(self, messages):
+        # ... call self._base_url; raise jaz.exceptions.RateLimitError / AuthenticationError / ...
         # on API errors so retry classification works.
-        response = CompletionResponse(
-            choices=[Choice(message=Message("assistant", "..."))],
-            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-            model=model,
+        wire = my_http_post(self._base_url, model=self._model, messages=messages, **self._query_params)
+        return LLMResponse(
+            content=wire["text"],
+            prompt_tokens=wire["usage"]["input"],
+            completion_tokens=wire["usage"]["output"],
+            cost_usd=None,                    # or price it yourself; see below
+            extra={},
         )
-        return self.finalize(response, model)  # token accounting + cost, for free
+
+    @cached_property
+    def model_info(self):
+        return ModelInfo(name=self._model)    # what you know; every field defaults to "unknown"
 
 jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
 ```
 
-One class owns the whole job: the API call, retry, cost accounting and model metadata. `finalize()` turns your wire response into the normalized `jaz.llm.LLMResponse` and prices it from the bundled table (models absent from it simply report `cost=None`); the retry wrappers and the non-retryable-error classification come from the base.
+One class owns the whole job: the API call, its parameters, and whatever accounting you choose to report. `complete()` receives the messages and returns an `LLMResponse` — that is the entire contract, and `BaseLLM`, `LLMResponse`, `ModelInfo` and `RetryPolicy` are the only names you need from `jaz.llm`. Nothing passes through the base: the model, the sampling parameters and the credentials are your own state, set in your `__init__` and put on the request by your `complete`. The base holds retry alone, so a backend with a `**query_params` tail names `retry_policy` explicitly and forwards only that. The base has no `model`: a backend that serves a nameable model takes `model=` as its own setting (all three built-ins do) and reports it through `model_info.name`, which is what tracing hooks label spans with; one that serves whatever its server loaded leaves the name `None`. The retry wrappers come from the base, which retries a failed call only on its `retryable_exceptions` (`RateLimitError`, `ServerError` and `APIConnectionError`, timeouts included, from `jaz.exceptions` by default): raise a transient failure as one of those, or add your own class to that tuple, and anything else fails at once. A user can retry more errors with `RetryPolicy(extra_retryable_exceptions=...)`.
 
-When a config *file* names your backend, the split between "settings for the backend object" and "params for the request" is taken from your `__init__` signature, so `base_url` reaches `MyLLM(...)` while `model` rides each call — a backend declares its construction keys just by declaring `__init__`. Whoever loads that file supplies the name → class mapping (`jaz.instantiate.build_config(..., resolvers={"llm": my_lookup})`); JAZ core holds no registry, and a backend class carries no name of its own. Constructing it yourself needs no name at all: `ConfigOverride(llm=my_llm)`.
+**Cost is yours to report.** Set `cost_usd` if you can price the call — [LiteLLM's pricing helpers](https://docs.litellm.ai/docs/completion/token_usage) (`litellm.completion_cost`, `litellm.model_cost`) are what the built-in `LiteLLM` backend prices with, and litellm is a JAZ dependency, so it is already installed.
 
-`OpenAILLM` and `AnthropicLLM` ship in the package but are in no loader's tag map, so `backend: openai` names nothing — reach those providers through litellm's `openai/…` / `anthropic/…` routes. Being nameable and being stable are separate axes: a name can resolve without being covered by the stable API. To add or replace a backend, subclass `BaseLLM`; add it to your loader's map only if a config file needs to name it.
+If your backend *can* price calls, say so with `ModelInfo(can_report_cost=True)` — the default is `False`, because JAZ itself prices nothing. Leaving it alone is safe: a `cost_budget` is then rejected before any call with an error naming your backend, and `calls_budget` still works. `max_input_tokens` is the same shape — it defaults to `None` ("unknown", not "unlimited"), and the `ContextWindowWarning` hook sizes its window from it, so a backend that does not report one just leaves that hook disabled rather than erroring. Retry is one value too: `MyLLM(model=..., retry_policy=RetryPolicy(max_retries=2))`.
 
-The configured model id is sent verbatim: JAZ neither strips nor rewrites a `provider/` prefix, so write the id the backend's own documentation uses. A backend is chosen by configuring it, not by prefixing the model — `OpenAILLM(model="litellm/gpt-4o")` sends that string to OpenAI, which rejects it.
+When a config *file* names your backend, every key in its block is a constructor argument: `model` and `base_url` reach the named parameters, and anything else (`temperature`) lands in your `**query_params` tail — a backend declares its settings just by declaring `__init__`. Whoever loads that file supplies the name → class mapping (the eval harness does it with the non-public `jaz._instantiate.build_config(..., resolvers={"llm": my_lookup})`); JAZ core holds no registry, and a backend class carries no name of its own. Constructing it yourself needs no name at all: `ConfigOverride(llm=my_llm)`.
+
+**Testing without a provider.** `MockLLM` is a backend that answers from a callable, so an agent can be exercised with no API key, no network and no nondeterminism — through the same `configure`/`ConfigOverride` as any backend, with retry and cost accounting intact:
+
+```python
+from jaz.llm import MockLLM
+
+def scripted(messages):
+    return "return 42"                    # a str is the assistant's reply; or return an LLMResponse
+
+with jaz.ConfigOverride(llm=MockLLM(scripted)):
+    assert jaz.invoke(task="add 40 and 2") == 42
+```
+
+`LiteLLM` is the default; `GitHubCopilotLLM` and `SGLangLLM` ship alongside it for the cases it does not cover, and all three are covered by the stable API. Reach OpenAI and Anthropic through litellm's `openai/…` / `anthropic/…` routes — the hand-written vendor-direct backends were removed before the first release. To add or replace a backend, subclass `BaseLLM`; add it to your loader's map only if a config file needs to name it.
+
+The configured model id is sent verbatim: JAZ neither strips nor rewrites a `provider/` prefix, so write the id the backend's own documentation uses. A backend is chosen by configuring it, not by prefixing the model — the prefix tells the configured backend which provider to route to, and a backend that does not route (`SGLangLLM`) sends the id to its own server verbatim.
 
 ## Architecture
 
 ```
 jaz/
-├── invoke.py       # Public invoke() API
-├── config.py       # Configuration system
-├── budget.py       # Cost tracking
-├── repl/           # Python REPL implementations
-├── hooks/          # Hook system, event orchestration, and built-in hooks
+├── _invoke.py      # invoke() / ainvoke(), re-exported from `jaz`
+├── _config.py      # configure() / ConfigOverride / get_config()
+├── _agent.py       # The REPL loop that drives one invoke
+├── repl/           # REPL implementations (PythonREPL)
+├── hooks/          # Hook system: events, effects, dispatcher, built-in hooks (BudgetPool, ...)
 ├── llm/            # LLM backends (LiteLLM by default)
 └── protocol/       # Wire-format codec between the LLM and the REPL
 ```
+
+Modules with a leading underscore are non-public; everything supported is exported from `jaz`
+or one of its public modules (`jaz.hooks`, `jaz.llm`, `jaz.repl`, `jaz.protocol`,
+`jaz.exceptions`, `jaz.credentials`).
 
 ### Core Concepts
 
@@ -384,7 +424,7 @@ turn's **REPLExec** — and every span walks the same four stages. All are impor
 | `*Exit` | the outcome union (`Completed \| Aborted \| Failed`) | nothing (observation-only) | whenever the span opened |
 
 Plus `LLMQueryRetry`, fired per retry attempt of an LLM call. Every event carries
-contextual data (e.g. `LLMQueryEnter.model`, `LLMQueryEnter.iteration`) and a
+contextual data (e.g. `LLMQueryEnter.iteration`, `event.config`) and a
 `timestamp` (its emission time — durations are arithmetic over two events' timestamps).
 
 ### Effect Types
@@ -396,13 +436,17 @@ raises `InvalidEffectError`).
 | Effect | Stage | Influence |
 |--------|-------|-----------|
 | `AddInputs` / `DropInputs` | `InvokeEnter` | Add/un-pass invoke inputs (prompt + REPL) |
-| `DisableRecursion` | `InvokeEnter` | Withhold the recursive `jaz.invoke` tool |
+| `DisableRecursion` | `InvokeEnter` | Withhold the recursive `invoke` tool |
+| `SupplyInvokeResult` | `InvokeSend` | Supply the invoke's result, skipping the agent loop |
+| `ModifyInvokeResult` | `InvokeComplete` | Replace the invoke's result |
 | `AddMessages` / `DropMessages` | `LLMQueryEnter` | Edit the messages sent to the model (transient or persistent) |
-| `AddVariables` / `DropVariables` | `REPLExecEnter` | Bind/unbind REPL namespace names for the turn |
 | `SupplyLLMResponse` | `LLMQuerySend` | Supply the response, skipping the API call |
+| `ModifyLLMResponse` | `LLMQueryComplete` | Replace the model's response |
+| `AddToNamespace` / `DropFromNamespace` | `REPLExecEnter` | Bind/unbind REPL namespace names for the turn |
+| `InsertCode` / `DeleteCode` | `REPLExecEnter` | Edit the code about to run |
 | `SupplyExecResult` | `REPLExecSend` | Supply a result, skipping execution |
-| `ModifyExecResult` | `REPLExecComplete` / `InvokeComplete` | Replace the raw result |
-| `Abort` | any `Enter`/`Send`/`Complete` | Abort the invoke; its error propagates out of `invoke()` |
+| `ModifyExecResult` | `REPLExecComplete` | Replace the raw execution result |
+| `Abort` | any `Enter`/`Send`/`Complete`, and `LLMQueryExit` / `REPLExecExit` | Abort the invoke; its error propagates out of `invoke()` |
 | `BlackboardWrite` | any event | Write to the per-invoke cross-hook blackboard |
 
 ### Langfuse Tracing Quick Start

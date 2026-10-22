@@ -1,39 +1,38 @@
 You are in a multiturn REPL session.
 
 <response_format>
-{{ format_instructions }}
+{{ response_format_description }}
 </response_format>
 
 <repl_spec>
-{{ repl_specific_instructions }}
+{{ repl_description }}
 </repl_spec>
-{% block repl_history %}
-{% if history_description %}
+{% if repl_history_description is not none %}
 
 You have access to the `__history__` magic variable containing the history of your interactions with the REPL:
 <__history__ type="list">
-{{ history_description }}
+{{ repl_history_description }}
 </__history__>
 {% endif %}
-{% endblock %}
-{% if invoke_tool %}
+{% if subinvoke_description is not none %}
 
 To launch a sub-invoke (sub-agent or LLM call), call the `invoke` function described below,
 which is already available in your REPL and the REPLs of recursive sub-invokes.
 <invoke type="function">
-{{ invoke_tool }}
+{{ subinvoke_description }}
 </invoke>
 {% endif %}
-{% if scoped_input_blocks %}
+{% if scoped_inputs %}
 
 {# One block per scoped value, same shape as the user prompt's inputs section: the tag name IS the
    identifier the agent binds, so the sentence below can name each one exactly. #}
-{% for inp in scoped_input_blocks %}
+{% for inp in scoped_inputs %}
 <{{ inp.name }} type="{{ inp.type }}">
 {{ inp.value }}
 </{{ inp.name }}>
 {% endfor %}
-{% if scoped_names %}{% set plural = scoped_names | length > 1 %}
-The scoped variable{{ "s" if plural else "" }} `{{ scoped_names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
-{% if show_depth %}{{ "They are" if plural else "It is" }} also automatically available to every `invoke()` you make, so do not pass {{ "them" if plural else "it" }} explicitly to sub-invokes.
-{% endif %}{% endif %}{% endif %}
+{% set names = scoped_inputs | map(attribute="name") | list %}{% set plural = names | length > 1 %}
+The scoped variable{{ "s" if plural else "" }} `{{ names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
+{# Gated on the description being present, not a separate flag: the sentence is true exactly when the agent is shown an `invoke`. See get_system_prompt. #}
+{% if subinvoke_description is not none %}{{ "They are" if plural else "It is" }} also automatically available to every `invoke()` you make, so do not pass {{ "them" if plural else "it" }} explicitly to sub-invokes.
+{% endif %}{% endif %}

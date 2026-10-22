@@ -1,7 +1,8 @@
 """The persistent, user-scoped credentials store: ``~/.jaz/credentials.json``.
 
-Keys are stored per provider tag — the same names that select a backend in a model string
-(``"openai/gpt-5-mini"``) or in :func:`jaz.configure`::
+Keys are stored per provider tag — the provider prefix of a model string (``"openai"`` for
+``"openai/gpt-5-mini"``), which is also the name the console's ``set_credential('<provider>')``
+takes::
 
     {
       "openai": {"api_key": "sk-..."},
@@ -28,29 +29,24 @@ neither. If a key stored here seems to be ignored, check for an exported variabl
 # EXECUTIVE CALL (user, 2026-08-05) — credentials live in their own file, NOT in
 # ``settings.json`` and NOT in the ``Config`` object, even though passing ``api_key`` to a
 # provider is already a working way to supply a key programmatically. The reason is that a
-# configured key is one ``configure(llm=...)`` away from being recorded: the eval harness
-# persists each run's config to a ``config.json`` on disk and ships it to ProcessPool
-# workers. Keeping credentials out of Config means the secret is never config *input* in the
-# first place — resolution happens at provider construction, downstream of Config entirely —
-# so "save my API key" cannot become "write my API key into every eval run directory".
+# configured key is one ``configure(llm=...)`` away from being recorded: an eval harness
+# persists each run's config to disk and ships it to worker processes. Keeping credentials out
+# of Config means the secret is never config *input* in the first place — resolution happens at
+# provider construction, downstream of Config entirely — so "save my API key" cannot become
+# "write my API key into every eval run directory".
 #
-# This predates the serialization rewrite and its reasoning shifted with it: #1064
-# (``8baf86b8``) removed ``Config.to_dict()`` (a configured component is no longer a
-# description of itself), #1054 split out the authored-data boundary so the harness now
-# records the *authored* config rather than the live one, and ``api_key`` redaction was added
-# at the harness egress (``evals/eval_harness.py::_redact_secrets``). All cut the same way
-# now, but the cleanest guarantee is still to keep the key off the config surface, which is
-# what this file does — it does not have to trust that every future serialization path
-# remembers to redact.
+# A harness can also record only the *authored* config (a configured component is not a
+# description of itself) and redact ``api_key`` at its egress; keeping the key off the config
+# surface is still the cleanest guarantee, because it does not have to trust that every
+# serialization path remembers to redact.
 #
-# Why no cache. NOT for the reason an earlier revision of this comment gave — it claimed
-# `_set_credential(...)` followed by an `invoke(...)` "builds a new provider, which re-reads the
-# file". It does not: `Agent.__init__` does `self.llm_client = self.config.llm` and reuses the
-# configured instance. Freshness comes from the default LiteLLM backend re-resolving on every
-# request, and from nowhere else.
+# Why no cache. `Agent.__init__` does `self.llm_client = self.config.llm` and reuses the
+# configured instance across runs, so a key stored by `_set_credential(...)` reaches the next
+# `invoke(...)` only because the default LiteLLM backend re-resolves on every request — from
+# nowhere else.
 #
 # So the rule is: resolution must stay uncached because a cache would break the "takes effect from
-# the next agent run — no restart needed" promise that `jaz.console.set_credential` makes. The
+# the next agent run — no restart needed" promise that `jaz._console.set_credential` makes. The
 # failure mode a cache invites ("I set my key and it still says not found") is exactly the one that
 # wastes an afternoon.
 #
@@ -60,15 +56,15 @@ neither. If a key stored here seems to be ignored, check for an exported variabl
 # past the explicit-key and environment-variable checks, so a user who exports their key never
 # touches the disk.
 #
-# KNOWN GAP: the single-vendor `OpenAILLM`/`AnthropicLLM` resolve once in `__init__`, so a reused
-# instance never sees a key stored mid-session — for them the no-restart promise is false. Both are
-# dormant since #1082 (LiteLLM is the sole registered backend), so nothing reaches this today;
-# reviving either means moving their resolution to the request path.
+# The no-restart promise holds only for a backend that resolves PER REQUEST, which `LiteLLM` does.
+# A backend resolving once in `__init__` never sees a key stored mid-session, because `Agent`
+# reuses the configured instance rather than rebuilding it; a custom backend that resolves at
+# construction has that gap.
 #
 # Why not the OS keyring (macOS Keychain / libsecret / Windows credential locker), which is
 # what a mature CLI eventually does: it needs a new dependency and per-platform failure
 # modes (headless Linux with no secret service is the common one), and the fallback path
-# would still be this file. Deferred to the design doc; a 0o600 file is what Claude Code
+# would still be this file. Deferred (#1076); a 0o600 file is what Claude Code
 # itself falls back to on Linux, and it is honest about the protection it offers.
 
 from __future__ import annotations
@@ -79,7 +75,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .paths import config_dir, ensure_config_dir
+# Aliased private: this module is public, so a bare import would make `jaz.credentials.
+# config_dir` a reachable, unadvertised name. Neither is handed to a caller — the
+# published path question is answered by `credentials_path()`.
+from ._paths import config_dir as _config_dir
+from ._paths import ensure_config_dir as _ensure_config_dir
 
 # Public API of this submodule. `jaz.credentials` is listed in `jaz.__all__`, so this list
 # is its published contract and what the docs generator pages (a public submodule with no
@@ -105,7 +105,7 @@ API_KEY_FIELD = "api_key"
 
 def credentials_path() -> Path:
     """Return the path of the credentials file (whether or not it exists)."""
-    return config_dir() / _CREDENTIALS_FILENAME
+    return _config_dir() / _CREDENTIALS_FILENAME
 
 
 def load_credentials() -> Mapping[str, Mapping[str, Any]]:
@@ -163,9 +163,7 @@ def resolve_credential(provider: str, field: str = API_KEY_FIELD) -> str | None:
 
     This is the opt-in hook: the store only takes effect for a backend that calls it. The default
     :class:`~jaz.llm.LiteLLM` backend calls it per request, with the provider it routes the model
-    to; the in-tree :class:`~jaz.llm.OpenAILLM` / :class:`~jaz.llm.AnthropicLLM` classes call it
-    once in ``__init__``, having one vendor each. A custom
-    backend that never calls it will not read a key stored under its tag.
+    to. A custom backend that never calls it will not read a key stored under its tag.
     """
     # Non-string values (a number, a nested object) are treated as absent rather than
     # returned: the caller puts this straight into an Authorization header, and a wrong
@@ -192,10 +190,10 @@ def _set_credential(provider: str, value: str, field: str = API_KEY_FIELD) -> st
         ValueError: ``provider`` or ``value`` is empty, or the existing file is malformed.
     """
     # Private on purpose — the underscore is the SDK/CLI boundary, not an implementation
-    # detail. `jaz.console.set_credential` is the supported spelling; see the rule beside
+    # detail. `jaz._console.set_credential` is the supported spelling; see the rule beside
     # `"credentials"` in `jaz/__init__.py:__all__` for why writing is a CLI act.
     #
-    # Returns a LOCATION STRING rather than the `Path` an earlier revision returned. The only
+    # Returns a LOCATION STRING rather than a `Path`. The only
     # caller uses it to print "Stored openai api_key in <here>", and a `Path` hard-codes "the
     # credential is a file" into the signature — which is precisely what an OS-keyring backend
     # (#1076) stops being true of, where the honest answer is "macOS Keychain (jaz)". Cheap to
@@ -216,7 +214,7 @@ def _set_credential(provider: str, value: str, field: str = API_KEY_FIELD) -> st
     entry[field] = value
     existing[provider] = entry
 
-    ensure_config_dir()
+    _ensure_config_dir()
     path = credentials_path()
     _write_private_json(path, existing)
     return str(path)

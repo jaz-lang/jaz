@@ -1,0 +1,178 @@
+"""Per-message provenance: what each conversation message *is* and where it came from.
+
+Provenance answers a question the raw message can't: is this the original system prompt,
+the task, an assistant turn, a REPL observation, or a hook-inserted summary? Consumers read
+it instead of guessing from role/position — ``TrajectoryRecorder`` to log a message's
+true origin, and a context-management hook to pin the load-bearing prefix (system + task) if one
+is configured; core ships none today. The guess
+breaks the moment a persistent edit (compaction) reorders or inserts messages; explicit
+provenance does not.
+
+**Storage: an in-dict reserved key, stripped at the provider egress.** Provenance rides
+*inside* the ``MessageDict`` under :data:`PROVENANCE_KEY`, so it carries through
+:func:`jaz.hooks.effects._apply_message_edits` and every ``messages.append(...)`` for free
+(the dict moves by reference) — there is no parallel list to keep aligned. It must never
+reach a provider: the model-facing message list is projected to wire form via
+:func:`to_wire_messages` at the single egress point (``Agent._to_wire``, applied at the
+provider call, after ``LLMQuerySend`` has observed the stamped committed list),
+which strips every key in :data:`RESERVED_KEYS` the configured backend has not declared it
+lists (``BaseLLM.extra_message_keys`` — provenance is listed by none, so it is always
+stripped; the token sidecar of ``jaz._tokens`` survives only for token-native backends).
+:class:`MessageProvenance` is deliberately a plain dataclass (**not** JSON-serializable by
+default) — a *missed* strip **may** then raise at ``json.dumps`` rather than silently leaking
+an internal key to the model. This is a best-effort backstop, not a guarantee: a serializer
+that coerces unknown types (``json.dumps(..., default=str)`` — used elsewhere in this codebase
+— or a provider/pydantic layer with arbitrary-type fallback) would stringify the stray
+``MessageProvenance`` instead of raising. The actual safety property is structural, not
+incidental: :func:`to_wire_messages` at the single egress point (``Agent._to_wire``)
+is the *only* path from the loop buffer to a provider, so nothing downstream depends on
+``json.dumps`` failing — the non-serializable dataclass is a defense-in-depth nicety on top of
+that, not the load-bearing guarantee.
+
+A type-safe wrapper alternative (``list[Message]`` binding dict + provenance, unwrapped before
+send) was considered and deferred to a tracking issue: it is leak-proof by construction (the
+provider signature forbids sending an un-unwrapped message) but retypes the buffer and the
+``event.messages`` API everywhere, churn not yet justified.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
+
+from jaz._messages import MessageDict
+from jaz._tokens import TOKENS_KEY
+
+
+class MessageKind(StrEnum):
+    """The origin of a conversation message.
+
+    ``SEED`` is *every* message in the initial rendered message list — the whole thing
+    the protocol produces before any turn runs, not just the system + user prompt. For
+    ``CodeOnlyProtocol`` that is ``[system, user]`` (the user message being today's
+    ``<task>`` + ``<inputs>`` + ``<return_type>``, still true once a pending refactor
+    collapses that to just ``<inputs>``); a custom protocol may also seed extra context
+    such as few-shot ``assistant`` examples, and those are seed too. This is the
+    load-bearing prefix a context-management hook would protect. NOTE core ships no such hook
+    since #1348 removed ``SlidingWindow``, so ``SEED`` is currently **write-only** — stamped by
+    the agent, read by nothing in this repo or the eval suite. Kept because the constraint it
+    encodes is the one a replacement has to honour: treat the seed as a single protected unit,
+    never distinguishing within
+    it, and a consumer that does want a particular seed message (the system prompt, say)
+    reads that message's own ``role`` — a finer kind would carry no information ``role``
+    plus ``iteration is None`` doesn't already give. ``ASSISTANT``/``OBSERVATION`` are the
+    normal turn-by-turn growth (``OBSERVATION`` is also ``role="user"`` but carries REPL
+    *output* fed back, not part of the seed). ``ADDED`` is content a hook inserted via
+    ``AddMessages`` (e.g. a compaction summary) — distinguishable from a genuine turn.
+    """
+
+    SEED = "seed"
+    ASSISTANT = "assistant"
+    OBSERVATION = "observation"
+    ADDED = "added"
+
+
+@dataclass(frozen=True)
+class MessageProvenance:
+    """Immutable origin record stamped onto a message.
+
+    Frozen so a surviving message can share one instance across turns/edits by reference.
+    Intentionally not JSON-serializable (see the module docstring): serialize it explicitly
+    where a human-facing record is wanted (e.g. ``TrajectoryRecorder``), and strip it
+    via :func:`to_wire_messages` everywhere else.
+    """
+
+    kind: MessageKind
+    iteration: int | None = None  # iteration when created; None for the seed
+    persistent: bool | None = None  # for ADDED: persistent vs transient
+    # A unique, stable per-message id -- the identity primitive #599 left open. Provenance's
+    # (kind, iteration) narrows identity but can't tell two same-content messages stamped in one
+    # iteration apart; the id can. Read it explicitly (``provenance_of(m).id``) where message
+    # identity is needed -- ATIF's ``extra.message_edits`` names a dropped message by its id. It is
+    # deliberately NOT folded into value-equality (``compare=False``): equality/hashing stay on
+    # (kind, iteration, persistent) so a surviving message can share one frozen instance across
+    # edits by reference. A consumer that instead diffs messages by dict equality therefore does
+    # not see the id -- intentional; message-identity consumers read .id directly.
+    #
+    # Unique per *message*, not per instance: an instance is meant to be shared across TIME (one
+    # message through edits), never across two messages. All stamp sites build a fresh instance per
+    # message, so the invariant holds; stamping one instance onto two messages would give them the
+    # same id.
+    #
+    # A fresh uuid per message per run (uuid4 hex, like session_id's), so it is an identity handle,
+    # not a stable key for diffing trace JSON across runs -- two identical runs get different ids.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Project to a JSON-compatible dict for a human-facing record.
+
+        Explicit opt-in, not automatic ``json.dumps`` support: this dataclass stays
+        deliberately non-serializable by default (see the module docstring) so a missed
+        strip stays visible; call this only where a serialized record is actually wanted
+        (e.g. :class:`~jaz.hooks.TrajectoryRecorder`).
+        """
+        return {
+            "id": self.id,
+            "kind": self.kind.value,
+            "iteration": self.iteration,
+            "persistent": self.persistent,
+        }
+
+
+# Reserved MessageDict key holding a MessageProvenance. Never sent to a provider — projected
+# out by to_wire_messages() at egress. Accessed only via the helpers below, never inline, so
+# the magic string lives in exactly one place.
+PROVENANCE_KEY = "__jaz_provenance__"
+
+
+def provenance_of(message: MessageDict) -> MessageProvenance | None:
+    """The message's provenance, or ``None`` if it was never stamped (e.g. a message a
+    hook constructed by hand)."""
+    return message.get(PROVENANCE_KEY)
+
+
+def set_provenance(message: MessageDict, provenance: MessageProvenance) -> None:
+    """Stamp ``message`` in place. Idempotent-friendly: overwrites any existing stamp."""
+    message[PROVENANCE_KEY] = provenance
+
+
+# Every reserved sidecar key that may ride inside a MessageDict. provenance.py owns this
+# set because it already owns the sidecar channel and the egress choke point below; a new
+# sidecar key added elsewhere MUST be registered here or it will leak to providers. The
+# import direction is acyclic: jaz._tokens keeps zero runtime jaz imports (see its module
+# comment), so provenance can import its key while jaz.llm imports jaz._tokens.
+RESERVED_KEYS: frozenset[str] = frozenset({PROVENANCE_KEY, TOKENS_KEY})
+
+
+def to_wire_messages(
+    messages: list[MessageDict], keep: frozenset[str] = frozenset()
+) -> list[MessageDict]:
+    """Provider-ready copies with reserved sidecar keys removed, except those in ``keep``.
+
+    ``keep`` is the consuming backend's :attr:`jaz.llm._base.BaseLLM.extra_message_keys` —
+    a token-native backend lists the token sidecar so its stamps survive to
+    ``complete()``; for every other backend the default empty set strips all of
+    :data:`RESERVED_KEYS`. Every message is returned as a fresh shallow copy, so a backend
+    that retains the list it was handed never observes a key the framework writes into the
+    buffer's own dicts after the call. This is the single choke point that keeps internal keys
+    out of every provider payload.
+    """
+    # Keying the strip by backend declaration (rather than a boolean or a second egress
+    # function) preserves both properties that matter: text backends still get a provably
+    # clean list — their wire form is byte-identical to the pre-allowlist behavior — and
+    # there is still exactly one egress path to audit. `keep` of an unreserved key is inert:
+    # only reserved keys are ever stripped in the first place.
+    #
+    # Always copy, even a message with nothing to strip. The by-reference pass-through this
+    # replaced was a timing hole: a persistent hook addition is stamped with provenance only
+    # AFTER the query (``Agent._apply_persistent_message_edits`` — the fold's sort key must
+    # not see the non-serializable stamp), so at call time it carried no reserved key, went
+    # to the backend by reference, and then had ``__jaz_provenance__`` written into that very
+    # dict. A backend that serializes synchronously never saw it; one that retains its
+    # request list (a cache, a lazy logger, a replay recorder) did. One shallow copy per
+    # message per call is the price of making "never reaches a backend" true by construction
+    # rather than by timing. Values are still shared — this severs the dict, not its contents.
+    strip = RESERVED_KEYS - keep
+    return [{k: v for k, v in m.items() if k not in strip} for m in messages]

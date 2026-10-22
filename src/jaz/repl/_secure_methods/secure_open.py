@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from pathspec.patterns.gitwildmatch import GitWildMatchPattern
 
-from jaz.exceptions import SandboxPermissionError
+from jaz.exceptions import FileAccessDeniedError
 
 
 class _OpenPolicy(Protocol):
@@ -223,7 +223,7 @@ def make_secure_open(policy: _OpenPolicy) -> Callable[..., Any]:
         target = _normalize_file_path(file_arg)
         if target is None:
             # An int file descriptor has no path to check against the allowlist → fail closed.
-            raise SandboxPermissionError(
+            raise FileAccessDeniedError(
                 "File descriptor access is not allowed in this REPL environment."
             )
 
@@ -233,7 +233,7 @@ def make_secure_open(policy: _OpenPolicy) -> Callable[..., Any]:
             )
             allowed_display = ", ".join(patterns) or "<none>"
             verb = "Writing" if is_write else "Reading"
-            raise SandboxPermissionError(
+            raise FileAccessDeniedError(
                 f"{verb} '{target}' is not allowed in this REPL environment. "
                 f"Allowed {direction} paths: {allowed_display}."
             )

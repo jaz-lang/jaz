@@ -14,16 +14,16 @@ class _ImportPolicy(Protocol):
 def make_secure_import(policy: _ImportPolicy) -> Callable[..., Any]:
     """Create an ``__import__`` wrapper bound to a permission policy (runtime import backstop).
 
-    Runtime complement to the compiler's static ``ImportPolicyChecker``. The static
-    checker (in ``secure_compile``) sees ``import`` / ``from`` *statements* and **reserves the
-    ``__builtins__`` name** — any ``ast.Name`` reference (e.g. ``__builtins__["__import__"]``, an
-    alias, or a rebind) is rejected at compile time, so an agent cannot reach this wrapper through
-    the bare builtins dict. What it does *not* see is ``__import__(...)`` *calls* (neither a
+    Runtime complement to the compiler's static checkers. ``ImportPolicyChecker`` (in
+    ``secure_compile``) sees ``import`` / ``from`` *statements*, and ``ReservedNamesChecker``
+    **reserves the ``__builtins__`` name** — every use, read or bound, is rejected at compile
+    time, so an agent cannot reach this wrapper through the bare builtins dict. What they do *not*
+    see is ``__import__(...)`` *calls* (neither a
     string-*literal* ``__import__("x")`` nor a *computed* ``__import__("o" + "s")`` / ``__import__(var)``),
     the ``IMPORT_NAME`` calls that ``import``
     *statements* compile down to, ``importlib.import_module(...)`` (an attribute), and reflective
     reach to ``__builtins__`` via frame/generator introspection or ``str.format`` (which
-    name-reservation cannot close — see ``ImportPolicyChecker`` and the Known limitations below).
+    name-reservation cannot close — see ``ReservedNamesChecker`` and the Known limitations below).
     Because ``__import__`` is an always-present builtin (every ``import`` statement needs it —
     omitting it makes even allowed imports raise ``ImportError: __import__ not found``), wrapping it
     here — bound to the per-REPL ``allowed_imports`` policy — enforces the allow-list at the moment
@@ -50,7 +50,7 @@ def make_secure_import(policy: _ImportPolicy) -> Callable[..., Any]:
       only sees ``__import__``. (Allow-listing ``importlib`` is itself an escape hatch — see the
       ``"builtins"`` / ``"importlib"`` bullet below.)
     - **The wrapper (this policy-bound ``__import__``) stays reachable — enforcement rides on it,
-      not on hiding it.** ``ImportPolicyChecker`` reserves the ``__builtins__`` *name* (and bare
+      not on hiding it.** ``ReservedNamesChecker`` reserves the ``__builtins__`` *name* (and bare
       ``__import__(...)`` calls still land here directly, the runtime backstop's original job), but
       the sandbox's ``__builtins__`` dict (hence this wrapper) is still reachable through routes
       that do not write the name as an ``ast.Name``: ``globals()["__builtins__"]``,

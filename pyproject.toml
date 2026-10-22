@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaz-lang"
-version = "0.2.0a4"
+version = "0.2.0b1"
 description = "JAZ: The language of building and optimizing LLM-agents"
 authors = [
     { name = "Zhening Li", email = "zli11010@mit.edu" },
@@ -23,11 +23,11 @@ dependencies = [
     "beartype>=0.18.0",
     "typing-extensions>=4.13.0",
     "pathspec>=0.12",
-    "litellm>=1.87.0",
+    "litellm[mcp]>=1.105.0",
 ]
 
 [project.scripts]
-jaz = "jaz.console:main"
+jaz = "jaz._console:main"
 
 [project.optional-dependencies]
 tracing = [
@@ -49,7 +49,6 @@ Changelog = "https://github.com/jaz-lang/jaz/blob/main/CHANGELOG.md"
 [tool.setuptools.package-data]
 jaz = [
     "templates/*.jinja2",
-    "llm/*.json",
 ]
 
 [tool.pytest.ini_options]

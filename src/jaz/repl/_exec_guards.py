@@ -23,8 +23,12 @@ Layer 2 -- SIGALRM nearest-deadline heap (POSIX main thread only). Bridges
 Layer 1's blind spot: blocking C calls (``time.sleep``, blocking IO,
 signal-polling C code such as ``sre``). A process-global min-heap of
 outstanding main-thread deadlines keeps ``setitimer`` armed for the nearest
-one; the handler raises the same owner-tagged ``REPLTimeoutError``. One-shot
-swallowing is not fatal because Layer 1 re-raises on the next agent line.
+one; the handler raises the same owner-tagged ``REPLTimeoutError``. A fired
+deadline is *latched*: it re-arms every ``_SIGALRM_RETRY_SECONDS`` until its
+owner's seam has seen the timeout, so a raise swallowed by library code
+between two blocking calls is raised again inside the next one rather than
+lost -- Layer 1's "re-raise on the next agent line" cannot help when no
+agent line comes.
 
 The ``owner_id`` tag lets REPL catch sites distinguish *their own* expired
 deadline (converted to a ``Continue`` for the agent, as before) from an
@@ -172,6 +176,20 @@ class REPLTimeoutError(Exception):
     so nested execs can distinguish their own timeout from an outer one.
     """
 
+    # Echoes the builtin ``TimeoutError`` without subclassing it, which the public taxonomy
+    # forbids (see ``jaz.exceptions``'s naming rules). Exempt on purpose, as a judged trade
+    # rather than a free pass. Its audience is the AGENT, which reads the class name in the
+    # rendered traceback, and ``TimeoutError`` is vocabulary every model already has where a
+    # jaz-specific spelling is noise; renaming it was tried and reverted for exactly that,
+    # against nineteen assertions that pin the string the agent sees.
+    #
+    # What the trade costs: this never escapes the OUTERMOST ``jaz.invoke`` — the enclosing
+    # exec owns it and renders a ``Continue`` — but a SUB-invoke's guard failure does
+    # propagate out of that inner ``jaz.invoke`` to the exec that called it (see
+    # ``_is_foreign_timeout``), so host-authored tool code running inside an exec can see one,
+    # and an ``except TimeoutError`` there will not catch it. Narrow, and inside the agent's own
+    # execution rather than in a caller's handler, which is why the agent-facing win wins.
+
     owner_id: object | None
 
     def __init__(self, *args: object, owner_id: object | None = None) -> None:
@@ -203,6 +221,20 @@ class REPLMemoryError(Exception):
     Carries an ``owner_id`` (like ``REPLTimeoutError``) so a nested exec can
     tell its own cap breach from an enclosing exec's via ``is_our_memory_error``.
     """
+
+    # Echoes the builtin ``MemoryError`` without subclassing it, which the public taxonomy
+    # forbids (see ``jaz.exceptions``'s naming rules). Exempt on purpose, as a judged trade
+    # rather than a free pass. Its audience is the AGENT, which reads the class name in the
+    # rendered traceback, and ``MemoryError`` is vocabulary every model already has where a
+    # jaz-specific spelling is noise; renaming it was tried and reverted for exactly that,
+    # against nineteen assertions that pin the string the agent sees.
+    #
+    # What the trade costs: this never escapes the OUTERMOST ``jaz.invoke`` — the enclosing
+    # exec owns it and renders a ``Continue`` — but a SUB-invoke's guard failure does
+    # propagate out of that inner ``jaz.invoke`` to the exec that called it (see
+    # ``_is_foreign_timeout``), so host-authored tool code running inside an exec can see one,
+    # and an ``except MemoryError`` there will not catch it. Narrow, and inside the agent's own
+    # execution rather than in a caller's handler, which is why the agent-facing win wins.
 
     owner_id: object | None
 
@@ -245,6 +277,14 @@ except (AttributeError, ValueError, OSError):  # pragma: no cover - non-POSIX
 # 0.01s too). The intended catch-all is the coarse ``RLIMIT_AS`` hard backstop
 # (kernel-enforced, no per-line sampling), deferred to the #812 follow-up.
 _MEMORY_CHECK_INTERVAL = 0.1  # seconds
+
+# How long after a Layer 2 raise the same deadline fires again if its owner has not yet seen it.
+# Long enough that a raise unwinding normally reaches its seam first (a handful of frames), short
+# enough that a swallowed timeout costs seconds rather than the length of the next blocking call.
+# Flat rather than scaled to the entry's own timeout: a retry shorter than a normal unwind is the
+# worse failure (it injects a second raise into the first's handling), and the overshoot it costs
+# is bounded by this constant no matter how short the deadline was.
+_SIGALRM_RETRY_SECONDS = 2.0
 
 
 def current_rss_bytes() -> int | None:
@@ -434,6 +474,17 @@ class _GuardRegistry:
         return entry
 
     def pop(self, entry: _DeadlineEntry) -> None:
+        # CANCELLED FIRST, before any other bookkeeping. `cancelled` is what stops Layer 2 from
+        # re-arming a latched entry, and it used to be set at the *end* of pop (in `_sigalrm_pop`).
+        # A SIGALRM delivered in the prefix -- outside `_in_critical_section`, which covers only the
+        # heap operations -- would then reach `expire_nearest` with the entry still live, re-push it
+        # at +`_SIGALRM_RETRY_SECONDS`, and raise straight out of `pop`, which never finishes and so
+        # never cancels. Nothing downstream recovers: `_prune` reads only `cancelled`. The entry
+        # would re-fire every retry interval for the life of the process, into whatever ran next.
+        # Under the old one-shot code the same window was harmless (a fired entry was already off
+        # the heap); the latch is what makes it unbounded. Harmless when Layer 2 never armed:
+        # `cancelled` is read by nothing but the heap, and Layer 1 gates on `released`.
+        entry.cancelled = True
         tid = threading.get_ident()
         with self._lock:
             stack = self._thread_stacks.get(tid)
@@ -646,11 +697,12 @@ class _GuardRegistry:
             self._in_critical_section = False
 
     def _sigalrm_pop(self, entry: _DeadlineEntry) -> None:
+        # `entry.cancelled` is already set by `pop`, this method's only caller, deliberately ahead
+        # of everything else it does; here the entry just has to leave the heap.
         if not self._sigalrm_installed:
             return
         self._in_critical_section = True
         try:
-            entry.cancelled = True
             self._rearm()
         finally:
             self._in_critical_section = False
@@ -662,6 +714,10 @@ class _GuardRegistry:
 
     def _rearm(self) -> None:
         """(Re)arm the itimer for the nearest live deadline, or disarm."""
+        # ``setitimer``, not ``alarm()``: it takes float seconds (``alarm`` is integer-only, and the
+        # sub-second deadlines this guard exists for would round to 0 or 1), and leaving its
+        # interval at 0 keeps every arm one-shot -- a repeating interval would re-enter the handler
+        # while the previous raise was still unwinding.
         self._prune()
         if self._sigalrm_heap:
             delay = max(1e-4, self._sigalrm_heap[0][0] - _real_monotonic())
@@ -670,12 +726,60 @@ class _GuardRegistry:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
     def expire_nearest(self) -> _DeadlineEntry | None:
-        """Pop and return the nearest expired heap entry (handler helper)."""
+        """Return the nearest expired heap entry, re-scheduled unless its owner has seen it.
+
+        Returns None when nothing has expired, or when the expired entry has already been
+        acknowledged by its owner (``timed_out``) or its exec has ended (``cancelled``/
+        ``released``) and so must not raise. Such an entry is dropped rather than re-scheduled.
+        """
+        # LATCHED, NOT ONE-SHOT. This used to pop the entry, so a deadline got exactly one raise and
+        # the design relied on Layer 1 re-raising "at the next agent line". That assumption fails
+        # when the raise is swallowed by library code between two blocking C calls: Factorio's
+        # tool layer catches ``Exception`` -- which ``REPLTimeoutError`` is -- and returns an empty
+        # result, the cell proceeds into the next RCON ``recv`` on a socket with no timeout, and no
+        # agent line ever comes. Observed: a main thread parked in ``recv`` for four hours under a
+        # 30 s deadline that had fired once and been eaten.
+        #
+        # So an expired entry is put back with a short retry deadline and keeps firing until its
+        # owner's exec seam sets ``timed_out`` (it has *seen* the timeout) or ``pop`` cancels it.
+        # ``timed_out`` is the gate rather than a frame walk: once the seam has caught the error the
+        # agent frames are gone and a re-fire would land inside jaz's own catch-site code. The
+        # window between a raise and the seam catching it can still see one re-fire mid-unwind; that
+        # nests a second ``REPLTimeoutError`` inside the first's handling, which Python chains
+        # harmlessly, and a swallowed timeout is far more expensive than that.
+        #
+        # KNOWN LIMITATION: that "one re-fire" bound holds for an entry whose owner is the exec the
+        # raise lands in. A *foreign* (outer) deadline firing inside a nested invoke unwinds through
+        # sub-invoke teardown, hook dispatch and trace writes before the owning ``guarded_exec``
+        # catches it; if that exceeds the retry interval it re-fires again, each time inside jaz's
+        # own code -- the thing the ``timed_out`` gate exists to prevent. Closing it needs a flag set
+        # at the first catch site that recognises the owner (distinct from ``timed_out``, which is
+        # set at the outer seam) or a cap on re-arms; neither is worth the machinery until a slow
+        # unwind is actually observed, since the cost is chained exceptions rather than a lost
+        # timeout.
+        #
+        # ``released`` is read alongside the other two because it is the flag the clean-completion
+        # path sets, so "the exec is over" is visible here without depending on ``pop`` reaching its
+        # end.
         self._prune()
-        if self._sigalrm_heap and self._sigalrm_heap[0][0] <= _real_monotonic():
-            _, _, entry = heapq.heappop(self._sigalrm_heap)
-            return entry
-        return None
+        if not self._sigalrm_heap or self._sigalrm_heap[0][0] > _real_monotonic():
+            return None
+        _, _, entry = heapq.heappop(self._sigalrm_heap)
+        if entry.timed_out or entry.cancelled or entry.released:
+            return None
+        # Only the HEAP KEY carries the retry time; ``entry.deadline`` keeps the original expiry.
+        # Load-bearing: Layer 1's ``check_deadline_current_thread`` reads ``entry.deadline``, so it
+        # goes on re-raising at every agent line. Rebasing ``entry.deadline`` onto the retry would
+        # silence Layer 1 for a whole interval after each fire.
+        heapq.heappush(
+            self._sigalrm_heap,
+            (
+                _real_monotonic() + _SIGALRM_RETRY_SECONDS,
+                next(self._heap_counter),
+                entry,
+            ),
+        )
+        return entry
 
 
 _registry = _GuardRegistry()
@@ -788,7 +892,7 @@ def register_code(code: CodeType) -> None:
     compiled it:
 
     - Agent-defined functions and classes persist in the REPL namespace
-      (``repl_state_locals``) across turns, so one compiled under no deadline
+      (``PythonREPLState.exec_globals``) across turns, so one compiled under no deadline
       is routinely called by a *later* turn's code that has one -- the same
       registered code object then runs under that later exec's deadline.
     - A registered code object can run on a worker thread that *adopts* an
@@ -1017,13 +1121,18 @@ async def guarded_aexec(
             await aexec(code, globals_dict)
             return
         entry = _registry.push(timeout, owner, use_sigalrm=False)
+        deadline = asyncio.timeout(timeout)
         try:
-            async with asyncio.timeout(timeout):
+            async with deadline:
                 await aexec(code, globals_dict)
         except TimeoutError:
             # asyncio.timeout fired (an await overran our own deadline). asyncio raises
             # the real builtin TimeoutError; normalize it to our owner-tagged
-            # REPLTimeoutError so the REPL exec seam treats it as an own timeout.
+            # REPLTimeoutError so the REPL exec seam treats it as an own timeout. Only if
+            # the deadline is what expired: agent code can raise a `TimeoutError` of its
+            # own, such as `jaz.exceptions.APITimeoutError` from a sub-invoke's LLM call.
+            if not deadline.expired():
+                raise
             entry.timed_out = True
             raise REPLTimeoutError(_timeout_message(timeout), owner_id=owner) from None
         except REPLTimeoutError as e:
@@ -1058,10 +1167,13 @@ async def guarded_aeval(
         if timeout is None:
             return await aeval(code, globals_dict)
         entry = _registry.push(timeout, owner, use_sigalrm=False)
+        deadline = asyncio.timeout(timeout)
         try:
-            async with asyncio.timeout(timeout):
+            async with deadline:
                 return await aeval(code, globals_dict)
         except TimeoutError:
+            if not deadline.expired():  # not ours; see guarded_aexec
+                raise
             entry.timed_out = True
             raise REPLTimeoutError(_timeout_message(timeout), owner_id=owner) from None
         except REPLTimeoutError as e:

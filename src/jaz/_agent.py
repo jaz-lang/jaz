@@ -1,72 +1,50 @@
 import functools
 import itertools
 import uuid
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .invoke import Prehook
+    from ._invoke import Prehook
 
 from tenacity import RetryCallState
 
-from ._invoke_tool import InvokeTool
-from ._llm_client import BaseLLM, LLMResponse
-from .config import Config
+from ._config import Config
+from ._messages import MessageDict
+from ._provenance import (
+    MessageKind,
+    MessageProvenance,
+    set_provenance,
+    to_wire_messages,
+)
+from ._subinvoke import Subinvoke
+from ._tokens import set_tokens, tokens_of
 from .exceptions import (
     MissingDropTargetError,
     REPLInputConflictError,
     _JazInternalError,
 )
 from .hooks import Hook
-from .hooks.dispatcher import HookDispatcher
-from .hooks.effects import apply_message_edits
+from .hooks._dispatcher import HookDispatcher
+from .hooks.effects import _apply_message_edits
 from .hooks.events import (
-    InvokeContext,
     InvokeEnter,
     LLMQueryEnter,
     LLMQueryRetry,
-    LLMQuerySpan,
     REPLExecEnter,
-    REPLExecSpan,
 )
-from .hooks.events.llm_query import MessageEdits
-from .inputs import resolve_inputs
-from .llm import MessageDict
+from .hooks.events._invoke import InvokeContext
+from .hooks.events._llm_query import LLMQuerySpan, MessageEdits
+from .hooks.events._repl_execution import REPLExecSpan
+from .llm._base import BaseLLM
+from .llm._types import LLMResponse
 from .protocol import BaseProtocol
-from .provenance import (
-    MessageKind,
-    MessageProvenance,
-    set_provenance,
-    to_wire_messages,
-)
-from .repl.base import BaseREPL, REPLState
-from .repl.types import (
+from .repl._base import BaseREPL
+from .repl._types import (
     Continue,
     ExecResult,
     Raise,
     Return,
 )
-from .tokens import set_tokens, tokens_of
-
-
-class REPLIterationResult[ReturnT](NamedTuple):
-    """Result from a single REPL iteration.
-
-    Attributes:
-        exec_result: The execution result from the REPL
-        state: The per-invoke :class:`REPLState` threaded across iterations; the REPL
-            itself is stateless config, so it is not carried here.
-        response_content: The LLM response content. Never None: the no-response cases
-            that used to produce one (a failed LLM call, an ``Abort`` at ``LLMQueryEnter``)
-            now *raise* out of the query under the abort model, so an iteration result only
-            exists when a response does. An *empty* completion is coerced to ""
-            (``Agent._record_llm_response``).
-        code: The extracted code from the response (None if not found)
-    """
-
-    exec_result: ExecResult[ReturnT]
-    state: REPLState
-    response_content: str
-    code: str | None
 
 
 class Agent:
@@ -81,33 +59,35 @@ class Agent:
 
         The REPL, LLM and protocol all come off ``config``; there is nothing else to pass.
         To run against the process-wide configuration, pass it at the call site:
-        ``Agent(config=jaz.get_config())``. That read is *depth-less*, so it differs from the
-        config an invoke runs under whenever a per-depth override is in scope.
+        ``Agent(config=jaz.get_config())``. That read is ambient, so it differs from the config an
+        invoke runs under whenever a per-call override is in scope.
         """
         # Requiring `config` is #826 §3 (executive call): the `None`-defaulting shape silently read a
         # different config than the caller's, and it was the read shape #826 set out to retire — it
-        # was the last depth-less `get_config()` read in the codebase. Two other resolutions were
+        # was the last ambient `get_config()` read in the codebase. Two other resolutions were
         # considered and rejected:
         #
-        #   - *Resolve the fallback at depth 1* (treat a bare Agent as a top-level agent). Rejected:
-        #     an Agent has no recursion depth. It carries an optional `prehook` and is just an
-        #     object a caller can drive at any level, so "depth 1" is an invented fact — and
-        #     inventing it widens `configure_by_depth({1: ...})` to silently reach Agents that are
-        #     not top-level invokes.
-        #   - *Keep the fallback depth-less* and document it as the one legitimate ambient read.
-        #     Rejected: honest about the semantics (no depth => no per-depth layer applies), but it
-        #     leaves an implicit ambient read on a public constructor for no ergonomic gain.
+        #   - *Resolve the fallback as if the Agent were a top-level invoke*. Rejected: an Agent
+        #     has no recursion depth. It carries an optional `prehook` and is just an object a
+        #     caller can drive at any level, so treating it as the top is an invented fact.
+        #   - *Keep the ambient fallback* and document it as the one legitimate ambient read.
+        #     Rejected: it leaves an implicit ambient read on a public constructor for no
+        #     ergonomic gain.
         #
         # Requiring the argument resolves the tension instead of picking a side of it: the caller
         # decides, so no depth has to be invented and no ambient read remains in this path. The
         # framework never relied on the fallback anyway — `_build_invoke_setup` has always passed
         # the depth-resolved `config` explicitly (it is the only in-tree construction site), so this
         # was unreachable-in-practice surface, not a capability taken away. It is nonetheless a
-        # breaking change to the public `jaz.Agent` signature; direct construction was exported but
+        # breaking change to the public `jaz._agent.Agent` signature; direct construction was exported but
         # never documented (no example in README/docs/design).
         #
         # `config` is keyword-only; `prehook` is the first positional.
-        self.config = config
+        # Taken as given: a `Config` is complete by construction, so there is nothing to resolve
+        # and no missing-LLM case to handle here. The invoke path folds one at the top of the
+        # invoke; a caller constructing an Agent directly passes `jaz.get_config()`, which
+        # refuses there if nothing is configured.
+        self.config: Config = config
         # The components come straight off the config — there is nothing left to build here.
         # This used to be three resolution blocks (a tag-or-instance branch for the backend, the
         # same for the protocol, and a language lookup for the REPL), each turning a
@@ -119,15 +99,22 @@ class Agent:
         # that existed only because the same fact was expressed twice. `invoke` derived the string
         # from `config.repl` in the first place, so the disagreement it policed was one the caller
         # had to construct deliberately.
-        # The configured REPL is a stateless *template*: `initialize` returns a fresh `REPLState`
-        # per invoke and the template holds no per-invoke state, so one config safely serves many
-        # concurrent invokes (#1056, #1058).
-        self.repl_template: BaseREPL = self.config.repl
+        # The configured REPL is a stateless *template*: `initialize` returns a fresh per-invoke
+        # state and the template holds no per-invoke state itself, so one config safely serves
+        # many concurrent invokes (#1056, #1058).
+        #
+        # `BaseREPL[Any]`, and the threaded state is annotated `object`: the Agent is NOT generic
+        # in the state type. It cannot usefully be — the REPL arrives from `Config`, which is
+        # populated with whatever REPL instance the host configured, so no call site here has
+        # a statically known state type to propagate. Making `Agent` (and therefore `Config`)
+        # generic would push a type parameter through the whole public config surface to recover
+        # a guarantee nothing could supply. Nothing is lost by threading it opaquely: an Agent
+        # holds exactly one REPL and exactly one state built by that REPL's own `initialize`, so
+        # there is no second state for the wrong one to be. The static safety the generic buys is
+        # at the *implementation* boundary — `PythonREPL.exec` will not accept another REPL's
+        # state — which is where the mix-up could actually happen.
+        self.repl_template: BaseREPL[Any] = self.config.repl
         self.llm_client: BaseLLM = self.config.llm
-        self.model: str = self.llm_client.get_model()
-        # Resolved once here, not per turn: both the client and the model are fixed for this
-        # agent's lifetime, so the answer cannot change between iterations.
-        self.can_report_cost: bool = self.llm_client.can_report_cost()
         self.protocol: BaseProtocol = self.config.protocol
         self.prehook = prehook
         # Always a per-invoke dispatcher instance (never the shared singleton): the
@@ -136,7 +123,8 @@ class Agent:
         # could not carry. Local hooks (if any) ride along on the same instance.
         # See HookDispatcher class docstring for why per-instance beats a second
         # contextvar. A HookDispatcher is a trivial object, so per-invoke allocation
-        # is cheap; get_dispatcher() remains for any caller that wants the singleton.
+        # is cheap, and every field on a dispatcher is per-invoke state, so there is no
+        # shared instance to reuse.
         self.dispatcher = HookDispatcher(local_hooks=local_hooks)
         # Per-query side-channel: the message edits composed at the last LLMQueryEnter,
         # stashed by _compose_shown_messages and applied to the carried-forward buffer by
@@ -145,26 +133,37 @@ class Agent:
         # changing its signature.
         self._pending_message_edits: MessageEdits | None = None
 
-        # Per-query side-channel (same idiom as _pending_message_edits): the full LLMResponse
-        # from the last *real* query, stashed by _record_llm_response so _record_history can hand
-        # the whole object to protocol.build_history_entry (the less-lossy #566 input) without
-        # changing what _query_with_messages returns (still the content str — so the many tests
-        # that patch _query_with_messages to return a bare string keep working). Reset to None
-        # before each query; on the mocked path it stays None and _record_history synthesizes a
-        # minimal LLMResponse from the content string, keeping the default projection identical.
+        # Per-query side-channel (same idiom as _pending_message_edits): the full LLMResponse from
+        # the last *real* query, stashed by _record_llm_response so _finalize_iteration can hand
+        # the whole object to repl.update_repl_history without changing what
+        # _query_with_messages returns (still the content str — so the many tests that patch
+        # _query_with_messages to return a bare string keep working). Reset to None before each
+        # query; on the mocked path it stays None and _llm_response_to_record synthesizes a
+        # minimal LLMResponse from the content string, keeping the default record identical.
         self._last_llm_response: LLMResponse | None = None
 
-        # Per-query side-channel (same idiom as the two above): the last query's *pre-strip*
-        # shown list — the buffer dicts (by reference) plus any transient hook additions, as
-        # composed by _compose_shown_messages before the wire projection copies stamped
-        # messages. _stamp_back_tokens needs it because a token-native backend's
-        # TurnRecord.sent is index-aligned with this list, and only these dict objects (not
-        # the wire copies) live on in the buffer. Reset to None before each query; stays
-        # None on the mocked path.
-        # TODO(#1161): this is the third per-query side-channel, each reset in two places (the
-        # sync + async query paths). Collapse all three into one record returned by
-        # _compose_shown_messages and threaded as a local, removing the paired reset sites.
+        # Per-query side-channel (same idiom as the two above): the last query's committed
+        # shown list, exactly what _compose_shown_messages returns — the buffer dicts (by
+        # reference) plus any transient hook additions. _stamp_back_tokens needs it because a
+        # token-native backend's TurnRecord.sent is index-aligned with this list, and only
+        # these dict objects (not the wire copies _to_wire makes at the provider call) live
+        # on in the buffer. Reset to None before each query; stays None on the mocked path.
+        # TODO(#1161): this is the third per-query side-channel. Collapsing all three into one
+        # record threaded as a local is blocked on the test seam, not on the field count: all
+        # three are produced inside _query_with_messages and read outside it, and that method is
+        # patched by the suite in ~150 places, so widening what it returns is a test migration
+        # rather than a refactor. Half-done for this one: the stash IS _compose_shown_messages's
+        # return value now (the wire projection moved to _to_wire), so the data dependency that
+        # justified a separate channel is gone and only that plumbing remains.
         self._pending_shown_messages: list[MessageDict] | None = None
+
+    def _reset_per_query_state(self) -> None:
+        """Clear the per-query side-channels before a query runs."""
+        # A fourth channel goes here, not at the two call sites (the sync and async loops).
+        # Why these live on the instance at all is on the fields above.
+        self._pending_message_edits = None
+        self._last_llm_response = None
+        self._pending_shown_messages = None
 
     def _make_llm_retry_fn(
         self,
@@ -173,12 +172,11 @@ class Agent:
         invoke_id: str,
         iteration: int,
         depth: int,
-        can_recurse: bool,
-    ) -> tuple[Any, str, LLMQueryEnter]:
+    ) -> tuple[Any, LLMQueryEnter]:
         """Bind the Config retry params + a hook-dispatching before-sleep onto
-        ``retry_fn`` (``LLM.(a)complete_with_retry``) and return
-        (fn, invoke_id, enter_event). All retry logic lives on the LLM; the
-        Agent only supplies the parameters and the ``on_retry`` callback."""
+        ``retry_fn`` (``LLM._complete_with_retry`` / ``_acomplete_with_retry``) and return (fn, enter_event).
+        All retry logic lives on the LLM; the Agent only supplies the parameters and
+        the ``on_retry`` callback."""
 
         def log_retry_attempt(retry_state: RetryCallState) -> None:
             exception = retry_state.outcome.exception() if retry_state.outcome else None
@@ -191,7 +189,6 @@ class Agent:
                 LLMQueryRetry(
                     config=self.config,
                     invoke_id=invoke_id,
-                    model=self.model,
                     attempt_number=retry_state.attempt_number,
                     exception=exception
                     if isinstance(exception, Exception)
@@ -205,8 +202,8 @@ class Agent:
         # The Agent supplies `on_retry`, which closes over this invoke's id/iteration to
         # dispatch LLMQueryRetry — per-call observability rather than policy.
         #
-        # No retry settings are threaded. The backend holds its own, and `complete_with_retry`
-        # falls back to them for every kwarg left `None`.
+        # No retry settings are threaded: the backend's `retry_policy` is the only source, and
+        # `_complete_with_retry` reads it.
         #
         # This used to forward `retry_*` out of `llm.params` as per-call overrides, but only for
         # an instance tag: a tag-built client got them through the config boundary, while a pre-built
@@ -219,13 +216,10 @@ class Agent:
             config=self.config,
             invoke_id=invoke_id,
             messages=messages,
-            model=self.model,
             iteration=iteration,
             depth=depth,
-            can_recurse=can_recurse,
-            can_report_cost=self.can_report_cost,
         )
-        return wrapped, invoke_id, enter_event
+        return wrapped, enter_event
 
     def _record_llm_response(
         self,
@@ -241,7 +235,7 @@ class Agent:
         # Complete the span with the response object. Cost tracking + enforcement is
         # handled by BudgetPool (opt-in) observing LLMQueryExit.
         span.complete(response=llm_response)
-        # Stash the whole object for _record_history's projection (see the field's init comment);
+        # Stash the whole object for the history record (see the field's init comment);
         # returning only .content keeps _query_with_messages's content-str contract intact.
         self._last_llm_response = llm_response
         # ``or ""`` is the single point where the wire's nullable content becomes a plain str, so
@@ -274,7 +268,6 @@ class Agent:
         iteration: int,
         depth: int,
         invoke_id: str,
-        can_recurse: bool,
     ) -> str:
         # An Abort composed at any of the query's stages raises its carried exception out
         # of this method (from the `with` statement for an enter-time hard-stop, from
@@ -284,25 +277,24 @@ class Agent:
         # HookDispatcher._unwind_outcome). Content is coerced to ``str`` at
         # ``_record_llm_response`` (an empty completion projects to ``""``, #1141), so this
         # returns a plain ``str`` — never ``None``, never a laundered ``Raise``.
-        complete_fn, invoke_id, enter_event = self._make_llm_retry_fn(
-            self.llm_client.complete_with_retry,
+        complete_fn, enter_event = self._make_llm_retry_fn(
+            self.llm_client._complete_with_retry,
             messages,
             invoke_id,
             iteration,
             depth,
-            can_recurse,
         )
         with self.dispatcher.span_llm_query(enter_event) as span:
             shown = self._compose_shown_messages(span, messages)
             # LLMQuerySend — fires iff the input committed. ``shown`` IS the committed
-            # input (the post-edit list handed to the result producer), so Send fires here
+            # input (the post-edit list; the result producer gets its ``_to_wire`` projection), so Send fires here
             # unconditionally: on the live-call path AND the supplied path below (the
             # commit is real on both; only the producer differs — Send is where a supplier
-            # like Replay answers, with the committed list in view). It does not fire on
+            # like TrajectoryReplay answers, with the committed list in view). It does not fire on
             # an enter-time abort — that raises out of the `with` statement before this
             # body runs, so no input ever commits (the span still closes, Aborted).
             span.send(shown)
-            # Send-supplied response (e.g. Replay): the provider call is skipped.
+            # Send-supplied response (e.g. TrajectoryReplay): the provider call is skipped.
             if span.supplied_response is not None:
                 llm_response: LLMResponse = span.supplied_response
             else:
@@ -312,14 +304,10 @@ class Agent:
                 # TODO(#697): deliberately downgrading *selected* failures to a
                 # recoverable Continue remains a legitimate future loop policy (as loop
                 # policy — not the blanket Raise-conversion #687 used to do here).
-                llm_response = complete_fn(
-                    model=self.model,
-                    messages=shown,
-                    **self.llm_client.request_defaults,
-                )
+                llm_response = complete_fn(messages=self._to_wire(shown))
             result = self._record_llm_response(llm_response, span)
         # Span closed: a Complete-stage ModifyLLMResponse may have replaced the response
-        # (authoritative — see resolve_llm_modify_results). If so, re-read it: its content is what
+        # (authoritative — see _resolve_llm_modify_results). If so, re-read it: its content is what
         # the agent parses next, and the same object is what LLMQueryExit carried and BudgetPool
         # booked, so content / observers / cost all agree. The identity check leaves the common
         # no-transform path (same object) untouched, and covers the supplied-response path too.
@@ -347,21 +335,33 @@ class Agent:
         attribute before each query, so when the query is mocked away in tests it simply
         stays empty (no persistence).
 
-        This is also the single **provider-egress** point: the returned list is projected
-        to wire form (``to_wire_messages``), stripping every reserved sidecar key the
-        configured backend has not declared it consumes
-        (``BaseLLM.consumes_internal_keys``), so internal per-message keys never reach a model
-        that doesn't read them. Both the sync and async query paths route through here, so
-        one strip covers both regardless of the underlying LLM client.
+        The returned list is the committed message list itself — the buffer's stamped dicts
+        (by reference) plus the folded edits — and is what ``LLMQuerySend`` carries. The wire
+        projection is NOT applied here: it is backend-specific (``BaseLLM.extra_message_keys``
+        decides which sidecar keys survive), so a committed list that had it baked in would
+        change with the backend from an identical buffer and identical edits, and would differ
+        in shape from ``LLMQueryEnter.messages``. :meth:`_to_wire` projects it at the provider
+        call instead — still one strip point, shared by the sync and async paths.
         """
         edits = span.ctx.message_edits
         self._pending_message_edits = edits
-        shown = apply_message_edits(messages, edits.all_drops, edits.all_adds)
-        # Stashed pre-strip: `shown` holds the buffer's own dicts by reference (the fold
-        # never copies), while the wire projection below copies every stamped message — so
-        # this list, not the returned one, is what stamp-back can mutate meaningfully.
+        shown = _apply_message_edits(messages, edits.all_drops, edits.all_adds)
+        # Stashed for stamp-back: `shown` holds the buffer's own dicts by reference (the fold
+        # never copies), while the wire projection at the provider call copies every
+        # message — so this list is what stamp-back can mutate meaningfully.
         self._pending_shown_messages = shown
-        return to_wire_messages(shown, keep=self.llm_client.consumes_internal_keys)
+        return shown
+
+    def _to_wire(self, shown: list[MessageDict]) -> list[MessageDict]:
+        """Project the committed message list to the configured backend's wire form.
+
+        The single **provider-egress** point: strips every reserved sidecar key the configured
+        backend has not listed in ``BaseLLM.extra_message_keys``, so internal per-message keys
+        never reach a model that doesn't read them. Applied at the provider call, AFTER
+        ``LLMQuerySend`` has observed the committed list — the event carries the stamped
+        buffer view, the provider gets its projection.
+        """
+        return to_wire_messages(shown, keep=self.llm_client.extra_message_keys)
 
     def _apply_persistent_message_edits(
         self, messages: list[MessageDict], iteration: int
@@ -376,17 +376,27 @@ class Agent:
         the buffer. A no-op unless a hook emitted a persistent ``DropMessages`` /
         ``AddMessages`` (context compaction).
 
-        Inserted messages are stamped with ``ADDED`` provenance *after* the fold — the
-        add's dict objects are now in the buffer by reference, and stamping earlier would
-        put a non-serializable provenance value into ``AddMessages.messages`` before the
-        fold's ``json.dumps`` sort-key computation runs over it.
+        Inserted messages are stamped with ``ADDED`` provenance after the fold, over the
+        persistent adds only: those are the dicts the fold put in the buffer, and an id means
+        "this is a buffer message", which a transient add never becomes.
         """
+        # The stamp used to be placed after the fold for a second, stronger reason: the fold
+        # computed a ``json.dumps`` sort key over ``AddMessages.messages``, which a provenance
+        # value is not serializable into. That sort key is gone (same-slot adds now apply in hook
+        # order), so only the reason above still holds. It is enough on its own, but the
+        # placement is no longer forced: the fold inserts these dicts by reference, so stamping
+        # them before it would reach the same objects.
+        #
+        # A consequence worth knowing, because a reader of the trace meets it: at
+        # ``LLMQuerySend`` -- where ``TrajectoryRecorder`` writes the turn's edit records -- no
+        # add is stamped yet, so an added message is recorded without an id and is identified by
+        # its record's position until the next enter.
         # Persistent edits are applied against the buffer, not the query snapshot, so the two coincide
         # for the next query — the invariant #660 established for `AddMessages`.
         edits = self._pending_message_edits
         if edits is None or not edits.has_persistent:
             return
-        messages[:] = apply_message_edits(
+        messages[:] = _apply_message_edits(
             messages, edits.persistent_drops, edits.persistent_adds
         )
         for add in edits.persistent_adds:
@@ -424,7 +434,7 @@ class Agent:
         from a token-native backend such as ``SGLangLLM``): text backends, mocked
         queries and replay overrides leave the buffer untouched.
         """
-        # This is the "stamp-back" edge of the token-rollout design (see jaz.tokens'
+        # This is the "stamp-back" edge of the token-rollout design (see jaz._tokens'
         # module comment for the rationale): the backend mints one frozen
         # TokenStamp per wire message inside complete(); here the agent attaches each
         # stamp to the buffer dict it came from, so the *next* send reuses the exact ids
@@ -432,14 +442,20 @@ class Agent:
         # reference. The agent treats stamps as opaque blobs and stays token-blind.
         #
         # Positional contract: record.sent[i] describes wire message i, and the wire list
-        # is an element-wise projection of the stashed pre-strip shown list — so
+        # is an element-wise projection of the stashed shown list — so
         # zip(shown, sent) pairs each stamp with the dict that produced it.
         # strict=True fails loud on a length mismatch — a genuine one-stamp-per-wire-message
-        # violation, i.e. a backend bug worth raising on. A subtler misalignment does NOT put
-        # wrong ids on the wire: the next send's content-guard re-renders any mismatched stamp,
-        # and per-message ids are a pure function of (content, chat template). Its real cost is
-        # downstream — _extends (rollout export) stops chaining, so to_flat shatters into pieces:
-        # degraded export quality, not corrupted training ground truth.
+        # violation, i.e. a backend bug worth raising on.
+        #
+        # A same-length misalignment is the dangerous one, and the content-guard alone does not
+        # catch it: the backend's re-render check compares `content_text` only, while a stamp's
+        # ids also depend on the ROLE, which the chat template renders as a header. So two
+        # same-content messages that swapped roles pass the content-guard and keep ids rendered
+        # under the wrong role. That is why the stamp-back below checks role as well as identity
+        # and skips rather than stamps on a mismatch; `test_role_mismatch_skips_the_stamp_rather_
+        # than_mis_stamping` pins it. Where the guard does hold, the cost is downstream only —
+        # _extends (rollout export) stops chaining, so to_spans() splits there: degraded
+        # export quality, not corrupted training ground truth.
         #
         # The identity check against the buffer is what skips (a) transient hook-added
         # messages — hook-owned dicts that are not in the buffer; their stamps live only
@@ -483,27 +499,24 @@ class Agent:
         self,
         messages: list[MessageDict],
         response_content: str,
-        repl: BaseREPL,
         invoke_id: str,
         iteration: int,
         depth: int,
-    ) -> tuple[float | None, REPLExecEnter]:
+        state: object,
+    ) -> REPLExecEnter:
         """Record the assistant response and decode it into an execution plan.
 
         Shared by the sync and async iteration paths — which differ *only* in how the
         response is fetched and how the code is executed; everything around that is
         identical and lives here (and in :meth:`_finalize_iteration`) so the two paths
-        cannot drift. Appends the assistant message, then parses, and always returns
-        ``(exec_timeout_override, enter_event)``. The parsed code rides on ``enter_event.code``
-        (its edit target); the code that actually *runs* is ``span.committed_code`` — the enter
-        code after any ``InsertCode`` / ``DeleteCode`` — so the bare parsed string is not returned
-        separately (it would be dead at both call sites).
+        cannot drift. Appends the assistant message, then parses, and returns the
+        ``enter_event``. The parsed code rides on ``enter_event.code`` (its edit target); the code
+        that actually *runs* is ``span.committed_code`` — the enter code after any ``InsertCode``
+        / ``DeleteCode`` — so the bare parsed string is not returned separately (it would be dead
+        at both call sites).
 
-        There is exactly one outcome now. This used to return either that tuple or a ready
-        ``REPLIterationResult`` carrying a recoverable parse error, which callers told apart with
-        ``isinstance`` — a discrimination that only worked because the success branch was a
-        *plain* tuple rather than a ``NamedTuple``. ``parse`` no longer has a failure mode, so
-        both the second outcome and that latent trap are gone.
+        There is exactly one outcome: ``parse`` has no failure mode, so there is no second
+        return shape for a caller to discriminate against.
         """
         assistant_message: MessageDict = {
             "role": "assistant",
@@ -526,51 +539,57 @@ class Agent:
         # canonical object the history record uses (``_last_llm_response`` on the real query path,
         # a synthesized one on the mock path), so a protocol can read ``.content is None`` /
         # ``.raw_response`` (refusal / finish_reason / tool_calls) rather than a coerced string.
-        code, exec_timeout_override = self.protocol.parse(
-            self._llm_response_to_record(response_content)
-        )
+        code = self.protocol.parse(self._llm_response_to_record(response_content))
 
         enter_event = REPLExecEnter(
             config=self.config,
             invoke_id=invoke_id,
             iteration=iteration,
             code=code,
+            # The namespace BEFORE this turn's AddToNamespace/DropFromNamespace: the proposal the
+            # enter-time effects edit, read off the REPL here because only the loop holds the
+            # state. The event copies it.
+            namespace=self.repl_template.get_namespace(state),
             depth=depth,
         )
-        return exec_timeout_override, enter_event
+        return enter_event
 
     def _finalize_iteration(
         self,
         span: REPLExecSpan,
-        code: str,
-        state: REPLState,
         response_content: str,
-        repl_history: list[object],
-    ) -> REPLIterationResult[Any]:
-        """Apply exit-time overrides and append the iteration's history entry.
+        state: object,
+    ) -> ExecResult[Any]:
+        """Apply exit-time overrides and hand the turn to the REPL's history record.
 
         Shared by both iteration paths. ``span.get_final_exec_result()`` folds in any
-        Complete-time ModifyExecResult / Abort; the core loop is the single writer
-        of ``__history__`` and appends one entry per iteration from that FINAL
-        (post-override) result — so a result-override hook (e.g. BudgetForcing) is
-        reflected in history without the REPL knowing, and an enter-time override
-        that skipped exec() still records an entry. ``repl_history`` is the same list the
-        REPL surfaced as ``__history__`` (by reference).
+        Complete-time ModifyExecResult / Abort; the REPL is handed that FINAL (post-override)
+        result — so a result-override hook (e.g. BudgetForcing) reaches the REPL history without
+        ``exec`` knowing, and a turn whose ``exec()`` an enter-time override skipped is handed over
+        too.
         """
         # History must not record a REPL result the REPL never saw (#448), which is why the exit-time
         # and enter-time override paths are kept distinct here.
+        #
+        # Every turn that reaches here is handed to the REPL exactly once, so ``PythonREPL``, which
+        # appends an entry per call, holds one entry per iteration (#719), and no guard is needed
+        # to say so: ``response_content``
+        # is a ``str`` by the time it reaches ``_llm_response_to_record``, so that always returns
+        # an object; an empty completion records ``llm_response=""``. The no-response terminal
+        # paths (a failed LLM call, or an ``Abort``) *raise* out of ``do_one_repl_iteration`` and
+        # never reach here.
+        #
+        # The one-entry-per-iteration invariant is not something to lean on for addressing:
+        # nothing addresses history *by iteration number*, and anything naming the current turn's
+        # entry uses ``[-1]``, which holds without it. This runs before the turn's observation is
+        # rendered, so ``[-1]`` is that turn — the property the deleted truncation-advice templates
+        # relied on when they pointed the agent at ``__history__[-1].repl_output``, and that any
+        # host template restating that pointer still relies on.
         exec_result = span.get_final_exec_result()
-        self._record_history(
-            repl_history,
-            self._llm_response_to_record(response_content),
-            exec_result,
+        self.repl_template.update_repl_history(
+            state, self._llm_response_to_record(response_content), exec_result
         )
-        return REPLIterationResult(
-            exec_result=exec_result,
-            state=state,
-            response_content=response_content,
-            code=code,
-        )
+        return exec_result
 
     def _llm_response_to_record(self, response_content: str) -> LLMResponse:
         """The ``LLMResponse`` to record for the current turn.
@@ -592,67 +611,24 @@ class Agent:
         # ``Abort`` at ``LLMQueryEnter``) return in ``do_one_repl_iteration`` before reaching here.
         # This used to have a third branch returning ``None`` for "no response to record", which
         # made the caller's history append conditional; that branch was already unreachable in
-        # practice (verified: converting it to an assert produced zero hits across tests + evals)
+        # practice (verified: converting it to an assert produced zero hits across the test suite)
         # and is now unreachable by construction.
         if self._last_llm_response is not None:
             return self._last_llm_response
         return LLMResponse(content=response_content)
 
-    def _record_history(
-        self,
-        repl_history: list[object],
-        llm_response: LLMResponse,
-        exec_result: ExecResult,
-    ) -> None:
-        """Append one ``__history__`` entry for a turn that produced an LLM response.
-
-        Records **every** turn the LLM actually responded to, storing the FULL response
-        (``REPLHistoryEntry.llm_response`` — the raw code incl. its leading comments), not the parsed
-        code. This includes a turn whose response **failed to parse**: that is still a real turn the
-        LLM took, and its entry carries the unparseable response plus the parse-error exception in
-        ``repl_exception`` (``exec_result`` there is the recoverable ``Continue`` the parse error was
-        surfaced as). A meta-agent analyzing behavior therefore sees malformed turns too, and the
-        per-turn index stays aligned with the loop's iteration count.
-
-        ``llm_response`` (resolved by :meth:`_llm_response_to_record`) is the whole ``LLMResponse``,
-        not the bare content string, so the configurable ``self.protocol.build_history_entry`` seam
-        can record a richer entry.
-        """
-        # The ``build_history_entry`` seam is #566's.
-        # Every turn that reaches here records an entry, so ``__history__`` holds exactly one per
-        # iteration (#719), and no guard is needed to say so: ``response_content`` is a ``str`` by
-        # the time it reaches ``_llm_response_to_record``, so that always returns an object. An
-        # empty completion is no exception — it projects to ``llm_response=""`` in
-        # ``build_history_entry``, as it always has. The no-response terminal paths (a failed LLM
-        # call, or an ``Abort``) *raise* out of ``do_one_repl_iteration`` and never reach here.
-        #
-        # The one-entry-per-iteration invariant is not something to lean on for addressing:
-        # nothing addresses history *by iteration number*, and anything naming the current turn's
-        # entry uses ``[-1]``, which holds without it. This append runs inside
-        # ``_finalize_iteration``, before the turn's observation is rendered, so ``[-1]`` is that
-        # turn — the property the deleted truncation-advice templates relied on when they pointed
-        # the agent at ``__history__[-1].repl_output``, and that any host template restating that
-        # pointer still relies on.
-        repl_history.append(
-            self.protocol.build_history_entry(llm_response, exec_result)
-        )
-
     def do_one_repl_iteration(
         self,
         iteration: int,
         depth: int,
-        can_recurse: bool,
         messages: list[MessageDict],
-        state: REPLState,
+        state: object,
         invoke_id: str,
-        repl_history: list[object],
-    ) -> REPLIterationResult[Any]:
+    ) -> ExecResult[Any]:
         # TODO: Fix static types
         # The query snapshot is the buffer itself — prompt additions arrive as message
         # edits folded at query time (see _compose_shown_messages), not baked in ahead.
-        self._pending_message_edits = None
-        self._last_llm_response = None
-        self._pending_shown_messages = None
+        self._reset_per_query_state()
         # No catch around the query: a failed LLM call (e.g. a missing API key surfaced as
         # AuthenticationError, or any error still raised after the retry policy) PROPAGATES
         # — LLMQueryExit(Failed) fired from the span CM, the invoke span closes Failed on
@@ -666,17 +642,16 @@ class Agent:
             iteration=iteration,
             depth=depth,
             invoke_id=invoke_id,
-            can_recurse=can_recurse,
         )
         # Apply any persistent message edits (compaction) to the carried-forward buffer.
         self._apply_persistent_message_edits(messages, iteration)
-        exec_timeout_override, enter_event = self._record_response_and_parse(
-            messages, response_content, self.repl_template, invoke_id, iteration, depth
+        enter_event = self._record_response_and_parse(
+            messages, response_content, invoke_id, iteration, depth, state
         )
 
         with self.dispatcher.span_repl_exec(enter_event) as span:
-            # Apply AddVariables then DropVariables to the REPL namespace before this turn's
-            # code runs. Adds bind raw names (no ``__jaz_get__``, prompt untouched) — the
+            # Apply AddToNamespace then DropFromNamespace to the REPL namespace before this turn's
+            # code runs. Adds bind names without touching the prompt — the
             # per-turn namespace counterpart of the invoke-level AddInputs; drops unbind names
             # so a dropped name (e.g. __history__) reads as a genuine NameError. Applied
             # whether or not an override skips exec, so the namespace state is consistent for the
@@ -684,8 +659,8 @@ class Agent:
             #
             # DROPS RUN FIRST, mirroring ``_apply_input_effects``. Add-first made re-binding a
             # name impossible even though both this effect's docstring and
-            # ``PythonREPL.add_variables`` documented the recipe: pairing a ``DropVariables``
-            # with an ``AddVariables`` hit the already-bound check while the old value was still
+            # ``PythonREPL.add_to_namespace`` documented the recipe: pairing a ``DropFromNamespace``
+            # with an ``AddToNamespace`` hit the already-bound check while the old value was still
             # there and raised ``REPLInputConflictError``, and on an unbound name the pair bound
             # then immediately unbound. Dropping first makes drop-then-add a re-bind, which is
             # the only way to replace a name a hook does not own.
@@ -694,19 +669,21 @@ class Agent:
             # remove a name another effect adds in the same turn (the add now wins). A drop that
             # outlives an add is the same mechanism that lets a stale drop erase one, and the two
             # cannot both hold in a single pass.
-            self.repl_template.drop_variables(
+            self.repl_template.drop_from_namespace(
                 state,
-                span.ctx.dropped_variables,
-                allow_missing=span.ctx.dropped_variables_allow_missing,
+                span.ctx.namespace_drops,
+                allow_missing=span.ctx.namespace_drops_allow_missing,
             )
-            self.repl_template.add_variables(state, span.ctx.added_variables)
+            self.repl_template.add_to_namespace(state, span.ctx.namespace_adds)
             # REPLExecSend — fires iff the code committed. The namespace deltas above just
-            # ran, so the execution's commit (code + committed namespace) is final. Send is
-            # the supply boundary: suppliers (ValidateREPLCode, evals Restrict*) compose
-            # here and the resolved short-circuit lands on span.supplied; an Abort raises
-            # its carried exception out of span.send() instead (the span closes Aborted —
-            # see span_repl_exec).
-            span.send()
+            # ran, so the execution's commit (code + committed namespace) is final, and the
+            # namespace the REPL now reports rides on the event (the loop passes it, as it
+            # passes the committed inputs into InvokeSpan.send — only the loop holds the
+            # state). Send is the supply boundary: suppliers (ValidateREPLCode, a host's
+            # restriction hooks) compose here and the resolved short-circuit lands on span.supplied;
+            # an Abort raises its carried exception out of span.send() instead (the span
+            # closes Aborted — see span_repl_exec).
+            span.send(self.repl_template.get_namespace(state))
             if span.supplied is not None:
                 # A Send-composed SupplyExecResult short-circuits execution: skip running
                 # the code and use the supplied result instead.
@@ -717,15 +694,13 @@ class Agent:
                 # same string REPLExecSend observers saw, so what runs matches what was validated.
                 # (Invoke inputs are folded in once at InvokeEnter, not here: AddInputs/DropInputs
                 # are InvokeEnter-only — #481. Per-turn namespace binds go through
-                # AddVariables/DropVariables above.)
+                # AddToNamespace/DropFromNamespace above.)
                 exec_result = self.repl_template.exec(
-                    state, span.committed_code, str(iteration), exec_timeout_override
+                    state, span.committed_code, str(iteration)
                 )
             span.complete(exec_result=exec_result)
 
-        return self._finalize_iteration(
-            span, span.committed_code, state, response_content, repl_history
-        )
+        return self._finalize_iteration(span, response_content, state)
 
     def _append_observation_messages(
         self,
@@ -745,7 +720,7 @@ class Agent:
         # #634 removed the budget-status / "enter your next REPL input" footer from every observation;
         # #657 tracks re-surfacing the budget half as a transient per-query addition.
         new_messages: list[MessageDict] = list(
-            self.protocol.render_observation(exec_result, iteration)
+            self.protocol.render_observation(exec_result)
         )
         for message in new_messages:
             # Stamp each observation message so consumers (TrajectoryRecorder, a
@@ -762,34 +737,32 @@ class Agent:
         ctx: "InvokeContext",
         inputs: dict[str, object],
         scope: dict[str, object],
-        resolved_inputs: dict[str, object],
-        resolved_bound: dict[str, object],
-    ) -> tuple[
-        dict[str, object],
-        dict[str, object],
-        dict[str, object],
-        dict[str, object],
-    ]:
-        """Fold an invoke's ``AddInputs`` / ``DropInputs`` effects into the input dicts *before*
-        the REPL and prompt are built. **Drops are applied first, then adds**, so dropping and
-        adding the same key replaces it. Added values are bound raw for the prompt (``inputs``)
-        and ``resolve_inputs``-resolved for the REPL namespace (``resolved_bound``) — exactly how
-        a top-level input is handled. An added key that collides with a caller-provided top-level
-        input/scope entry raises (a hook may not silently override the caller). Dropped names are
-        removed from all agent-facing dicts (``inputs``/``scope``/``resolved_inputs``/
-        ``resolved_bound``), so the input is un-passed from the prompt and the REPL; dropping a
-        name the invoke never received raises ``MissingDropTargetError`` unless that
-        ``DropInputs`` opted into ``allow_missing``. Returns the updated ``(inputs, scope,
-        resolved_inputs, resolved_bound)``; the inputs are copied only when an effect is present
-        (the common no-effect path returns them unchanged)."""
-        # ``resolved_inputs`` (the resolved EXPLICIT inputs, scope excluded) is threaded
-        # through so the loop can hand ``InvokeSend`` the committed counterpart of
-        # ``InvokeEnter.inputs`` without re-running ``resolve_inputs`` over the whole dict
-        # (``__jaz_get__`` may be side-effecting, so values are resolved exactly once).
+    ) -> dict[str, object]:
+        """Fold an invoke's ``AddInputs`` / ``DropInputs`` effects into ``inputs`` *before* the
+        REPL and prompt are built. **Drops are applied first, then adds**, so dropping and adding
+        the same key replaces it. An added key that collides with a caller-provided top-level
+        input/scope entry raises (a hook may not silently override the caller). ``scope`` is never
+        edited — a ``jaz.scope`` value is not an input, so naming one is "a name the invoke never
+        received" and raises ``MissingDropTargetError`` like any other, unless that ``DropInputs``
+        opted into ``allow_missing``; ``scope`` is read only, for the add-collision check. Returns
+        the committed ``inputs``, copied only when an effect is present (the common no-effect path
+        returns it unchanged)."""
+        # The REPL namespace is NOT edited here (review of #1497): these effects are named for
+        # ``inputs`` and edit only that, per the event-shape rule that an effect edits the field it
+        # is named for. The merged namespace the REPL binds is a DERIVATION of the committed result
+        # — the caller rebuilds it as ``{**scope, **inputs}`` right after this returns — so it
+        # cannot drift from the commit, and there is no second dict to keep in step. Folding it
+        # here used to require filtering by the dropped names that were *actually inputs*, purely
+        # so an ``allow_missing`` drop naming a scope value would not strip it from the merged
+        # dict; deriving the merge instead makes that structural.
+        # There used to be a fourth dict here — the `__jaz_get__`-resolved counterpart of
+        # `inputs`, threaded through so `InvokeSend` could be handed committed values without
+        # re-resolving (a getter could be side-effecting, so each was resolved exactly once).
+        # With the protocol gone, values bind as themselves and `inputs` IS that counterpart.
         added = ctx.added_inputs
         dropped = ctx.dropped_inputs
         if not added and not dropped:
-            return inputs, scope, resolved_inputs, resolved_bound
+            return inputs
         # Drops run BEFORE adds, so each check reads the state its contract is about:
         # ``MissingDropTargetError`` sees the inputs the invoke was actually called with, and the
         # add-collision check sees what survives the drops.
@@ -814,14 +787,21 @@ class Agent:
         # Pinned by ``test_a_drop_cannot_remove_a_key_another_effect_adds``.
         if dropped:
             # Fail loud on a drop of a name this invoke never received — a hook bug (typo, or a
-            # "re-drop every turn" pattern), exactly as ``DropVariables`` does at the REPL layer and
+            # "re-drop every turn" pattern), exactly as ``DropFromNamespace`` does at the REPL layer and
             # as ``MissingDropTargetError``'s contract documents for ``DropInputs``. Double-drop
             # stays safe: composition already unioned the keys into one set (dispatcher
             # ``_compose_invoke``), so two hooks dropping the same present name coalesce here rather
             # than tripping this. Keys marked ``allow_missing`` (a ``DropInputs(...,
             # allow_missing=True)``, e.g. a defensive drop that tolerates another effect having
             # already un-passed the input) are exempt from the check.
-            present = inputs.keys() | scope.keys() | resolved_bound.keys()
+            #
+            # ``inputs`` alone is what counts as present: ``DropInputs`` edits inputs, and a
+            # ``jaz.scope`` value is not one (the effect is "remove a ``name=value`` keyword
+            # argument", and scope values were never keyword arguments). Reaching into ``scope``
+            # used to be an overreach of this fold, not a designed feature: no effect adds to
+            # ``scope``, and keeping it out of every effect's reach is what lets ``scope`` be
+            # ambient invoke context, like ``config``, rather than a per-invoke proposal.
+            present = inputs.keys()
             missing = (dropped - present) - ctx.dropped_inputs_allow_missing
             if missing:
                 raise MissingDropTargetError(
@@ -829,14 +809,16 @@ class Agent:
                     "dropping an absent input is a hook bug (drop it only when it is present, "
                     "e.g. once on the first InvokeEnter)."
                 )
+            # Naming the drop set directly is safe GIVEN that ``inputs`` and ``scope`` are
+            # disjoint: a name that is not an input is not in ``inputs`` to begin with, so an
+            # ``allow_missing`` drop of a scope value is a no-op here and the value stays bound
+            # through the caller's re-merge. Where the old shape filtered the merged dict — and
+            # so removed a name that was BOTH an input and a scope entry — this leaves the scope
+            # copy. That case is unreachable (``_build_invoke_setup`` raises on the intersection,
+            # and both entry points into ``Agent.invoke``/``ainvoke`` pass through it), which is
+            # why the difference is not a behavior change; it does mean this fold now leans on
+            # that check rather than merely agreeing with it.
             inputs = {k: v for k, v in inputs.items() if k not in dropped}
-            scope = {k: v for k, v in scope.items() if k not in dropped}
-            resolved_inputs = {
-                k: v for k, v in resolved_inputs.items() if k not in dropped
-            }
-            resolved_bound = {
-                k: v for k, v in resolved_bound.items() if k not in dropped
-            }
         if added:
             # A hook must not silently override a caller-provided top-level input. An ``AddInputs``
             # key that collides with an existing invoke input (``inputs``) or ``scope`` entry raises,
@@ -852,21 +834,13 @@ class Agent:
                     "input(s)/scope entries; a hook must not silently override a caller-provided "
                     "input. Rename the added key, or stop passing it at the call site."
                 )
-            inputs = {**inputs, **added}  # raw values render in the prompt
-            # Resolve the added values exactly once and feed both resolved views from it
-            # (see the resolved_inputs note above — __jaz_get__ may be side-effecting).
-            resolved_added = resolve_inputs(added)
-            resolved_inputs = {**resolved_inputs, **resolved_added}
-            resolved_bound = {
-                **resolved_bound,
-                **resolved_added,
-            }  # resolved for the REPL
-        return inputs, scope, resolved_inputs, resolved_bound
+            inputs = {**inputs, **added}  # renders in the prompt, and binds in the REPL
+        return inputs
 
     def invoke(
         self,
         *,
-        invoke_tool: InvokeTool | None,
+        subinvoke: Subinvoke,
         depth: int,
         invoke_id: str,
         parent_invoke_id: str | None,
@@ -878,46 +852,43 @@ class Agent:
         # that renders the <return_type> prompt and enforces the type via effects, so the agent /
         # REPL know nothing about it. Returns whatever the agent RETURNed as an untyped object;
         # the public invoke's typed overloads carry the static -> ReturnT.
-        # Resolve `__jaz_get__` payload substitution once, up front, via the core
-        # `resolve_inputs` helper: the event and every REPL want the value the agent
-        # actually binds, not the metadata wrapper (a `jaz.Display` directive, a
-        # `Library`). The prompt builder keeps the original `inputs`/`scope` instead — it
-        # needs the wrappers to read their descriptions (`__jaz_description__`) — and
-        # resolves `__jaz_get__` itself only for the type label / default rendering. This
-        # single core resolution replaced both the old display-directive-specific unwrap step and
-        # the REPL-level resolution that #510 introduced before this moved into the loop.
-        #
         # `inputs` (explicit kwargs) and `scope` (resolved `jaz.scope`) are kept as SEPARATE
-        # provenance channels (#727): resolve each independently for the event, and merge
-        # into the single namespace the REPL actually binds only here (`resolved_bound`).
-        # They are disjoint (invoke.py's conflict check guarantees it), so the merge is
-        # order-independent and nothing is lost by keeping the two apart — this is what lets
-        # the event carry them unmerged with no downstream re-split. `scope` defaults to
-        # empty for any direct caller; invoke.py always passes it.
+        # provenance channels (#727) and merged into the single namespace the REPL actually
+        # binds (`bound`) only once the input effects have committed, below. They are disjoint
+        # (invoke.py's conflict check guarantees it), so the merge is order-independent and
+        # nothing is lost by keeping the two apart — this is what lets the event carry them
+        # unmerged with no downstream re-split. `scope` defaults to empty for any direct caller;
+        # invoke.py always passes it.
+        #
+        # There is no payload-substitution step any more. Every value binds as itself, so the
+        # dicts the prompt renders and the dicts the REPL binds hold the same objects; the
+        # `__jaz_get__` protocol that made them potentially differ is gone.
         scope = scope or {}
-        resolved_inputs = resolve_inputs(inputs)
-        resolved_scope = resolve_inputs(scope)
-        resolved_bound = {**resolved_scope, **resolved_inputs}
+        # Copied, not aliased: the effect fold below rebuilds these, but a caller's own mapping
+        # must not be observed changing mid-invoke. `resolve_inputs` used to give this copy
+        # incidentally by building a new dict; with it gone the copy has to be explicit.
+        inputs = dict(inputs)
+        scope = dict(scope)
         # Seed the per-invoke blackboard (generation 0) BEFORE any event fires, so
         # InvokeEnter consumers already see seeded keys. seed_blackboard binds it to
         # this invoke's dispatcher, which then stamps it onto every event in emit().
-        # Seeds come from active hooks' blackboard_seed() (e.g. a MetaData hook
-        # carrying `task_name`), including per-call local hooks — agents can now pass
-        # `jaz.MetaData(...)` positionally to the agent-facing invoke (#545). A direct
+        # Seeds come from active hooks' blackboard_seed (e.g. a MetaData hook
+        # carrying `label`), including per-call local hooks — agents can now pass
+        # a `MetaData(...)` hook (non-public, `jaz.hooks._builtin.metadata`) positionally to
+        # the agent-facing invoke (#545). A direct
         # caller-supplied `metadata=` seed channel is still deferred to #538 (the
         # public invoke-syntax issue; #537's hook-side mechanism landed as
         # `MetaData`, #545).
-        self.dispatcher.seed_blackboard(self.config)
+        self.dispatcher.seed_blackboard()
         # Use dispatcher span for invoke
         enter_event = InvokeEnter(
             config=self.config,
             invoke_id=invoke_id,
             parent_invoke_id=parent_invoke_id,
             parent_repl_iteration=parent_repl_iteration,
-            inputs=resolved_inputs,
-            scope=resolved_scope,
+            inputs=inputs,
+            scope=scope,
             depth=depth,
-            invoke_tool=invoke_tool,
         )
         # An Abort composed at InvokeEnter raises its carried exception from the `with`
         # statement itself (e.g. an inherited cost-pool budget already exhausted): the
@@ -928,23 +899,23 @@ class Agent:
             # BEFORE the REPL and prompt are built, so an added input renders in the prompt AND
             # binds in the REPL, and a dropped input is un-passed from both — the "inputs"
             # (prompt-level) half of the symmetric effect family. Drops are applied first, then
-            # adds, so a key both added and dropped ends added. Added values go through the
-            # same ``resolve_inputs`` (__jaz_get__) resolution as top-level inputs for the REPL
-            # binding, while the raw value renders in the prompt (matching top-level inputs).
-            inputs, scope, resolved_inputs, resolved_bound = self._apply_input_effects(
-                span.ctx, inputs, scope, resolved_inputs, resolved_bound
-            )
+            # adds, so a key both added and dropped ends added. An added value lands in both the
+            # prompt dict and the REPL namespace, exactly as a top-level input does.
+            inputs = self._apply_input_effects(span.ctx, inputs, scope)
+            # The REPL namespace is DERIVED from the committed inputs, so it reflects the fold by
+            # construction rather than by being folded alongside it.
+            bound = {**scope, **inputs}
             # InvokeSend — fires iff the input committed. The add/drop fold above IS the
             # commit of this invoke's input set, so Send fires here with the committed
             # resolved inputs (what InvokeEnter.inputs would have been had it carried the
             # post-effect view). It does not fire on an enter-time abort — that raised
             # before the fold, so the input set never commits. An Abort @ InvokeSend
             # raises out of this call (the committed-input veto; the span closed Aborted).
-            span.send(resolved_inputs)
+            span.send(inputs)
 
-            # `invoke_tool` carries only the framework's recursive sub-invoke primitive (a
+            # `subinvoke` carries only the framework's recursive sub-invoke primitive (a
             # single callable, bound in the REPL as the bare name `invoke`; user tool
-            # namespaces are ordinary inputs — see library_as_input.md). Hooks that need to
+            # namespaces are ordinary inputs). Hooks that need to
             # inject a namespace use AddInputs, not a tool effect.
 
             # Honor a DisableRecursion effect emitted at InvokeEnter (by RecursionLimit at the
@@ -952,56 +923,47 @@ class Agent:
             # bind, since the primitive IS the whole surface (#635 moved the former jaz.*
             # helpers out to ordinary inputs). Both consumers below (REPL binding + the prompt
             # that advertises the tool) must see the same value, or they would disagree —
-            # a prompt documenting `invoke` over a REPL that has no such name.
-            # `can_recurse` is tracked separately from `effective_invoke_tool is None` because
-            # it also rides LLMQueryEnter, where the must-exit warnings use it to gate their
-            # delegate guidance; with no RecursionLimit installed it is always True.
-            effective_invoke_tool = None if span.ctx.recursion_disabled else invoke_tool
-            can_recurse = not span.ctx.recursion_disabled
+            # a prompt documenting `invoke` over a REPL that has no such name. This is the one
+            # read of `recursion_disabled` on this path (`ainvoke` mirrors it), and `subinvoke`
+            # itself is required (never `None`), so "the tool is bound" has exactly one cause:
+            # the effect was not emitted.
+            effective_subinvoke = None if span.ctx.recursion_disabled else subinvoke
+            # A WithholdREPLHistory effect withholds `__history__` the same way: the REPL binds no
+            # list and the prompt omits its section, both from this one flag. Whether the REPL
+            # binds the name at all is the REPL's (`repl_history_description`), read by the
+            # opener; the loop holds no history list and knows no entry shape (see
+            # `jaz.repl._repl_history`).
+            repl_history_withheld = span.ctx.repl_history_withheld
 
             # Generate unique session ID to prevent linecache collisions between
             # sessions
             session_id = uuid.uuid4().hex[:8]
 
-            # Get REPL configs from Config
-
-            # __history__ is owned by the core agent loop (the single writer): build the list
-            # here, pass it into initialize() (the REPL surfaces it by reference), and retain the
-            # reference to append iteration entries in the loop. Unconditional, for every REPL —
-            # whether the name is *reachable* from agent code is the REPL's business (one that
-            # cannot bind it ignores the argument) and whether the prompt names it is the
-            # template's, so neither is core's to decide. `do_one_repl_iteration` takes the list
-            # as a REQUIRED argument for the same reason: an optional one that silently dropped
-            # every entry was a contract nothing exercised. Empty list = the whole initial
-            # history — no index-0 init snapshot (#568).
-            repl_history: list[object] = []
             # Build the REPL state and the opening prompt only when no result was supplied at
             # Send: a SupplyInvokeResult short-circuits the whole invoke, and `initialize` resolves
             # the invoke's inputs (possibly with I/O) while `render_initial_message_list` can run
             # arbitrary custom-protocol work — neither should run for a supplied invoke, and a
             # failure building them must not discard the supplied result. They stay None on that
             # path; the loop below breaks on `span.supplied` before it would read either.
-            state: REPLState | None = None
+            state: object | None = None
             messages: list[MessageDict] | None = None
             if span.supplied is None:
                 # The configured REPL is a stateless template; `initialize` returns this run's
-                # `REPLState` (#1058), threaded into every exec below. The protocol opener still
-                # gets the config template (it reads only config: description, history capability).
+                # per-invoke state (#1058), threaded into every exec below. The protocol opener still
+                # gets the config template (it reads only config: description, history description).
                 state = self.repl_template.initialize(
-                    inputs=resolved_bound,
-                    invoke_tool=effective_invoke_tool,
+                    inputs=bound,
+                    subinvoke=effective_subinvoke,
                     session_id=session_id,
-                    initial_repl_history=repl_history,
+                    repl_history_withheld=repl_history_withheld,
                 )
 
                 messages = self.protocol.render_initial_message_list(
                     inputs,
                     scope,
                     self.repl_template,
-                    invoke_tool=effective_invoke_tool,
-                    depth=depth,
-                    recursion_available=can_recurse,
-                    input_display_overrides=None,
+                    subinvoke=effective_subinvoke,
+                    repl_history_withheld=repl_history_withheld,
                 )
                 # A custom BaseProtocol must return a non-empty opener. Guard it loudly
                 # here (the load-bearing half of the old iteration-0 footer assert, #705): an
@@ -1011,10 +973,10 @@ class Agent:
 
                 self._stamp_seed_provenance(messages)
 
-            # (Invoke-level AddInputs/DropInputs were already folded into inputs/scope/
-            # resolved_bound above via _apply_input_effects, before the REPL and prompt were
-            # built — so added inputs are bound in `repl` and rendered in `messages`, and
-            # dropped inputs are absent from both. No post-init REPL mutation needed.)
+            # (Invoke-level AddInputs/DropInputs were already folded into `inputs` above via
+            # _apply_input_effects, and `bound` derived from the result, before the REPL and
+            # prompt were built — so added inputs are bound in `repl` and rendered in `messages`,
+            # and dropped inputs are absent from both. No post-init REPL mutation needed.)
 
             # The loop is unbounded; termination is owned by effects — a terminal
             # RETURN/RAISE result, or a governance-emitted Abort. The hard iteration cap
@@ -1049,13 +1011,14 @@ class Agent:
             # an absolute turn count rather than a fraction of the cap (see
             # ``IterationLimit.warn_remaining``, and the sibling ``BudgetPool.warn_*_remaining``).
             #
-            # ``__history__`` is a plain 0-based list holding exactly one entry per iteration
-            # (see ``_record_history``), so iteration N is now ``__history__[N]``. Note this is
+            # ``PythonREPL``'s ``__history__`` is a plain 0-based list holding exactly one entry
+            # per iteration (see ``_finalize_iteration``), so iteration N is now
+            # ``__history__[N]``. Note this is
             # alignment, not a contract anything relies on: nothing in-tree addresses history by
             # iteration number, and the heaviest consumers (the oolong/stulife history-search
             # prompts) scan ``prev_repl_history + __history__[:-1]``, a concatenation across
             # agent boundaries whose positions cannot correspond to this agent's turns under any
-            # base. ``_REPL_HISTORY_DESCRIPTION`` says ``[-1]`` for that reason.
+            # base. ``PythonREPL.repl_history_description`` says ``[-1]`` for that reason.
             #
             # Watch for falsiness when adding a consumer: iteration 0 is falsy, so ``if iteration:``
             # silently means "not the first turn". Use ``is not None``.
@@ -1078,18 +1041,13 @@ class Agent:
                 if self.prehook is not None:
                     self.prehook.parent_repl_iteration = i
 
-                repl_iter_result = self.do_one_repl_iteration(
+                exec_result = self.do_one_repl_iteration(
                     i,
                     depth,
-                    can_recurse,
                     messages,
                     state,
                     invoke_id,
-                    repl_history=repl_history,
                 )
-
-                exec_result = repl_iter_result.exec_result
-                state = repl_iter_result.state
 
                 match exec_result:
                     case Continue():
@@ -1132,18 +1090,16 @@ class Agent:
         iteration: int,
         depth: int,
         invoke_id: str,
-        can_recurse: bool,
     ) -> str:
         # Mirrors _query_with_messages exactly except for the awaited LLM call; the edit
         # fold is the shared _compose_shown_messages, so the two paths cannot drift. An
         # Abort at any stage raises out of this method — see the sync path's comment.
-        complete_fn, invoke_id, enter_event = self._make_llm_retry_fn(
-            self.llm_client.acomplete_with_retry,
+        complete_fn, enter_event = self._make_llm_retry_fn(
+            self.llm_client._acomplete_with_retry,
             messages,
             invoke_id,
             iteration,
             depth,
-            can_recurse,
         )
         with self.dispatcher.span_llm_query(enter_event) as span:
             shown = self._compose_shown_messages(span, messages)
@@ -1151,20 +1107,16 @@ class Agent:
             # unconditionally after the edit fold, on the supplied path too; never on an
             # enter-time abort (which raised before this body ran).
             span.send(shown)
-            # Send-supplied response (e.g. Replay): the provider call is skipped.
+            # Send-supplied response (e.g. TrajectoryReplay): the provider call is skipped.
             if span.supplied_response is not None:
                 llm_response: LLMResponse = span.supplied_response
             else:
                 # Provider errors propagate; see the sync path (incl. the TODO(#697)
                 # future-policy note).
-                llm_response = await complete_fn(
-                    model=self.model,
-                    messages=shown,
-                    **self.llm_client.request_defaults,
-                )
+                llm_response = await complete_fn(messages=self._to_wire(shown))
             result = self._record_llm_response(llm_response, span)
         # Span closed: a Complete-stage ModifyLLMResponse may have replaced the response
-        # (authoritative — see resolve_llm_modify_results). If so, re-read it: its content is what
+        # (authoritative — see _resolve_llm_modify_results). If so, re-read it: its content is what
         # the agent parses next, and the same object is what LLMQueryExit carried and BudgetPool
         # booked, so content / observers / cost all agree. The identity check leaves the common
         # no-transform path (same object) untouched, and covers the supplied-response path too.
@@ -1178,12 +1130,10 @@ class Agent:
         self,
         iteration: int,
         depth: int,
-        can_recurse: bool,
         messages: list[MessageDict],
-        state: REPLState,
+        state: object,
         invoke_id: str,
-        repl_history: list[object],
-    ) -> REPLIterationResult[Any]:
+    ) -> ExecResult[Any]:
         # Mirrors do_one_repl_iteration exactly except for the two awaited steps — the
         # LLM query above and repl.aexec below. Everything else is the shared
         # _record_response_and_parse / _finalize_iteration, so the paths cannot drift.
@@ -1191,9 +1141,7 @@ class Agent:
         # `else` and so clobbered enter-time overrides (#592), and it never applied
         # exit-time overrides nor finalized history — all fixed by routing through the
         # shared helpers.)
-        self._pending_message_edits = None
-        self._last_llm_response = None
-        self._pending_shown_messages = None
+        self._reset_per_query_state()
         # No catch around the query: LLM-call failures and abort-carried exceptions
         # propagate — see the sync path's comment on the deleted #687 conversion.
         response_content = await self._aquery_with_messages(
@@ -1201,28 +1149,28 @@ class Agent:
             iteration=iteration,
             depth=depth,
             invoke_id=invoke_id,
-            can_recurse=can_recurse,
         )
         # Apply any persistent message edits (compaction) to the carried-forward buffer.
         self._apply_persistent_message_edits(messages, iteration)
-        exec_timeout_override, enter_event = self._record_response_and_parse(
-            messages, response_content, self.repl_template, invoke_id, iteration, depth
+        enter_event = self._record_response_and_parse(
+            messages, response_content, invoke_id, iteration, depth, state
         )
 
         with self.dispatcher.span_repl_exec(enter_event) as span:
-            # Apply DropVariables then AddVariables (see the sync path for rationale): unbind the
+            # Apply DropFromNamespace then AddToNamespace (see the sync path for rationale): unbind the
             # composed names, then bind, before this turn's code runs — drop-first so a
             # drop-then-add pair re-binds; consistent across the override/exec branches.
-            self.repl_template.drop_variables(
+            self.repl_template.drop_from_namespace(
                 state,
-                span.ctx.dropped_variables,
-                allow_missing=span.ctx.dropped_variables_allow_missing,
+                span.ctx.namespace_drops,
+                allow_missing=span.ctx.namespace_drops_allow_missing,
             )
-            self.repl_template.add_variables(state, span.ctx.added_variables)
+            self.repl_template.add_to_namespace(state, span.ctx.namespace_adds)
             # REPLExecSend — fires iff the code committed (see the sync path's comment):
-            # after the namespace deltas; suppliers compose here and the resolved
-            # short-circuit lands on span.supplied (an Abort raises out of span.send).
-            span.send()
+            # after the namespace deltas, carrying the namespace the REPL now reports;
+            # suppliers compose here and the resolved short-circuit lands on span.supplied
+            # (an Abort raises out of span.send).
+            span.send(self.repl_template.get_namespace(state))
             if span.supplied is not None:
                 # A Send-composed SupplyExecResult short-circuits execution: skip running
                 # the code and use the supplied result instead.
@@ -1232,20 +1180,18 @@ class Agent:
                 # edits (== the original when no hook edited it), the same string REPLExecSend
                 # observers saw. (Invoke inputs are folded in once at InvokeEnter, not here:
                 # AddInputs/DropInputs are InvokeEnter-only — #481. Per-turn namespace binds go
-                # through AddVariables/DropVariables above.)
+                # through AddToNamespace/DropFromNamespace above.)
                 exec_result = await self.repl_template.aexec(
-                    state, span.committed_code, str(iteration), exec_timeout_override
+                    state, span.committed_code, str(iteration)
                 )
             span.complete(exec_result=exec_result)
 
-        return self._finalize_iteration(
-            span, span.committed_code, state, response_content, repl_history
-        )
+        return self._finalize_iteration(span, response_content, state)
 
     async def ainvoke(
         self,
         *,
-        invoke_tool: InvokeTool | None,
+        subinvoke: Subinvoke,
         depth: int,
         invoke_id: str,
         parent_invoke_id: str | None,
@@ -1254,30 +1200,27 @@ class Agent:
         inputs: dict[str, object],
     ) -> object:
         # The return type is a ReturnType(...) hook now (#568), not a param — see `invoke`.
-        # Resolve `__jaz_get__` once for the event and REPL (the value the agent
-        # binds, not the wrapper) via the core `resolve_inputs` helper; the prompt
-        # builder keeps the original `inputs`/`scope` to read wrapper descriptions.
         # Mirrors the sync `invoke` path — including keeping `inputs` (explicit kwargs)
         # and `scope` (resolved `jaz.scope`) as SEPARATE channels (#727), merged into the
-        # single REPL namespace only via `resolved_bound`; see sync `invoke` for the full
-        # rationale. This is also what now makes `jaz.Display` work here, which the old
-        # unwrap step never covered.
+        # single REPL namespace (`bound`) only after the input effects commit; see sync
+        # `invoke` for the full rationale.
         scope = scope or {}
-        resolved_inputs = resolve_inputs(inputs)
-        resolved_scope = resolve_inputs(scope)
-        resolved_bound = {**resolved_scope, **resolved_inputs}
+        # Copied, not aliased: the effect fold below rebuilds these, but a caller's own mapping
+        # must not be observed changing mid-invoke. `resolve_inputs` used to give this copy
+        # incidentally by building a new dict; with it gone the copy has to be explicit.
+        inputs = dict(inputs)
+        scope = dict(scope)
         # Seed the per-invoke blackboard (generation 0) before any event fires; see
         # the sync invoke() for rationale and the #538 TODO on caller metadata.
-        self.dispatcher.seed_blackboard(self.config)
+        self.dispatcher.seed_blackboard()
         enter_event = InvokeEnter(
             config=self.config,
             invoke_id=invoke_id,
             parent_invoke_id=parent_invoke_id,
             parent_repl_iteration=parent_repl_iteration,
-            inputs=resolved_inputs,
-            scope=resolved_scope,
+            inputs=inputs,
+            scope=scope,
             depth=depth,
-            invoke_tool=invoke_tool,
         )
         # An Abort at InvokeEnter raises from the `with` statement itself — see the sync
         # path's comment.
@@ -1286,54 +1229,47 @@ class Agent:
             # prompt are built — the async mirror of the sync path (see there for the full
             # rationale). Adds render+bind, drops un-pass from both; drops run first, so an add
             # wins on overlap.
-            inputs, scope, resolved_inputs, resolved_bound = self._apply_input_effects(
-                span.ctx, inputs, scope, resolved_inputs, resolved_bound
-            )
+            inputs = self._apply_input_effects(span.ctx, inputs, scope)
+            # Derived from the committed inputs, as in sync invoke().
+            bound = {**scope, **inputs}
             # InvokeSend — fires iff the input committed (see the sync path's comment):
             # right after the add/drop fold, never on an enter-time abort. An Abort here
             # raises out of this call (the span closed Aborted).
-            span.send(resolved_inputs)
+            span.send(inputs)
 
-            # `invoke_tool` carries only the framework's recursive sub-invoke primitive (a
-            # single callable, or None; see the sync path above and library_as_input.md).
+            # `subinvoke` carries only the framework's recursive sub-invoke primitive (a
+            # single callable; see the sync path above).
 
             # Honor DisableRecursion (RecursionLimit at the cap leaf) — same as the sync path:
-            # withhold the tool entirely, and track can_recurse separately because it also
-            # rides LLMQueryEnter.
-            effective_invoke_tool = None if span.ctx.recursion_disabled else invoke_tool
-            can_recurse = not span.ctx.recursion_disabled
+            # withhold the tool entirely, in the one place the flag is read.
+            effective_subinvoke = None if span.ctx.recursion_disabled else subinvoke
+            # A WithholdREPLHistory effect withholds `__history__` the same way (see the sync
+            # invoke()).
+            repl_history_withheld = span.ctx.repl_history_withheld
 
             session_id = uuid.uuid4().hex[:8]
 
-            # Single-writer __history__ ownership (see the sync invoke()).
-            repl_history: list[object] = []
             # Build the REPL state and the opening prompt only when no result was supplied at Send
             # (the sync path documents why); they stay None for a supplied invoke, which the loop
             # below short-circuits before reading either.
-            state: REPLState | None = None
+            state: object | None = None
             messages: list[MessageDict] | None = None
             if span.supplied is None:
                 # The configured REPL is a stateless template; `initialize` returns this run's
-                # `REPLState` (#1058). The protocol opener still gets the config template.
+                # per-invoke state (#1058). The protocol opener still gets the config template.
                 state = self.repl_template.initialize(
-                    inputs=resolved_bound,
-                    invoke_tool=effective_invoke_tool,
+                    inputs=bound,
+                    subinvoke=effective_subinvoke,
                     session_id=session_id,
-                    initial_repl_history=repl_history,
+                    repl_history_withheld=repl_history_withheld,
                 )
 
-                # NOTE: the async path historically does NOT unwrap jaz.Display display
-                # overrides (only sync invoke() calls unwrap_display), so it passes
-                # input_display_overrides=None — preserved here verbatim. Unifying the
-                # sync/async paths is tracked separately (see #566 roadmap).
                 messages = self.protocol.render_initial_message_list(
                     inputs,
                     scope,
                     self.repl_template,
-                    invoke_tool=effective_invoke_tool,
-                    depth=depth,
-                    recursion_available=can_recurse,
-                    input_display_overrides=None,
+                    subinvoke=effective_subinvoke,
+                    repl_history_withheld=repl_history_withheld,
                 )
                 # A custom BaseProtocol must return a non-empty opener. Guard it loudly
                 # here (the load-bearing half of the old iteration-0 footer assert, #705): an
@@ -1343,8 +1279,9 @@ class Agent:
 
                 self._stamp_seed_provenance(messages)
 
-            # (AddInputs/DropInputs already folded into inputs/resolved_bound above via
-            # _apply_input_effects — no post-init REPL mutation needed; see sync invoke().)
+            # (AddInputs/DropInputs already folded into `inputs` above via _apply_input_effects,
+            # with `bound` derived from the result — no post-init REPL mutation needed; see sync
+            # invoke().)
 
             # ``i`` is 0-based, as in sync invoke() — see the iteration-numbering note there (#719).
             for i in itertools.count():
@@ -1366,18 +1303,13 @@ class Agent:
                 if self.prehook is not None:
                     self.prehook.parent_repl_iteration = i
 
-                repl_iter_result = await self.do_one_repl_iteration_async(
+                exec_result = await self.do_one_repl_iteration_async(
                     i,
                     depth,
-                    can_recurse,
                     messages,
                     state,
                     invoke_id,
-                    repl_history=repl_history,
                 )
-
-                exec_result = repl_iter_result.exec_result
-                state = repl_iter_result.state
 
                 match exec_result:
                     case Continue():

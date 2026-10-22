@@ -1,60 +1,71 @@
-"""LLM backends — one class per backend (:class:`BaseLLM`), selected by one tag.
+"""LLM backends — one class per backend (:class:`BaseLLM`), selected by configuring an instance.
 
-The ``litellm`` backend routes through the LiteLLM library; the ``OpenAILLM``/``AnthropicLLM``
-classes post directly to a vendor's HTTP API. Add your own by subclassing ``BaseLLM``;
-see :mod:`jaz.llm.llm` for what a backend owns and why the former ``LLMClient``/``Provider``
-split was merged away.
+The ``litellm`` backend routes through the LiteLLM library and is the default, reaching every
+provider LiteLLM supports. ``GitHubCopilotLLM`` and ``SGLangLLM`` ship alongside it for the two cases it
+does not serve well — completions billed to GitHub AI credits, and a self-hosted SGLang server
+addressed token-in/token-out. ``MockLLM`` answers from a callable you supply, for deterministic
+tests with no provider. Add your own by subclassing :class:`BaseLLM` — see :class:`BaseLLM` for
+what a backend owns.
 """
 
 from __future__ import annotations
 
-# Public surface: base + default concrete backend only — ``BaseLLM`` and ``LiteLLM`` (the sole
-# v1 backend). Everything else (the retired OpenAILLM/AnthropicLLM backends, ``LLMResponse`` and
-# the message/usage types, the LLM exception taxonomy, pricing helpers, the extras-merge
-# registry, and the backend registry/registration) is re-exported for reachability — internal
-# call sites import these from the package — but kept OUT of ``__all__`` via the ruff-blessed
-# ``X as X`` re-export idiom, so it is not part of the v1 public promise. The three
-# pluggable-component packages (llm/protocol/repl) are uniform on this: each exposes only its
-# base + default concrete (see the note in ``jaz.repl.__init__``).
+# Public surface: the authoring contract, plus every backend that ships.
 #
-# ``ChatFormat``/``HFChatFormat`` are demoted the same way, by deliberate call (PR #1128): the
-# caller-owned chat-format seam stays reachable as ``jaz.llm.HFChatFormat`` but is NOT pinned
-# into the v1 promise — it gets the identical treatment to the OpenAILLM/AnthropicLLM backends
-# rather than a sanctioned exception to the base+default-concrete pin.
+# ``BaseLLM`` is the class you subclass and ``LLMResponse`` is what its one abstract method
+# returns, so a backend author cannot write ``complete`` without both — an unadvertised return
+# type on a public ABC is a boundary nobody can respect.
+#
+# The provider-backed backends are public by the same rule, stated in ``jaz.repl.__init__``: a
+# caller is handed one. ``LiteLLM`` is the default; ``GitHubCopilotLLM`` and ``SGLangLLM`` cover
+# the two cases it cannot reach. Each is constructed by name in user code and named by a console
+# tag (``litellm``, ``copilot``, ``sglang``), so shipping them unadvertised would only mean
+# callers depended on them without a promise. ``MockLLM`` is public on a different rule: no
+# authored config can name it (it is built from a callable) and it has no console tag, but it
+# exists so a test needs no provider — and a test author has to be able to import it.
+#
+# ``ChatFormat``/``HFChatFormat`` follow from ``SGLangLLM``: they type its ``chat_format``
+# parameter and its docstring tells the caller to construct one, so promoting the backend without
+# them would leave a public constructor taking a type nobody can name.
+#
+# Nothing else is exported for reachability. There is no message/usage envelope type: every
+# backend constructs ``LLMResponse`` directly (``SGLangLLM`` says why in a comment — its wire
+# envelope is not OpenAI-shaped), and ``MessageDict`` lives in ``jaz._messages``. Pricing is
+# LiteLLM's job (``litellm.completion_cost``), which is what a caller wanting cost should reach
+# for. The exception taxonomy is public in ``jaz.exceptions`` only; a second path here would be a
+# duplicate nothing imports.
+# ``TokenStamp``/``TurnRecord`` are here rather than in a module of their own because
+# ``LLMResponse`` is the type that originates one: a token-native backend builds the record
+# inside ``complete()`` and hands it back on the response (a caller also meets one on
+# ``Rollout.turns``, and a hook may construct one for ``SupplyLLMResponse.tokens``, but the
+# response is where it comes from). Publishing the
+# response type while leaving the type of one of its fields unnameable was the gap
+# (EXECUTIVE CALL, user, 2026-09-13).
+from jaz._tokens import TokenStamp, TurnRecord
+
+from ._base import BaseLLM
+from ._chat_format import ChatFormat, HFChatFormat
+from ._copilot import GitHubCopilotLLM
 from ._litellm import LiteLLM
-from .anthropic import AnthropicLLM as AnthropicLLM
-from .base import Choice as Choice
-from .base import CompletionResponse as CompletionResponse
-from .base import Message as Message
-from .base import MessageDict as MessageDict
-from .base import Usage as Usage
-from .base import declared_init_keys as declared_init_keys
-from .chat_format import ChatFormat as ChatFormat
-from .chat_format import HFChatFormat as HFChatFormat
-from .copilot import CopilotLLM as CopilotLLM
-from .exceptions import APIError as APIError
-from .exceptions import AuthenticationError as AuthenticationError
-from .exceptions import ContentPolicyViolationError as ContentPolicyViolationError
-from .exceptions import ContextWindowExceededError as ContextWindowExceededError
-from .exceptions import LLMError as LLMError
-from .exceptions import NotFoundError as NotFoundError
-from .exceptions import PermissionDeniedError as PermissionDeniedError
-from .exceptions import RateLimitError as RateLimitError
-from .exceptions import UnsupportedParamsError as UnsupportedParamsError
-from .extras_merge import MergeRule as MergeRule
-from .extras_merge import get_extra_merge_rule as get_extra_merge_rule
-from .extras_merge import merge_extras as merge_extras
-from .extras_merge import register_extra_merge_rule as register_extra_merge_rule
-from .llm import BaseLLM
-from .llm import LLMResponse as LLMResponse
-from .openai import OpenAILLM as OpenAILLM
-from .pricing import compute_cost as compute_cost
-from .pricing import cost_per_token as cost_per_token
-from .pricing import get_all_models as get_all_models
-from .pricing import get_model_info as get_model_info
-from .sglang import SGLangLLM as SGLangLLM
+from ._mock import MockLLM
+from ._sglang import SGLangLLM
+from ._types import LLMResponse as LLMResponse
+from ._types import ModelInfo as ModelInfo
+from ._types import RetryPolicy as RetryPolicy
 
 __all__ = [
     "BaseLLM",
+    "ChatFormat",
+    "GitHubCopilotLLM",
+    "HFChatFormat",
+    "LLMResponse",
     "LiteLLM",
+    "MockLLM",
+    # The two value types a backend author constructs: what it reports about its model, and
+    # how the framework retries its calls.
+    "ModelInfo",
+    "RetryPolicy",
+    "SGLangLLM",
+    "TokenStamp",
+    "TurnRecord",
 ]

@@ -1,12 +1,12 @@
 {# One block per input. The tag name IS the identifier the agent binds in its REPL and `type=` the
    runtime type, so the sentence below can refer to each input by the exact name the agent has.
    The blocks and that sentence are one surface — change them together. #}
-{% for inp in input_blocks %}
+{% for inp in inputs %}
 <{{ inp.name }} type="{{ inp.type }}">
 {{ inp.value }}
 </{{ inp.name }}>
 {% endfor %}
-{% if input_names %}{% set plural = input_names | length > 1 %}
-The input variable{{ "s" if plural else "" }} `{{ input_names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
-{% if recursion_available %}{{ "They are" if plural else "It is" }} not automatically available to `invoke()` calls you make, so making {{ "them" if plural else "it" }} available to sub-invokes requires passing {{ "them" if plural else "it" }} explicitly.
+{% if inputs %}{% set names = inputs | map(attribute="name") | list %}{% set plural = names | length > 1 %}
+The input variable{{ "s" if plural else "" }} `{{ names | join("`, `") }}` {{ "are" if plural else "is" }} available in your REPL with descriptions given above.
+{% if subinvoke_description is not none %}{{ "They are" if plural else "It is" }} not automatically available to `invoke()` calls you make, so making {{ "them" if plural else "it" }} available to sub-invokes requires passing {{ "them" if plural else "it" }} explicitly.
 {% endif %}{% endif %}

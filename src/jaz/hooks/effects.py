@@ -10,9 +10,10 @@ returns at an event are composed together before they are applied.
 Where each effect composes, per pipeline stage (see :mod:`jaz.hooks.events` for the
 ``Enter → Send → Complete → Exit`` pipeline itself)::
 
-    Enter    (edit the proposal)     InvokeEnter:   AddInputs, DropInputs, DisableRecursion
+    Enter    (edit the proposal)     InvokeEnter:   AddInputs, DropInputs, DisableRecursion,
+                                                    WithholdREPLHistory
                                      LLMQueryEnter: AddMessages, DropMessages
-                                     REPLExecEnter: AddVariables, DropVariables, InsertCode, DeleteCode
+                                     REPLExecEnter: AddToNamespace, DropFromNamespace, InsertCode, DeleteCode
     Send     (supply the result,     LLMQuerySend:  SupplyLLMResponse
               skipping the work)     REPLExecSend:  SupplyExecResult
                                      InvokeSend:    SupplyInvokeResult
@@ -35,22 +36,28 @@ in a future release.
 
 from __future__ import annotations
 
-import enum
-import json
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from jaz._llm_client import LLMResponse
-    from jaz.tokens import TurnRecord
+    from collections.abc import Sequence
 
+    # Annotation-only (the module has `from __future__ import annotations`, so the dataclass
+    # fields below resolve lazily). For `MessageDict` that matters: `jaz.hooks.effects.MessageDict`
+    # must not be a second reachable path to a name `jaz.llm` withdrew. `TurnRecord` is public
+    # via `jaz.llm` and simply rides along under the same guard.
+    from jaz._messages import MessageDict
+    from jaz._tokens import TurnRecord
+    from jaz.llm._types import LLMResponse
+
+from jaz._sentinel import UNSET, UnsetType
 from jaz.exceptions import (
+    BlackboardWriteConflictError,
     CodeEditOffsetError,
     MessageEditIndexError,
     ReturnValueConflictError,
 )
-from jaz.llm import MessageDict
-from jaz.repl.types import Continue, ExecResult, Raise, Return, TerminalExecResult
+from jaz.repl._types import Continue, ExecResult, Raise, Return, TerminalExecResult
 
 # The public effect surface (`jaz.hooks.effects`) — the typed values a hook handler
 # returns to influence execution. `Effect` is the base for annotating handler returns.
@@ -63,17 +70,17 @@ __all__ = [
     "Abort",
     "BlackboardWrite",
     "DisableRecursion",
+    "WithholdREPLHistory",
     "AddInputs",
     "DropInputs",
-    "AddVariables",
-    "DropVariables",
+    "AddToNamespace",
+    "DropFromNamespace",
     "InsertCode",
     "DeleteCode",
     "DropMessages",
     "AddMessages",
     "SupplyLLMResponse",
     "ModifyLLMResponse",
-    "UNSET",
 ]
 
 
@@ -114,12 +121,12 @@ class Effect:
 #     Send supplier and a Complete transform).
 #
 # ``ModifyExecResult`` and ``ModifyInvokeResult`` are a deliberate split of one former shared
-# effect (executive call, see ``TerminalExecResult`` in ``jaz.repl.types``): the REPL boundary
+# effect (executive call, see ``TerminalExecResult`` in ``jaz.repl._types``): the REPL boundary
 # admits the full ``ExecResult`` (a hook downgrades a terminal to a ``Continue`` to force another
 # turn), while the invoke boundary admits only a terminal one (the loop has already broken, so a
 # ``Continue`` there is meaningless). The two carry different valid domains, so they are different
 # effect types — but the *merge* is identical, so both resolve through the same
-# ``_fold_carried_results`` (``resolve_modify_results`` / ``resolve_invoke_modify_results``). What
+# ``_fold_carried_results`` (``_resolve_modify_results`` / ``_resolve_invoke_modify_results``). What
 # is shared is the fold, not the wrapper. ``ModifyInvokeResult`` rejects a ``Continue`` at
 # construction (``__post_init__``), moving what was a strippable late ``assert`` in ``span_invoke``
 # to the emitting hook's own call site.
@@ -136,7 +143,7 @@ class Effect:
 # same supply-vs-modify split as ``SupplyLLMResponse`` at the LLM-query boundary.
 #
 # The two boundaries once diverged — supply required its results to be *equal* (a supply "names
-# THE result", so two distinct supplies raised ``ResultConflictError``) while transform
+# THE result", so two distinct supplies were a hard internal error) while transform
 # folded. They were unified to fold because independent enter-point vetoes (two hooks each
 # rejecting the same code with a recoverable ``Continue``) should compose exactly as independent
 # transforms do, not crash on a hard internal error; distinct ``Return`` *values* still conflict
@@ -177,7 +184,7 @@ class SupplyExecResult(Effect):
 
     # This is the supply-boundary "supply instead" slot for sandbox/approval hooks generally.
     # ``ValidateREPLCode`` emits it: on rejected REPL code it supplies a ``Continue``
-    # (recoverable), or a ``Raise`` at the failure cap. See ``resolve_supply_results``.
+    # (recoverable), or a ``Raise`` at the failure cap. See ``_resolve_supply_results``.
     #
     # The ``Continue`` merge is what lets two such hooks reject the SAME code without one of
     # them losing or the fold raising — their outputs concatenate and their exceptions group.
@@ -215,7 +222,7 @@ class ModifyExecResult(Effect):
     # never renders the grouped exception, so a ``Continue(exception=…, output="")`` contributes
     # an error the agent never sees. ``BudgetForcing`` / ``ReturnType`` / ``ValidateReturn`` all
     # use that shape — ``BudgetForcing``, for instance, turns an early ``Return`` into a
-    # ``Continue`` refusal. See ``resolve_modify_results``.
+    # ``Continue`` refusal. See ``_resolve_modify_results``.
     #
     # Downgrading a terminal result this way shows the agent only the carried text: a ``Return``
     # or ``Raise`` has no ``output`` (#903), so whatever the turn printed before finishing is not
@@ -252,7 +259,7 @@ class ModifyInvokeResult(Effect):
     #
     # This is the split half of the former single ``ModifyExecResult`` that was valid at both
     # ``*Complete`` boundaries. See the module-level "Exec-result effects" comment and
-    # ``TerminalExecResult`` (``jaz.repl.types``) for the executive call: the invoke boundary's
+    # ``TerminalExecResult`` (``jaz.repl._types``) for the executive call: the invoke boundary's
     # valid domain is genuinely narrower than the REPL boundary's, so it gets its own effect whose
     # *field type* states the invariant and whose ``__post_init__`` enforces it — instead of the
     # old strippable ``assert`` in ``span_invoke``, which failed late (at span close, not at the
@@ -303,7 +310,7 @@ class SupplyInvokeResult(Effect):
     # The invoke-Send supplier — the invoke-boundary twin of ``SupplyExecResult`` (``REPLExecSend``),
     # which is what fills the last open cell of the supply/modify grid for the invoke span (the
     # ``InvokeSend`` boundary previously had no supplier). It folds like ``SupplyExecResult``
-    # (``resolve_invoke_supply_results`` → ``_fold_carried_results`` with ``original=None``) but on
+    # (``_resolve_invoke_supply_results`` → ``_fold_carried_results`` with ``original=None``) but on
     # the terminal domain, and rejects a ``Continue`` at construction like ``ModifyInvokeResult`` —
     # the same ``TerminalExecResult`` invariant, stated in the field type and enforced here.
 
@@ -386,7 +393,7 @@ class Abort(Effect):
 
 @dataclass(frozen=True)
 class DisableRecursion(Effect):
-    """Withhold the recursive ``jaz.invoke`` tool from this invoke.
+    """Withhold the recursive ``invoke`` tool from this invoke.
 
     Valid at :class:`InvokeEnter` only.
 
@@ -398,17 +405,46 @@ class DisableRecursion(Effect):
     # built — there is no later point at which suppressing it means anything.
     #
     # Cut from the docstring: the tool is removed structurally rather than made to fail when
-    # called (the agent never sees ``jaz.invoke`` at all), and the invoke still runs to
+    # called (the agent never sees ``invoke`` at all), and the invoke still runs to
     # completion — ``Abort`` is the effect that stops it. Both are covered by the summary line
     # plus ``Abort``'s own docstring.
     #
     # Emitted by ``RecursionLimit`` on the cap-leaf invoke (``event.depth == max_depth``) for
-    # affordance removal: the primitive honors it by binding the REPL with ``invoke_tool=None``.
-    # It also publishes the inverse as ``can_recurse`` on ``LLMQueryEnter``, so the must-exit
-    # warnings gate their "you may delegate" guidance correctly.
+    # affordance removal: the primitive honors it by binding the REPL with ``subinvoke=None``,
+    # and the prompt follows the binding (the ``invoke`` block and both propagation sentences
+    # are gated on the description of that same bound tool), so the two cannot disagree.
     #
     # The over-cap backstop — a child that enters past the cap anyway, e.g. the public
     # ``jaz.invoke`` reached from a human tool — is handled by ``Abort``, not this effect.
+
+    pass
+
+
+@dataclass(frozen=True)
+class WithholdREPLHistory(Effect):
+    """Withhold ``__history__`` from this invoke: the REPL does not bind it, and the prompt
+    does not describe it.
+
+    Valid at :class:`InvokeEnter` only.
+
+    Composition: a pure signal carrying no fields, so emitting it more than once is the same as
+    emitting it once.
+    """
+
+    # The counterpart of `DisableRecursion` for the other name the framework provides: the
+    # REPL is built without the binding and the prompt follows that same fact, so the two
+    # cannot disagree. It replaces dropping the name with `DropFromNamespace`, which left the
+    # prompt describing a variable the agent could not reach. Chosen by the user (2026-10-17),
+    # on comparing designs in which the namespace view did or did not list the framework's
+    # names. The name carries `REPL` as every framework name for this history does
+    # (`REPLHistoryEntry`, `repl_history_description`, `update_repl_history`): "history" alone
+    # is ambiguous in jaz, which also has a conversation history (the user's call, 2026-10-17).
+    # The verb is `Withhold`, not `DisableRecursion`'s `Disable`, because the two names take
+    # different kinds of object: recursion is a phenomenon the effect switches off, and what
+    # gets withheld there is the `invoke` primitive; here the thing withheld is the REPL history
+    # itself, so the verb names the act on it (the user's call, 2026-10-20). jaz-evals-internal's
+    # `CodeAct` hook emits this effect at `InvokeEnter` to withhold `__history__` from every
+    # invoke.
 
     pass
 
@@ -438,7 +474,7 @@ class AddInputs(Effect):
 
     Valid at :class:`InvokeEnter` only. Each entry both renders in the user prompt and binds as
     a REPL variable. For a namespace-only binding that leaves the prompt alone, use
-    :class:`AddVariables`.
+    :class:`AddToNamespace`.
 
     Composition: all ``inputs`` are unioned; the same key with the same value coalesces, and
     with a *different* value raises :class:`~jaz.exceptions.REPLInputConflictError`, so no hook
@@ -447,11 +483,10 @@ class AddInputs(Effect):
     clears it first and makes the pair a replacement. (That drop only works on a key the invoke
     was passed; one that another hook merely adds raises
     :class:`~jaz.exceptions.MissingDropTargetError` instead.) Naming ``__builtins__`` raises
-    :class:`~jaz.exceptions.SandboxKeyError`. An add always wins over a :class:`DropInputs` of
+    :class:`~jaz.exceptions.KeyEditDeniedError`. An add always wins over a :class:`DropInputs` of
     the same key: drops are applied first.
 
-    Values resolve through the same ``__jaz_get__`` protocol as a top-level input, so a wrapper
-    that defines it binds its payload rather than the wrapper itself.
+    Values bind under their own names, exactly as a top-level input does.
 
     Attributes:
         inputs: Name-to-value pairs to add; each renders in the prompt and binds in the REPL.
@@ -460,18 +495,14 @@ class AddInputs(Effect):
         AddInputs({"config": {"api_key": "abc"}})
     """
 
-    # The ``__jaz_get__`` wrappers in tree today are ``Library`` and the ``jaz.Display``
-    # directive; both are named here rather than in the docstring because they are expected to
-    # leave the public API. The protocol sentence is what a caller needs and outlives them.
-
     # Only valid at ``InvokeEnter`` because inputs are per-invoke setup, applied once before the
     # prompt renders — cut from the docstring, which now just states where it is valid.
     #
     # The prompt-level Add of the symmetric family; its inverse is ``DropInputs``, and the
-    # input-level vs namespace-level split mirrors ``DropInputs`` vs ``DropVariables``.
+    # input-level vs namespace-level split mirrors ``DropInputs`` vs ``DropFromNamespace``.
     #
     # Not valid at the conditional ``REPLExecEnter``, which is skipped on a parse-failure turn
-    # and so is a poor home for injection; per-turn namespace injection is ``AddVariables``.
+    # and so is a poor home for injection; per-turn namespace injection is ``AddToNamespace``.
 
     inputs: dict[str, object]
 
@@ -481,26 +512,27 @@ class DropInputs(Effect):
     """Un-pass invoke inputs by name, equivalent to removing ``name=value`` keyword arguments
     from ``jaz.invoke``.
 
-    Valid at :class:`InvokeEnter` only. Each listed key is removed as if it had never been
+    Valid at :class:`InvokeEnter` only. Each listed name is removed as if it had never been
     passed to ``jaz.invoke``, so it is removed from both the prompt and the REPL. Contrast
-    :class:`DropVariables`, which unbinds a REPL name only and leaves the prompt rendering
-    intact.
+    :class:`DropFromNamespace`, which unbinds a REPL name only and leaves the prompt rendering
+    intact. A ``jaz.scope`` value is not an input: naming one is dropping a name the invoke
+    never received (below), and no effect edits ``scope``.
 
-    Composition: ``keys`` are unioned across all drops, order-independently. Drops are applied
-    before any :class:`AddInputs`, so dropping and adding the same key replaces it provided that
-    key was passed to the invoke, and a drop can only remove what the invoke was passed — never
-    an input another hook added.
+    Composition: ``names`` are unioned across all drops, order-independently. Drops are applied
+    before any :class:`AddInputs`, so dropping and adding the same name replaces it provided
+    that name was passed to the invoke, and a drop can only remove what the invoke was passed —
+    never an input another hook added.
 
-    Dropping a key the invoke never received raises
+    Dropping a name the invoke never received raises
     :class:`~jaz.exceptions.MissingDropTargetError` — a typo or a re-drop-every-turn pattern is
-    a hook bug. A key that only an :class:`AddInputs` provides counts as never received. Set
-    ``allow_missing=True`` for a defensive drop that tolerates the key already being absent; it
-    is tracked per-key, so one tolerant hook suffices. Note that this silences the error without
-    making the drop remove an added key — the add still wins.
+    a hook bug. A name that only an :class:`AddInputs` provides counts as never received. Set
+    ``allow_missing=True`` for a defensive drop that tolerates the name already being absent; it
+    is tracked per-name, so one tolerant hook suffices. Note that this silences the error without
+    making the drop remove an added name — the add still wins.
 
     Attributes:
-        keys: The input names to un-pass.
-        allow_missing: Whether dropping an absent key is tolerated rather than an error.
+        names: The input names to un-pass.
+        allow_missing: Whether dropping an absent name is tolerated rather than an error.
 
     Examples:
         DropInputs({"secret_token"})
@@ -510,62 +542,77 @@ class DropInputs(Effect):
     # Only valid at ``InvokeEnter`` because inputs are fixed at invoke setup, before the prompt
     # renders — cut from the docstring, which now just states where it is valid.
     #
-    # The add-before-drop ordering is ``Agent._apply_input_effects``: the ``if added:`` branch
-    # merges into ``inputs``/``resolved_bound`` first, and the ``if dropped:`` branch then
-    # computes ``present`` from that post-add snapshot. Stated in the docstring because the two
-    # rules read as contradictory otherwise — "adding and dropping resolves to the drop" against
-    # "dropping a key the invoke never received raises".
+    # Drops run before adds in ``Agent._apply_input_effects`` (the rationale for that order lives
+    # there). The docstring states the order because its two rules read as contradictory
+    # otherwise — "dropping and adding the same key replaces it" against "a drop never removes an
+    # input another hook added".
     #
     # Executive decision, superseding the ``add_drop_effect_family`` doc: that doc proposed
     # ``DropInputs`` as the migration target for ``expose_inputs_in_repl=False`` (withhold the
     # REPL binding but KEEP the inputs in the prompt). Rejected — this effect is kept strictly
-    # symmetric with ``AddInputs`` and parallel to ``DropVariables``/``DropMessages``: it
+    # symmetric with ``AddInputs`` and parallel to ``DropFromNamespace``/``DropMessages``: it
     # literally drops the input, from prompt AND REPL. Making it prompt-preserving to serve one
     # caller would break the family's symmetry (an Add/Drop pair that don't invert each other)
-    # for no gain, since ``DropVariables`` already covers withhold-binding-keep-prompt. So
-    # ``expose_inputs_in_repl`` stays on a one-shot ``DropVariables`` — see
-    # ``evals/repl_config_hooks.py``'s ``WithholdInputsFromREPL``.
+    # for no gain, since ``DropFromNamespace`` already covers withhold-binding-keep-prompt. So
+    # withholding a binding while keeping the prompt block stays a one-shot ``DropFromNamespace``.
+    # ``DropFromNamespace``'s docstring steers an input drop here unless the hook also edits the
+    # prompt itself, as jaz-evals-internal's ``CodeAct`` does: it rewrites the user message to
+    # remove the sentence naming the input as a REPL variable, keeping the value block.
 
-    keys: set[str]
+    # ``names``, matching ``DropFromNamespace``: both address their target by name. Only
+    # ``DropMessages`` addresses by position, hence its ``indices``.
+    names: set[str]
     allow_missing: bool = False
 
 
 @dataclass(frozen=True)
-class AddVariables(Effect):
+class AddToNamespace(Effect):
     """Bind names into the agent's REPL namespace before a turn's code runs.
 
-    Valid at :class:`REPLExecEnter` only. Each name is bound as a REPL variable without touching
-    the prompt. Values are bound raw, with no ``__jaz_get__`` payload substitution.
+    Valid at :class:`REPLExecEnter` only. Each name is bound as a REPL variable; the prompt is
+    untouched, so the agent is not told the name exists.
 
-    Composition: all ``variables`` are unioned; identical (name, value) coalesces and a
+    It is therefore not how an input is added: an input binds in the REPL *and* renders in the
+    user prompt, and adding one is :class:`AddInputs`, at :class:`InvokeEnter`. Nor is it how the
+    framework's ``invoke`` and ``__history__`` are provided: each is bound and described in the
+    system prompt together unless :class:`DisableRecursion` or :class:`WithholdREPLHistory`
+    withholds it, and binding either name here gives the agent a value the prompt describes
+    differently or not at all.
+
+    Composition: all ``entries`` are unioned; identical (name, value) coalesces and a
     divergent value for the same name raises :class:`~jaz.exceptions.REPLInputConflictError`.
-    Binding a name already present in the *variable* namespace also raises rather than
-    clobbering it. A name that lives only in ``__builtins__`` — an allowed builtin such as
-    ``len``, or a framework magic such as ``__history__`` — does not count as already
-    bound, so adding it succeeds and shadows what was there. Naming ``__builtins__`` itself
-    raises :class:`~jaz.exceptions.SandboxKeyError`.
+    Binding a name already present in the namespace also raises rather than clobbering it. A
+    name that lives only in ``__builtins__`` — an allowed builtin such as ``len``, or what the
+    framework provides there, such as ``__history__`` or ``invoke`` — is not bound, so adding it
+    succeeds and shadows what was there, as an assignment in the agent's code would. Naming
+    ``__builtins__`` itself raises :class:`~jaz.exceptions.KeyEditDeniedError`.
 
-    Drops are applied before adds, so pairing a :class:`DropVariables` with an add re-binds a
+    Drops are applied before adds, so pairing a :class:`DropFromNamespace` with an add re-binds a
     name, and an add wins over a drop of the same name in the same turn. Pair with
-    ``DropVariables(..., allow_missing=True)`` whenever the name may not be bound yet — on the
+    ``DropFromNamespace(..., allow_missing=True)`` whenever the name may not be bound yet — on the
     turn it is still unbound, a strict drop raises
     :class:`~jaz.exceptions.MissingDropTargetError` before the add ever runs.
 
     Attributes:
-        variables: Name-to-value pairs to bind in the REPL namespace.
+        entries: Name-to-value pairs to bind in the REPL namespace.
 
     Examples:
-        AddVariables({"scratch": {}})
+        AddToNamespace({"scratch": {}})
     """
 
     # Only valid at ``REPLExecEnter`` because the namespace matters exactly when code is about
-    # to run — cut from the docstring, which now just states where it is valid. Also cut: "for a
-    # prompt-rendering input use ``AddInputs``". That reads as an equivalence and is not one —
-    # ``AddInputs`` is invoke setup, fixed before the first prompt renders, while this fires per
-    # turn and is typically used well after turn 1.
+    # to run — cut from the docstring, which now just states where it is valid.
+    #
+    # The pointer to ``AddInputs`` was once cut, on the ground that "for a prompt-rendering input
+    # use ``AddInputs``" read as an equivalence between a per-invoke and a per-turn effect. It is
+    # back, joined by the two withholding effects, and phrased as what each effect does to the
+    # prompt rather than as a weaker/stronger pair: the thing a hook author has to know is that
+    # the prompt and the namespace disagree afterwards, and the docstring is the one place that
+    # can say so before the mismatch shows up in a trajectory (the user's call, 2026-10-20; the
+    # same for ``DropFromNamespace``).
     #
     # The namespace-level Add of the symmetric family and the direct counterpart of
-    # ``DropVariables``: where that deletes names from ``repl_state_locals`` before the turn,
+    # ``DropFromNamespace``: where that deletes names from the REPL namespace before the turn,
     # this writes them. A hook typically binds once (emit on ``event.iteration == 0``, the first turn).
     #
     # Drops run before adds (``Agent.do_one_repl_iteration``), matching
@@ -575,28 +622,35 @@ class AddVariables(Effect):
     # unbound. The cost of the reorder is that a drop can no longer remove a name another effect
     # adds in the same turn — the same trade the input family makes, for the same reason.
     #
-    # The already-present check is ``name in self.repl_state_locals``, which is the *variable*
-    # namespace only — ``__builtins__`` is a separate dict, so a name living there is invisible
-    # to the guard and gets shadowed rather than rejected. Measured: adding ``len`` or
+    # The already-present check is against the REPL namespace, in which ``__builtins__`` is a key
+    # rather than a bound name — what it holds is a separate dict, so a name living there is
+    # invisible to the guard and gets shadowed rather than rejected. Measured: adding ``len`` or
     # ``__history__`` binds, while adding an existing variable raises. The docstring says
     # "shadows" rather than "is not checked" because the outcome, not the mechanism, is what a
     # hook author is deciding about.
 
-    variables: dict[str, object]
+    entries: dict[str, object]
 
 
 @dataclass(frozen=True)
-class DropVariables(Effect):
+class DropFromNamespace(Effect):
     """Remove names from the agent's REPL namespace before a turn's code runs.
 
     Valid at :class:`REPLExecEnter` only. Each listed name is deleted before the turn's code
-    executes, so referencing it raises an ordinary ``NameError``. It reaches any name bound in
-    the namespace, whatever put it there — an invoke input, a variable an earlier turn assigned,
-    or a framework magic such as ``__history__``.
+    executes, as ``del name`` in the agent's code would. It reaches any name bound in the
+    namespace, whatever put it there — an invoke input, a hook's binding, a variable an earlier
+    turn assigned. What ``__builtins__`` holds (an allowed builtin such as ``len``, or the
+    framework's ``__history__`` and ``invoke``) is not bound unless a variable shadows it, so
+    naming it is a missing target, as ``del len`` raises ``NameError``; dropping a shadow
+    removes only the shadow, and the original shows again.
 
-    The prompt is untouched. If the dropped name happened to come from an invoke input, that
-    input still renders in the user prompt; un-passing an input is :class:`DropInputs`, which
-    acts on a different thing — the invoke's inputs, fixed once at :class:`InvokeEnter`.
+    The prompt is untouched, so this is not how an input, ``invoke`` or ``__history__`` is taken
+    away: each is described in the prompt, and dropping the binding alone leaves the agent told
+    about a name that raises ``NameError``. Un-passing an input is :class:`DropInputs`, which
+    removes it from the user prompt and the REPL together, at :class:`InvokeEnter`; withholding
+    ``invoke`` or ``__history__`` is :class:`DisableRecursion` or :class:`WithholdREPLHistory`,
+    which the system prompt follows likewise. Use this effect for names the prompt does not
+    describe.
 
     Composition: every drop's ``names`` are combined into one set and applied once, so the
     outcome does not depend on hook order. Two hooks naming the same bound name therefore
@@ -604,13 +658,14 @@ class DropVariables(Effect):
 
     Dropping a name that is not bound raises :class:`~jaz.exceptions.MissingDropTargetError`.
     Pass ``allow_missing=True`` to ignore names that are not bound rather than raising;
-    if an unbound name is dropped by both a ``DropVariables(..., allow_missing=True)`` and a
-    ``DropVariables(..., allow_missing=False)``,
+    if an unbound name is dropped by both a ``DropFromNamespace(..., allow_missing=True)`` and a
+    ``DropFromNamespace(..., allow_missing=False)``,
     then the drop is ignored and will not raise — one tolerant drop exempts the name for
     every hook naming it. Naming ``__builtins__`` always raises
-    :class:`~jaz.exceptions.SandboxKeyError`, which ``allow_missing`` cannot suppress.
+    :class:`~jaz.exceptions.KeyEditDeniedError`, which ``allow_missing`` cannot suppress. A drop
+    that raises removes nothing.
 
-    Drops are applied before any :class:`AddVariables`, so pairing the two re-binds a name, and
+    Drops are applied before any :class:`AddToNamespace`, so pairing the two re-binds a name, and
     a drop only removes what was bound before the turn — never a name an add supplies. If the
     name may not be bound yet, the drop needs ``allow_missing=True``, or it raises before the
     paired add can bind it.
@@ -620,38 +675,48 @@ class DropVariables(Effect):
         allow_missing: Whether dropping an unbound name is tolerated rather than an error.
 
     Examples:
-        # Hide the framework REPL-history list from the agent this turn.
-        DropVariables({"__history__"})
-        # Defensively unbind an input that another effect may already have un-passed.
-        DropVariables({"maybe_unpassed"}, allow_missing=True)
+        # Unbind a variable an earlier turn assigned, before this turn's code runs.
+        DropFromNamespace({"scratch"})
+        # Unbind a name that may not have been bound yet, without raising.
+        DropFromNamespace({"scratch"}, allow_missing=True)
     """
 
     # The docstring used to say this "unbinds the REPL name only — it does not un-pass an invoke
     # input", pointing at ``DropInputs`` "to remove it everywhere". That framed the two as one
     # operation at two strengths, which they are not: this acts on the REPL namespace (any name,
-    # whatever bound it — an input, an agent assignment, ``__history__``), while
+    # whatever bound it — an input, a hook's binding, an agent assignment), while
     # ``DropInputs`` acts on the invoke's *inputs* and is only valid at ``InvokeEnter``. A
     # per-turn hook cannot reach for it as "the stronger version", and most names this drops were
-    # never inputs at all.
+    # never inputs at all. The pointer is back all the same, now phrased as what each effect does
+    # to the prompt, and extended to the two framework names: each has been reached for with
+    # this effect (a first-turn drop of inputs, and of ``__history__`` before
+    # ``WithholdREPLHistory`` existed), and the symptom — a described name that raises
+    # ``NameError`` — appears only in the agent's trajectory (the user's call, 2026-10-20). No
+    # carve-out for an ablation that wants the mismatch: jaz-evals-internal's ``CodeAct``, the
+    # hook there that drops string inputs here, rewrites the user prompt to remove the sentence
+    # naming them as REPL variables, so the prompt claims no binding it dropped (the user's call,
+    # 2026-10-20). The examples name neither an input nor a framework name, so that leaving
+    # a dropped name described in the prompt cannot read as the effect's job rather than its side
+    # effect; the first example used to be that very first-turn ``__history__`` drop.
     #
-    # ``__builtins__`` is refused at composition (``_compose_repl_exec_enter``) rather than in
-    # the REPL, which is why ``allow_missing`` cannot reach it — the effect never gets as far as
-    # the missing-target check. ``PythonREPL.drop_variables`` also skips the key defensively.
+    # ``__builtins__`` is refused at composition (``_compose_repl_exec``) before the REPL is
+    # reached, which is why ``allow_missing`` cannot reach it — the effect never gets as far as
+    # the missing-target check. ``PythonREPL.drop_from_namespace`` refuses it again on a direct call.
     #
     # ``allow_missing`` composes as a union of names, not a per-effect flag
-    # (``ctx.dropped_variables_allow_missing |= names``), so a strict drop of a name another
+    # (``ctx.namespace_drops_allow_missing |= names``), so a strict drop of a name another
     # hook opted into does not raise either. That is deliberate: the tolerant hook is the one
     # that knows the name may be absent.
     #
-    # Emit on the iteration(s) where the target is actually bound. In practice that is the first
-    # iteration for both the ``expose_inputs`` case (drop the binding once, then leave the name
-    # free) and the ``repl_history`` case (bound once at init, core appends by reference, so one
-    # drop is permanent — re-dropping next turn would raise). The effect is agnostic; the
-    # emitting hook chooses when the target is present.
+    # Emit on the iteration(s) where the target is actually bound. For a name bound at init,
+    # such as an input, that is the first iteration: drop the binding once, then leave the name
+    # free — re-dropping next turn would raise. The effect is agnostic; the emitting hook chooses
+    # when the target is present.
     #
-    # ``allow_missing`` exists for ``WithholdInputsFromREPL``, which drops an input's REPL
-    # binding on turn one when a ``DropInputs`` may have already un-passed it — without the
-    # opt-out that legitimate composition would raise.
+    # ``allow_missing`` is for a hook that drops an input's REPL binding on turn one when another
+    # hook may have unbound it first — a ``DropInputs`` at ``InvokeEnter`` when the names were fixed
+    # before it, or an earlier namespace drop; ``CodeAct`` passes it for the latter — since without
+    # the opt-out that legitimate composition would raise.
 
     names: set[str]
     allow_missing: bool = False
@@ -662,13 +727,13 @@ class InsertCode(Effect):
     """Insert source into the proposed REPL code, before it runs.
 
     Valid at :class:`REPLExecEnter` only — the "edit the proposal" stage, alongside
-    :class:`AddVariables` / :class:`DropVariables` (which edit the namespace, not the code). The
+    :class:`AddToNamespace` / :class:`DropFromNamespace` (which edit the namespace, not the code). The
     LLM-message twin is :class:`AddMessages`.
 
     The offset is a character position in the ORIGINAL proposed code (:class:`REPLExecEnter`'s
     ``code``), so composition is order-independent — every effect names a position in the code the
-    hook saw, not in the post-edit string. Two inserts at the same offset both apply, ordered by
-    ``sort_key``; an insert whose offset falls inside a :class:`DeleteCode` range still inserts
+    hook saw, not in the post-edit string. Two inserts at the same offset both apply, in hook
+    order; an insert whose offset falls inside a :class:`DeleteCode` range still inserts
     (new content survives a delete — this is how a hook *replaces* a span: delete it and insert at
     the same offset).
 
@@ -681,14 +746,19 @@ class InsertCode(Effect):
         at: Character offset to insert *before*, in ``[0, len]`` of the original code; a negative
             offset counts from the end (``-1`` = before the last character), matching list
             semantics. An out-of-range offset raises :class:`~jaz.exceptions.CodeEditOffsetError`.
-        sort_key: Orders inserts that share an offset (lower first; default ``0.0``), ties broken
-            by the inserted text — so same-offset inserts are deterministic without depending on
-            hook order. Mirrors :class:`AddMessages`.
     """
+
+    # No within-offset ordering knob (EXECUTIVE CALL, user, 2026-09-19): same-offset inserts
+    # apply in hook order, which is deterministic (``with``-nesting order, then positional) and
+    # the author's to arrange. The earlier ``sort_key`` float plus a tie-break on the inserted
+    # text made the order independent of hook order, but at the cost of a public field, a
+    # helper, and an order (alphabetical by text) that nobody chose; two hooks that need a
+    # specific order coordinate it the same way either way. Same call for ``AddMessages``.
+    # What commutativity protects here is authority, not sequence: no insert can suppress
+    # another's, whatever the order.
 
     text: str
     at: int
-    sort_key: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -715,13 +785,6 @@ class DeleteCode(Effect):
     end: int
 
 
-def _code_insert_sort_key(ins: InsertCode) -> tuple[float, str]:
-    """Within-offset ordering for an ``InsertCode``: ``sort_key`` first, then the inserted text —
-    a total order that keeps same-offset inserts deterministic without depending on hook
-    accumulation order (the character-offset twin of :func:`_add_sort_key`)."""
-    return (ins.sort_key, ins.text)
-
-
 def _resolve_code_offset(offset: int, n: int, *, kind: str) -> int:
     """Resolve a possibly-negative code-edit character offset against code length ``n``.
 
@@ -745,7 +808,19 @@ def _resolve_code_offset(offset: int, n: int, *, kind: str) -> int:
     return resolved
 
 
-def apply_code_edits(
+# The composition helpers below carry a leading underscore because this module is public and
+# they are not: a hook's contract is to RETURN an `Effect`, and these are what the dispatcher then
+# does with several of them. No public event field, effect payload or `Hook.on_*` signature names
+# one, and none appears in the generated API reference.
+#
+# Renamed in place rather than moved to a private module. Five of the seven are a contiguous block
+# further down, but `_apply_code_edits` and `_apply_message_edits` sit up here among the `Effect`
+# classes they fold, and 13 comments and docstrings across the file cross-reference the set — so an
+# extraction would move two functions away from their subject matter and rewrite that prose, for
+# the same end state an underscore reaches. The underscore is the boundary either way.
+
+
+def _apply_code_edits(
     code: str,
     inserts: list[InsertCode],
     deletes: list[DeleteCode],
@@ -753,17 +828,17 @@ def apply_code_edits(
     """Fold code insert/delete edits over ``code``, anchored to its original offsets.
 
     **Pure** — returns a new string, never mutates ``code``. The character-offset twin of
-    :func:`apply_message_edits`: every insert offset and delete range is resolved against the
+    :func:`_apply_message_edits`: every insert offset and delete range is resolved against the
     ORIGINAL code (the single-coordinate-system rule that keeps edits commutative), then a single
-    left-to-right pass emits, at each offset, any inserts there (ordered by
-    :func:`_code_insert_sort_key`) followed by the original character unless it falls in a deleted
-    range. Overlapping deletes union; an insert at a deleted offset still inserts (new content
-    survives a delete), which is how a hook replaces a span.
+    left-to-right pass emits, at each offset, any inserts there (in hook order) followed by
+    the original character unless it falls in a deleted range. Overlapping deletes union; an
+    insert at a deleted offset still inserts (new content survives a delete), which is how a
+    hook replaces a span.
 
     Offsets follow list semantics (negatives count from the end); an out-of-range offset — or a
     delete whose resolved ``start`` exceeds its ``end`` — raises
     :class:`~jaz.exceptions.CodeEditOffsetError` rather than being ignored or clamped, the same
-    fail-loud contract as ``apply_message_edits`` (an out-of-range offset is a hook bug, and the
+    fail-loud contract as ``_apply_message_edits`` (an out-of-range offset is a hook bug, and the
     raise aborts the invoke).
     """
     n = len(code)
@@ -782,8 +857,6 @@ def apply_code_edits(
     for ins in inserts:
         at = _resolve_code_offset(ins.at, n, kind="InsertCode at")
         inserts_by_offset.setdefault(at, []).append(ins)
-    for group in inserts_by_offset.values():
-        group.sort(key=_code_insert_sort_key)
 
     parts: list[str] = []
     for i in range(n + 1):
@@ -800,6 +873,10 @@ def apply_code_edits(
 @dataclass(frozen=True)
 class BlackboardWrite(Effect):
     """Write a key/value into the per-invoke blackboard.
+
+    The *blackboard* is a small shared scratch space — a key/value store that every
+    hook active for an invoke can read and write — through which hooks pass per-invoke
+    data to one another and to the caller without calling each other directly.
 
     Valid at **any** event — the blackboard spans the whole invoke rather than one context.
     Writes are applied at the event boundary after every hook has run, so a write is invisible
@@ -820,6 +897,104 @@ class BlackboardWrite(Effect):
 
     key: str
     value: object
+
+
+def _values_conflict(existing: object, incoming: object) -> bool:
+    """Whether two values composed for one slot diverge (raise) or coalesce (skip), crash-free.
+
+    Every check in hook composition that compares two values for one slot uses it, such as two
+    hooks' ``BlackboardWrite`` values for one key or their ``Return`` values at one boundary.
+
+    Identity first: the same object never conflicts with itself — cheap, and the common case when
+    one shared value reaches composition twice. Otherwise compare with ``!=``, but guard the result:
+    a value whose ``__eq__``/``__ne__`` returns a non-bool (e.g. a numpy array, whose ``!=`` yields
+    an array and whose truthiness raises ``ValueError``) must not crash composition. Two *distinct*
+    such objects can't be proven identical, so the safe default is to treat them as a conflict (fail
+    loud) rather than silently coalescing or aborting the whole invoke with an ambiguous-truth error.
+    """
+    # TODO(#1721): equal values of different types (`1`, `True`) coalesce to whichever came
+    # first, so the result depends on hook order.
+    if existing is incoming:
+        return False
+    differs = _compared(existing, incoming)
+    return True if differs is None else differs
+
+
+# What `!=` on such a value raises when read as a bool: numpy's `ValueError`, a torch tensor's
+# `RuntimeError` (also on mismatched shapes), and a `TypeError` from a type that refuses the
+# comparison. Anything else is a bug in the value's `__eq__`/`__ne__`, and propagates. numpy:
+# https://github.com/numpy/numpy/blob/v2.4.4/numpy/_core/src/multiarray/number.c#L668-L671;
+# torch, a multi-element tensor's truth value and mismatched shapes:
+# https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/native/prim_native_functions.cpp#L17-L18
+# and https://github.com/pytorch/pytorch/blob/v2.14.1/aten/src/ATen/ExpandUtils.cpp#L35-L38
+# (`TORCH_CHECK`s). Observed: found by running `bool(a != b)` against numpy 2.4.4 and torch
+# 2.14.1+cpu, each raising the class named here.
+_UNCOMPARABLE = (ValueError, TypeError, RuntimeError)
+
+
+def _compared(existing: object, incoming: object) -> bool | None:
+    """``existing != incoming`` as a bool, or ``None`` if it cannot be read as one."""
+    try:
+        return bool(existing != incoming)
+    except _UNCOMPARABLE:
+        return None
+
+
+def _uncomparable_note(*values: object) -> str:
+    """A sentence for a conflict error when two of ``values`` could not be compared, else ``""``."""
+    # It must never replace the conflict error it decorates, so any failure to compare here,
+    # including one the conflict check itself never reached, just leaves the note out.
+    first = values[0]
+    try:
+        if all(v is first or _compared(first, v) is not None for v in values[1:]):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return (
+        " Some of these values cannot be compared with `!=` (numpy arrays or tensors, say), so "
+        "distinct objects conflict even when their contents are equal; if they are equal, create "
+        "the value once and have every hook pass that one object rather than a copy of its own."
+    )
+
+
+def _resolve_blackboard_writes(
+    writes: Sequence[tuple[str, object]],
+) -> dict[str, object]:
+    """Fold one event's ``BlackboardWrite`` effects into the batch that mints the next
+    blackboard generation.
+
+    ``writes`` are ``(key, value)`` pairs in hook-dispatch order. Identical writes to a key
+    coalesce; two writes to one key with *different* values raise
+    :class:`~jaz.exceptions.BlackboardWriteConflictError`. Returns the merged batch, to be
+    overlaid on the current generation.
+    """
+    # Composition lives here, in a standalone fold beside its siblings (``_resolve_supply_results``,
+    # ``_apply_message_edits``, ...), rather than as a mutating method on a bespoke board type
+    # (executive call by the author): every other effect composition in the system is a pure
+    # function of the emitted effects, and the blackboard's was the lone exception. Making it one
+    # too means the board itself needs no jaz-owned class — it is a plain read-only mapping the
+    # dispatcher replaces per generation (see ``Event.blackboard`` / ``HookDispatcher.emit``), which
+    # also keeps a framework-private type off the public event surface.
+    #
+    # Same-key divergence has no order-independent resolution *within* an event, because write order
+    # across hooks is declared irrelevant — hence the raise. *Across* events the later value simply
+    # overwrites, sequenced by the agent loop rather than by hook order, so the caller overlays this
+    # batch on the previous generation without consulting it here.
+    batch: dict[str, object] = {}
+    for key, value in writes:
+        if key in batch and _values_conflict(batch[key], value):
+            raise BlackboardWriteConflictError(
+                f"Conflicting BlackboardWrite for key {key!r} in the same event: "
+                f"{batch[key]!r} != {value!r}. Within one event, write order is "
+                "irrelevant, so a same-key conflict cannot be resolved without "
+                "relying on hook order. Ensure only one hook writes a given key "
+                "per event, or have them write identical values. Setting "
+                f"reserved_blackboard_keys = frozenset({{{key!r}}}) on each hook that "
+                "writes it has this rejected at activation instead, before the run "
+                "spends anything." + _uncomparable_note(batch[key], value)
+            )
+        batch[key] = value
+    return batch
 
 
 # LLM query effects
@@ -846,7 +1021,7 @@ class DropMessages(Effect):
     # Contrast an arbitrary message transform, which is order-dependent and can act on messages
     # a previous transform already moved or removed — that is why this marks positions instead.
     # ``persistent`` is the only axis on which a transient and a persistent drop differ; see
-    # ``apply_message_edits``.
+    # ``_apply_message_edits``.
 
     indices: set[int]
     persistent: bool = False
@@ -860,18 +1035,21 @@ class AddMessages(Effect):
     list as seen on that event; omitting ``index`` appends.
     An explicit out-of-range index raises :class:`~jaz.exceptions.MessageEditIndexError`.
 
-    Composition is commutative — a pure function of the *set* of adds. Adds at distinct slots
-    are independent; adds landing in the same slot are ordered by ``sort_key``, ties broken by
-    a canonical serialization of the content. Identical adds from two hooks both appear; they
-    are not coalesced, and adjacent same-role adds are not merged.
+    Composition is a pure function of the set of adds plus hook order: adds at distinct slots
+    are independent, and adds landing in the same slot apply in the fold's order: persistent adds
+    first, then this turn's transient ones, each in hook order. Identical adds from two hooks both appear; they are
+    not coalesced, and adjacent same-role adds are not merged.
 
     Attributes:
-        messages: The messages to insert.
+        messages: The messages to insert, each an OpenAI-shaped mapping — ``{"role": ...,
+            "content": ...}`` — plus any extra keys the configured provider accepts.
         index: Slot to insert before; ``None`` (default) appends. Negative counts from the end.
         persistent: ``False`` (default) applies the add to this turn's message list only;
             ``True`` makes the add survive into later turns.
-        sort_key: Used to order adds landing in the same slot; lower comes first.
     """
+
+    # No ``sort_key``: same-slot adds apply in hook order — see the comment on ``InsertCode``
+    # for the call and its reasoning.
 
     # Adjacent same-role adds are deliberately not merged, so a turn where several hooks each
     # add an instruction produces multiple consecutive ``user`` messages. This reverses the old
@@ -886,24 +1064,9 @@ class AddMessages(Effect):
     # effect except this one, where it only fed a replay log and an error string, never behavior.
     # Mainstream effect systems attach reasons to *denials*, which here is ``Abort``'s exception.
 
-    messages: list[MessageDict]
+    messages: list[dict[str, Any]]
     index: int | None = None  # None ⇒ append (resolved to len(snapshot) in the fold)
     persistent: bool = False
-    sort_key: float = 0.0
-
-
-def _add_sort_key(add: AddMessages) -> tuple[float, str]:
-    """The deterministic within-slot ordering key for an ``AddMessages`` (see its
-    docstring): ``sort_key`` first, then a canonical serialization of the content.
-
-    ``default=str`` keeps this total even if a message carries a non-JSON-serializable
-    value (e.g. an in-dict provenance stamp from a hook that reuses a message dict) — the
-    key stays stable rather than raising. It only affects the *ordering* string, never the
-    content that is folded into the buffer."""
-    return (
-        add.sort_key,
-        json.dumps(add.messages, sort_keys=True, ensure_ascii=False, default=str),
-    )
 
 
 def _resolve_edit_index(index: int, n: int, *, upper: int, kind: str) -> int:
@@ -927,7 +1090,7 @@ def _resolve_edit_index(index: int, n: int, *, upper: int, kind: str) -> int:
     return resolved
 
 
-def apply_message_edits(
+def _apply_message_edits(
     snapshot: list[MessageDict],
     drops: set[int],
     adds: list[AddMessages],
@@ -940,7 +1103,7 @@ def apply_message_edits(
     adds commutative): a dropped index removes that original message; an add inserts its
     messages before its ``index`` slot; an add and a drop at overlapping positions commute
     (both reference original indices — an add "at" a dropped slot still inserts, since it
-    is new content). Same-slot adds are ordered by :func:`_add_sort_key`.
+    is new content). Same-slot adds apply in the order given (hook order).
 
     Indices follow NumPy / ``list`` semantics: negatives count from the end (``-1``
     = the last message; append is an add ``index`` of ``None`` — the default — or the
@@ -972,8 +1135,6 @@ def apply_message_edits(
         raw_index = add.index if add.index is not None else n
         slot = _resolve_edit_index(raw_index, n, upper=n, kind="AddMessages")
         adds_by_slot.setdefault(slot, []).append(add)
-    for slot_adds in adds_by_slot.values():
-        slot_adds.sort(key=_add_sort_key)
 
     result: list[MessageDict] = []
     for i in range(n + 1):
@@ -1016,7 +1177,7 @@ class SupplyLLMResponse(Effect):
     # `cost_usd` and `total_tokens` was dropped (see the comment on `LLMResponse`) — sum
     # `prompt_tokens` + `completion_tokens`. Full coverage (not just the metrics) so a supplied
     # response can carry a `raw_response` a tool-calling protocol reads and the `extra` / `tokens`
-    # a live call would have — without it a Replay/mock could not faithfully stand in for the real
+    # a live call would have — without it a `TrajectoryReplay`/mock could not faithfully stand in for the real
     # response. Keeping a second spelling of one concept here is what let jaz's old client/provider
     # split drift apart in the first place.
 
@@ -1030,21 +1191,10 @@ class SupplyLLMResponse(Effect):
     tokens: TurnRecord | None = None
 
 
-class _Unset(enum.Enum):
-    """The ``ModifyLLMResponse`` "field untouched" sentinel — a keep-marker distinct from ``None``.
-
-    A single-member enum (rather than a bare ``object()``) so it has a real type for annotations
-    (``T | None | _Unset``) and narrows under an ``is`` check, and so its ``repr`` is stable.
-    """
-
-    UNSET = enum.auto()
-
-
-#: Sentinel marking a :class:`ModifyLLMResponse` field as "leave the original untouched" — used
-#: because ``None`` is a settable value there (see the effect's docstring). Rarely written
-#: explicitly (omit the field to get it as the default); exposed so a hook that computes overrides
-#: conditionally can assign ``UNSET`` to mean "don't touch this one".
-UNSET = _Unset.UNSET
+# The sentinel lives in `jaz._sentinel` and is exported from the package root, `jaz.UNSET`.
+# Imported here (not re-exported) so `ModifyLLMResponse`'s annotations can name `UnsetType`;
+# a caller writes `from jaz import UNSET`. One path, matching `openai.NOT_GIVEN` and
+# `dataclasses.MISSING` — the leaf that consumes a sentinel does not also publish it.
 
 
 @dataclass(frozen=True)
@@ -1078,10 +1228,12 @@ class ModifyLLMResponse(Effect):
         prompt_tokens: Replacement input token count (:data:`UNSET` = keep).
         completion_tokens: Replacement output token count (:data:`UNSET` = keep).
         cached_tokens: Replacement cached-input token count (:data:`UNSET` = keep).
-        cost_usd: Replacement cost in US dollars (:data:`UNSET` = keep). Note: this re-prices the
-            cost *booked* at ``LLMQueryExit``, but it cannot rescue an uncosted-model turn — the
-            ``BudgetPool`` backstop aborts on the *raw* ``cost_usd is None`` at ``LLMQueryComplete``
-            before this override resolves (abort supersedes the transform).
+        cost_usd: Replacement cost in US dollars (:data:`UNSET` = keep). Re-prices the cost
+            *booked* at ``LLMQueryExit``, including for a turn the backend priced at ``None`` —
+            whether or not it promised a cost via
+            :attr:`~jaz.llm.ModelInfo.can_report_cost`. The one turn it cannot re-price is one
+            that never runs: a ``BudgetPool`` carrying a ``cost_budget`` aborts pre-flight when
+            the backend says up front it cannot report a cost.
         extra: Replacement provider-metrics dict (:data:`UNSET` = keep; replaces wholesale).
         raw_response: Replacement raw provider payload (:data:`UNSET` = keep; ``None`` clears it).
         tokens: Replacement per-turn token record (:data:`UNSET` = keep; ``None`` clears it).
@@ -1099,24 +1251,31 @@ class ModifyLLMResponse(Effect):
     # a settable value here — a response legitimately carries ``content`` / ``raw_response`` /
     # ``tokens`` of ``None`` — so overloading it as the keep-marker (as ``SupplyLLMResponse`` can,
     # since a supply has no original to keep) would make those un-settable. The sentinel costs a
-    # ``| _Unset`` on each annotation but buys full, unambiguous override coverage.
+    # ``| UnsetType`` on each annotation but buys full, unambiguous override coverage.
     #
     # Authoritative feedback (executive call, this conversation): the transformed response is routed
     # back into what the agent parses (``_query_with_messages`` re-reads ``span.get_response()``
     # after the span closes), not merely shown to Exit observers — otherwise "modify the response"
     # would not change behavior. Cost booked at ``LLMQueryExit`` reflects the override; the
-    # same-boundary uncosted-model *abort* backstop (``BudgetPool.on_llm_query_complete``) reads the
-    # raw pre-transform response deliberately — it guards against a provider reporting no cost, not
-    # against what a hook re-prices.
+    # same-boundary uncosted-model *abort* backstop (``BudgetPool.on_llm_query_exit``) reads the
+    # FINAL post-transform cost — the same value it books — which is what makes a re-price able to
+    # rescue the turn at all.
+    #
+    # That rescue is narrow, and the docstring says so: a backend whose ``can_report_cost`` is
+    # False never gets here, because ``BudgetPool.on_llm_query_enter`` aborts pre-flight with
+    # ``ModelPricingUnavailableError`` and no query is sent. What remains is the over-promise case
+    # — ``can_report_cost`` True, ``cost_usd`` None — which among the built-in backends only
+    # ``GitHubCopilotLLM`` reaches (see ``exceptions.py``); the test,
+    # ``test_modify_response_reprice_rescues_an_uncosted_model``, uses ``MockLLM``.
 
-    content: str | None | _Unset = UNSET
-    prompt_tokens: int | None | _Unset = UNSET
-    completion_tokens: int | None | _Unset = UNSET
-    cached_tokens: int | None | _Unset = UNSET
-    cost_usd: float | None | _Unset = UNSET
-    extra: dict[str, Any] | _Unset = UNSET
+    content: str | None | UnsetType = UNSET
+    prompt_tokens: int | None | UnsetType = UNSET
+    completion_tokens: int | None | UnsetType = UNSET
+    cached_tokens: int | None | UnsetType = UNSET
+    cost_usd: float | None | UnsetType = UNSET
+    extra: dict[str, Any] | UnsetType = UNSET
     raw_response: Any = UNSET
-    tokens: TurnRecord | None | _Unset = UNSET
+    tokens: TurnRecord | None | UnsetType = UNSET
 
 
 # Composition helpers for Abort / SupplyExecResult / ModifyExecResult
@@ -1139,7 +1298,7 @@ def _combine_exceptions(excs: list[BaseException], message: str) -> BaseExceptio
 def _fold_carried_results(
     carried: list[ExecResult], *, original: ExecResult | None
 ) -> ExecResult | None:
-    """Precedence fold shared by both REPL-exec result boundaries.
+    """Precedence fold shared by all four supply/modify families across the exec and invoke boundaries.
 
     ``carried`` are the full ``ExecResult``s named by this boundary's effects (each
     ``SupplyExecResult`` / ``ModifyExecResult`` ``.result``). ``original`` is the executed result at the
@@ -1168,7 +1327,7 @@ def _fold_carried_results(
     terminal ``original`` is *downgraded* to a ``Continue`` here (``BudgetForcing``,
     ``ReturnType``), it contributes **no leading output** — the resulting ``Continue`` shows the
     agent only the carried hooks' text, not whatever the turn printed before finishing. See the
-    ``Raise`` docstring in ``jaz.repl.types`` for why that loss is accepted.
+    comment on ``Raise`` in ``jaz.repl._types`` for why that loss is accepted.
     """
     # Terminal results carry no output since #903, which is what makes the Raise/Return branches a
     # plain kind replacement rather than an output merge.
@@ -1187,11 +1346,14 @@ def _fold_carried_results(
         # (order-independence forbids a winner). Identical values coalesce.
         values = [r.return_value for r in return_results]
         first = values[0]
-        if any(v != first for v in values[1:]):
+        if any(_values_conflict(first, v) for v in values[1:]):
             raise ReturnValueConflictError(
                 f"{len(return_results)} results carrying distinct Return values ({values!r}) "
-                "were composed at one REPL-exec boundary; return values cannot be merged, so at "
-                "most one Return-carrying result may apply at a boundary."
+                "were composed at one boundary; return values cannot be merged, so at "
+                "most one Return-carrying result may apply at a boundary. Setting "
+                "reserves_exec_return = True (or reserves_invoke_return for the invoke "
+                "boundary) on each hook that may carry one has this rejected at activation "
+                "instead, before the run spends anything." + _uncomparable_note(*values)
             )
         return Return(return_value=first)
 
@@ -1220,7 +1382,7 @@ def _fold_carried_results(
     return None
 
 
-def resolve_supply_results(
+def _resolve_supply_results(
     *,
     supply_effects: list[SupplyExecResult],
 ) -> ExecResult | None:
@@ -1230,7 +1392,7 @@ def resolve_supply_results(
     fold **among themselves** via ``_fold_carried_results`` (``original=None``) — the same
     precedence/merge the *transform* boundary uses. Two hooks vetoing the same code with
     recoverable ``Continue``s therefore merge (outputs concatenated, exceptions grouped) rather
-    than conflicting — e.g. the evals ``RestrictReturnValue`` co-installed with a ``ValidateREPLCode``.
+    than conflicting — e.g. a host's return-value restriction co-installed with a ``ValidateREPLCode``.
     Distinct carried ``Return`` *values* still can't merge (``ReturnValueConflictError``): a
     supplied return names THE value, and order-independence forbids picking a winner.
 
@@ -1239,18 +1401,17 @@ def resolve_supply_results(
     not by a precedence rule inside the fold; the former ``abort_errors`` parameter was the
     legacy laundering channel that turned an abort into a terminal ``Raise`` result).
 
-    (This folds rather than requiring suppliers to be *equal* — the earlier contract, which raised
-    ``ResultConflictError`` on any two distinct supplies. Folding was adopted so that
-    independent "veto this input" hooks compose the same way independent transforms do at exit,
-    instead of a stack that installs two of them crashing on a hard internal error; see the
-    ``resolve_modify_results`` origin-agnostic note for the mirror semantics.)
-
     Returns the folded result, or ``None`` when nothing was emitted (run the code).
     """
+    # Folds rather than requiring suppliers to be *equal*, which was the earlier contract: two
+    # distinct supplies were a hard internal error. Folding was adopted so that independent
+    # "veto this input" hooks compose the same way independent transforms do at exit, instead of
+    # a stack that installs two of them crashing; see the ``_resolve_modify_results``
+    # origin-agnostic note for the mirror semantics.
     return _fold_carried_results([eff.result for eff in supply_effects], original=None)
 
 
-def resolve_modify_results(
+def _resolve_modify_results(
     *,
     modify_effects: list[ModifyExecResult],
     original: ExecResult,
@@ -1292,18 +1453,18 @@ def resolve_modify_results(
     return _fold_carried_results([m.result for m in modify_effects], original=original)
 
 
-def resolve_invoke_modify_results(
+def _resolve_invoke_modify_results(
     *,
     modify_effects: list[ModifyInvokeResult],
     original: TerminalExecResult,
 ) -> TerminalExecResult | None:
     """Resolve ``ModifyInvokeResult`` at the invoke transform boundary (``InvokeComplete``).
 
-    The invoke-boundary twin of ``resolve_modify_results``: it delegates to the *same*
+    The invoke-boundary twin of ``_resolve_modify_results``: it delegates to the *same*
     ``_fold_carried_results``, so the merge semantics are identical. The difference is entirely in
     the domain — ``original`` and every carried result are terminal (``Return`` | ``Raise``), so
     the fold's ``Continue`` branch is unreachable and the override is itself terminal. That is the
-    guarantee the shared ``resolve_modify_results`` could *not* make: it accepted a carried
+    guarantee the shared ``_resolve_modify_results`` could *not* make: it accepted a carried
     ``Continue`` and would downgrade the terminal result to it, which at an invoke's completion is
     a leaked non-terminal outcome (previously caught only by a strippable ``assert`` in
     ``span_invoke``). Here it cannot arise, because ``ModifyInvokeResult`` rejects a ``Continue`` at
@@ -1321,13 +1482,13 @@ def resolve_invoke_modify_results(
     return cast("TerminalExecResult | None", folded)
 
 
-def resolve_invoke_supply_results(
+def _resolve_invoke_supply_results(
     *,
     supply_effects: list[SupplyInvokeResult],
 ) -> TerminalExecResult | None:
     """Resolve ``SupplyInvokeResult`` at the invoke *supply* boundary (``InvokeSend``).
 
-    The invoke twin of ``resolve_supply_results``: no work has run, so the suppliers' carried
+    The invoke twin of ``_resolve_supply_results``: no work has run, so the suppliers' carried
     terminal results fold **among themselves** via ``_fold_carried_results`` (``original=None``),
     the same precedence/merge the REPL supply boundary uses — restricted to terminal results,
     since ``SupplyInvokeResult`` cannot carry a ``Continue``. Distinct carried ``Return`` values
@@ -1338,15 +1499,16 @@ def resolve_invoke_supply_results(
     folded = _fold_carried_results(
         [eff.result for eff in supply_effects], original=None
     )
-    # Terminal-in ⇒ terminal-out, as in ``resolve_invoke_modify_results`` (here there is no
+    # Terminal-in ⇒ terminal-out, as in ``_resolve_invoke_modify_results`` (here there is no
     # ``original`` either, so the ``Continue`` branch is doubly unreachable). Narrow the generic
     # ``ExecResult | None`` accordingly.
     return cast("TerminalExecResult | None", folded)
 
 
-# The fields ``ModifyLLMResponse`` may override; everything else on an ``LLMResponse``
-# (``raw_response``, ``extra``, ``cached_tokens``, ``tokens``) is always preserved from the
-# original. Kept as a tuple so the resolver and any test iterate the same source of truth.
+# Every field ``ModifyLLMResponse`` may override — which is all of an ``LLMResponse``'s fields.
+# What preserves the original is a field left :data:`UNSET`, NOT absence from this tuple; a name
+# missing here is simply an override that silently never applies. One tuple so the resolver and
+# the test that checks it against ``dataclasses.fields`` read the same source.
 _LLM_MODIFY_FIELDS = (
     "content",
     "prompt_tokens",
@@ -1359,14 +1521,14 @@ _LLM_MODIFY_FIELDS = (
 )
 
 
-def resolve_llm_modify_results(
+def _resolve_llm_modify_results(
     *,
     modify_effects: list[ModifyLLMResponse],
     original: LLMResponse,
 ) -> LLMResponse | None:
     """Resolve ``ModifyLLMResponse`` at the response-transform boundary (``LLMQueryComplete``).
 
-    The LLM-query twin of ``resolve_modify_results``, but the merge is **field-wise** rather than
+    The LLM-query twin of ``_resolve_modify_results``, but the merge is **field-wise** rather than
     the ``ExecResult`` precedence fold (an ``LLMResponse`` has no kind precedence): for each of the
     response's fields (see ``_LLM_MODIFY_FIELDS``) it takes the single non-``UNSET`` value the
     effects carry, and two effects setting the *same* field to *different* values raise
@@ -1390,12 +1552,15 @@ def resolve_llm_modify_results(
         if not values:
             continue
         first = values[0]
-        if any(v != first for v in values[1:]):
+        if any(_values_conflict(first, v) for v in values[1:]):
             raise LLMResponseConflictError(
                 f"Multiple ModifyLLMResponse effects set '{field_name}' to distinct values "
                 f"({values!r}) at one LLMQueryComplete boundary; field-wise merge is "
                 "order-independent, so a field's value cannot be resolved without relying on hook "
-                "registration / with-nesting order. Have at most one hook set a given field."
+                "registration / with-nesting order. Have at most one hook set a given field; "
+                f"reserving it (reserved_llm_response_fields = frozenset({{{field_name!r}}})) on "
+                "each hook that sets it has this rejected at activation instead, before the run "
+                "spends anything." + _uncomparable_note(*values)
             )
         overrides[field_name] = first
 
