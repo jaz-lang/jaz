@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you're using JAZ, please cite our paper."
+title: JAZ
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/jaz-lang/jaz"
+authors: &authors
+  - given-names: Zhening
+    family-names: Li
+  - given-names: Joshua
+    family-names: Liu
+  - given-names: Mateja
+    family-names: Vukelic
+  - given-names: Nicole
+    family-names: Shen
+  - given-names: Supriya
+    family-names: Lall
+  - given-names: Amitayush
+    family-names: Thakur
+  - given-names: Alex
+    family-names: Zhang
+  - given-names: Omar
+    family-names: Khattab
+  - given-names: Jonathan
+    family-names: Light
+  - given-names: Armando
+    family-names: Solar-Lezama
+preferred-citation:
+  type: article
+  title: "Harness as a Language: A Minimalist Agent Framework With Maximal Expressivity"
+  authors: *authors
+  journal: "arXiv preprint arXiv:2609.26891"
+  year: 2026
+  url: "https://arxiv.org/abs/2609.26891"
+  identifiers:
+    - type: other
+      value: "arXiv:2609.26891"
+      description: arXiv identifier
