@@ -2,6 +2,16 @@
 
 A Python framework for building and optimizing LLM-agents through intelligent, iterative execution.
 
+If you're using JAZ, please cite our paper using the following BibTeX entry:
+```bibtex
+@article{li2026jaz,
+  title={Harness as a Language: A Minimalist Agent Framework With Maximal Expressivity},
+  author={Li, Zhening and Liu, Joshua and Vukelic, Mateja and Shen, Nicole and Lall, Supriya and Thakur, Amitayush and Zhang, Alex and Khattab, Omar and Light, Jonathan and Solar-Lezama, Armando},
+  journal={arXiv preprint arXiv:2609.26891},
+  year={2026}
+}
+```
+
 ## Overview
 
 JAZ provides a unified framework for creating agents that combine deterministic Python code with LLM reasoning. Agents execute in a REPL loop where the LLM generates code, observes results, and iterates until the task is complete.
