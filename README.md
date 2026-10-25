@@ -2,7 +2,7 @@
 
 A Python framework for building and optimizing LLM-agents through intelligent, iterative execution.
 
-If you're using JAZ, please cite our paper using the following BibTeX entry:
+If you're using JAZ, please cite [our paper](https://arxiv.org/abs/2609.26891) using the following BibTeX entry:
 ```bibtex
 @article{li2026jaz,
   title={Harness as a Language: A Minimalist Agent Framework With Maximal Expressivity},
