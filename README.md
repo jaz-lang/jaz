@@ -219,6 +219,62 @@ with scope(my_tool=my_tool):
     invoke(ReturnType(int), task="Use my_tool on 5")  # nested invokes inherit `my_tool`
 ```
 
+### Passing files between agents
+
+`jaz.filesystem` adds scoped file and directory objects with agent-facing descriptions,
+line-range reads, and exact-text edits. Create a root in host code, then pass selected
+handles through ordinary `invoke` arguments and return values:
+
+```python
+from jaz import invoke
+from jaz.filesystem import from_local
+
+project = from_local("./my-project", access="write")  # directory must exist
+report = project.file("report.md")
+report.write_text("Status: draft\n")
+
+summary = invoke(
+    task="Read the report and summarize it.",
+    report=report.handle(access="read"),
+)
+edited_report = invoke(
+    task="Replace 'Status: draft' with 'Status: ready', then return report.",
+    report=report.handle(access="write"),
+)
+assert report.read_text() == "Status: ready\n"
+```
+
+An agent can delegate with the same syntax:
+
+```python
+summary = invoke(task="Summarize this report", report=report.handle(access="read"))
+return summary
+```
+
+| Object | Operations |
+| --- | --- |
+| Both | `handle(access="read" \| "write")`, read-only `name` and `access` |
+| Directory | `file(path)`, `directory(path)`, shallow `list()` |
+| File | `read_text(offset=1, limit=200)`, `write_text(text)`, `replace_text(old, new)` |
+
+`from_local` defaults to read access. Write access includes reading; a derived handle
+cannot gain permissions or leave its directory subtree. File reads use 1-based lines
+and preserve newlines; results over 64 KiB raise an error rather than truncate. Exact
+replacement requires one nonempty, unambiguous match. Directory descriptions preview
+at most 20 entries, without reading file contents or descending into subdirectories.
+
+Handles share live files. Parents retain access during delegation, and returned handles
+remain valid while their backing paths exist. Python copying/deep-copying a handle does
+not copy its files. Operations use process-local locks shared across aliases (including
+hard links); `replace_text` holds its lock across reading, checking, and writing. Separate
+read/think/write steps are not a transaction. There is no versioning, rollback, or merge.
+
+Handles enforce their own permissions without granting broader REPL `open()` access.
+Root registration is a host function, absent from the handle API. In-scope symlinks pin
+their resolved target when the handle is created; later redirection of that target path
+is rejected. This is an in-process interface, not an OS sandbox: external filesystem
+changes and code using other I/O routes do not participate in these checks or locks.
+
 ### Hooks for Extensibility
 
 Use hooks to add logging, tracing, workflow strategies, and more:

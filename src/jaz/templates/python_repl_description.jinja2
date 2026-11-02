@@ -64,8 +64,11 @@
 - You may NOT {{ verb }} any files.
 {%- endif -%}
 {% endmacro %}
+For filesystem access through `open()` or imported modules:
 {{ file_rule("read", allowed_read_paths) }}
 {{ file_rule("write", allowed_write_paths) }}
+Explicitly supplied file/directory handles grant separate access through their methods,
+within each handle's permissions.
 
 ## Determine the workflow type
 

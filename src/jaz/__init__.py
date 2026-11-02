@@ -32,6 +32,7 @@ The v1 public API is exactly ``__all__`` below, in two parts.
 - ``jaz.protocol`` — the interaction-protocol component: the base :class:`BaseProtocol`
   and default :class:`CodeOnlyProtocol`.
 - ``jaz.exceptions`` — the exception taxonomy every JAZ failure belongs to.
+- ``jaz.filesystem`` — scoped local file and directory handles for agent inputs/outputs.
 
 Everything outside ``__all__`` lives in a ``_``-prefixed module and is not part of the
 official public API. It is reachable — Python has no enforcement — but it is internal, and
@@ -50,6 +51,7 @@ may change or be removed without notice.
 from . import (  # noqa: F401
     credentials,
     exceptions,
+    filesystem,
     hooks,
     llm,
     protocol,
@@ -137,6 +139,7 @@ __all__ = [
     "llm",
     "protocol",
     "exceptions",
+    "filesystem",
     # EXECUTIVE CALL (user, 2026-08-15) — `credentials` is public because of what it
     # READS, not what it writes. The governing rule, settled after weighing #1076's
     # "unified vs split SDK/CLI credential model": **library code reads ambient

@@ -3,6 +3,13 @@
 All notable user-facing changes to JAZ. Versions follow the distribution on PyPI
 (`jaz-lang`); the import name is `jaz`.
 
+## Unreleased
+
+- Add `jaz.filesystem`: scoped local `File` and `Directory` handles, host-side
+  `from_local`, narrowed read/write access, bounded descriptions and line reads, and
+  exact-text edits serialized across shared handles. Handles pass through ordinary
+  agent inputs and returns; no copying, versioning, or invocation-wide borrowing.
+
 ## 0.2.0b1 — 2026-10-21
 
 ### Breaking changes

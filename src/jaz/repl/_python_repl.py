@@ -1279,6 +1279,9 @@ class PythonREPL(BaseREPL[PythonREPLState]):
             allowed_write_paths: gitignore-style globs for file writes. ``None`` applies
                 the fail-closed default (deny all). Instructed and enforced the same way as
                 ``allowed_read_paths``, with the same ``allowed_imports`` caveat.
+                Explicit ``jaz.filesystem`` handles grant separate access through their
+                own methods and permissions; passing a handle does not widen either
+                path allow-list.
             traceback_verbosity: How much of the error traceback the agent sees, a
                 :class:`TracebackVerbosity` or one of its values as a literal string.
                 A string whose value is not known statically — one read from your own
